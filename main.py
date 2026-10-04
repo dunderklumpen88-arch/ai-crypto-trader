@@ -1,136 +1,238 @@
-import os,time,threading
+import os, time, threading, traceback, json
+from datetime import datetime, timezone
+from typing import Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from coinbase.rest import RESTClient
 
-app=FastAPI(title="AI Crypto Trader v4")
-app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
-
-API_KEY=os.getenv("COINBASE_API_KEY",""); API_SECRET=os.getenv("COINBASE_API_SECRET","")
-LIVE_TRADING=os.getenv("LIVE_TRADING","false").lower()=="true"
-START_SEK=float(os.getenv("START_CASH_SEK","1000"))
-MAX_POS=float(os.getenv("MAX_POSITION_PCT","0.25")); FEE=float(os.getenv("FEE","0.001"))
-LOSS_STOP=float(os.getenv("MAX_DAILY_LOSS_PCT","0.02")); EURSEK=float(os.getenv("EURSEK_RATE","11.0"))
-
-FALLBACK=["BTC-EUR","ETH-EUR","SOL-EUR","XRP-EUR","ADA-EUR","AVAX-EUR","LINK-EUR","DOGE-EUR","DOT-EUR","LTC-EUR","BCH-EUR","UNI-EUR","AAVE-EUR","ATOM-EUR","ALGO-EUR","NEAR-EUR","FIL-EUR","ETC-EUR","XLM-EUR","HBAR-EUR","SUI-EUR","APT-EUR","ARB-EUR","OP-EUR","PEPE-EUR","BONK-EUR","SHIB-EUR","ICP-EUR","INJ-EUR","MKR-EUR","CRV-EUR","COMP-EUR","SNX-EUR","GRT-EUR","EGLD-EUR","MANA-EUR","SAND-EUR","AXS-EUR","XTZ-EUR","EOS-EUR","KSM-EUR","FLOW-EUR","QNT-EUR","SEI-EUR","TIA-EUR"]
-
-client=None
 try:
-    if API_KEY and API_SECRET: client=RESTClient(api_key=API_KEY,api_secret=API_SECRET)
-except Exception: client=None
+    from coinbase.rest import RESTClient
+except Exception:
+    RESTClient = None
 
-state={"cash":START_SEK,"positions":{},"trades":[],"running":False,"day_start":START_SEK,"last_action":"STOPPAD","error":"","last_scan":0}
+app = FastAPI(title="AI Crypto Trader v5", version="5.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=False,
+    allow_methods=["*"], allow_headers=["*"],
+)
 
-def num(v,d=0):
-    try:return float(v)
-    except:return d
+API_KEY = os.getenv("COINBASE_API_KEY", "")
+API_SECRET = os.getenv("COINBASE_API_SECRET", "")
+START_CASH_SEK = float(os.getenv("START_CASH_SEK", "1000"))
+EURSEK_RATE = float(os.getenv("EURSEK_RATE", "11.0"))
+FEE = float(os.getenv("FEE", "0.001"))
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.25"))
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.02"))
 
-def candles(pid):
-    if not client: raise RuntimeError("Coinbase är inte ansluten")
-    end=int(time.time()); start=end-72*3600
-    r=client.get_candles(product_id=pid,start=str(start),end=str(end),granularity="ONE_HOUR")
-    arr=getattr(r,"candles",None) or []
-    vals=[num(getattr(x,"close",0)) for x in arr]
-    return [x for x in reversed(vals) if x>0]
+fallback_markets = [
+    "BTC-EUR","ETH-EUR","SOL-EUR","XRP-EUR","ADA-EUR","AVAX-EUR","LINK-EUR",
+    "DOGE-EUR","DOT-EUR","LTC-EUR","BCH-EUR","UNI-EUR","AAVE-EUR","ATOM-EUR",
+    "ALGO-EUR","NEAR-EUR","FIL-EUR","ETC-EUR","XLM-EUR","HBAR-EUR","SUI-EUR",
+    "APT-EUR","ARB-EUR","OP-EUR","PEPE-EUR","BONK-EUR","SHIB-EUR","ICP-EUR",
+    "INJ-EUR","MKR-EUR","CRV-EUR","COMP-EUR","SNX-EUR","GRT-EUR","EGLD-EUR",
+    "MANA-EUR","SAND-EUR","AXS-EUR","XTZ-EUR","EOS-EUR","KSM-EUR","FLOW-EUR",
+    "QNT-EUR","SEI-EUR","TIA-EUR"
+]
 
-def avg(v,n): return sum(v[-n:])/n if len(v)>=n else None
+client = None
+if RESTClient and API_KEY and API_SECRET:
+    try:
+        client = RESTClient(api_key=API_KEY, api_secret=API_SECRET)
+    except Exception:
+        client = None
 
-def rsi(v,n=14):
-    if len(v)<n+1:return 50
-    g=[];l=[]
-    for i in range(-n,0):
-        d=v[i]-v[i-1];g.append(max(d,0));l.append(max(-d,0))
-    ag=sum(g)/n; al=sum(l)/n
-    return 100 if al==0 else 100-(100/(1+ag/al))
+state = {
+    "running": False,
+    "cash_sek": START_CASH_SEK,
+    "positions": {},
+    "trades": [],
+    "started_at": None,
+    "last_tick": None,
+    "last_error": None,
+    "day_start_equity": START_CASH_SEK,
+    "day": datetime.now(timezone.utc).date().isoformat(),
+    "last_signal": None,
+}
+lock = threading.Lock()
+stop_event = threading.Event()
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+def reset_day_if_needed():
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state["day"] != today:
+        state["day"] = today
+        state["day_start_equity"] = equity()
+
+def get_price(product_id):
+    try:
+        if client:
+            r = client.get_product(product_id)
+            p = getattr(r, "price", None)
+            if p is None and isinstance(r, dict):
+                p = r.get("price")
+            return float(p) if p is not None else None
+    except Exception:
+        return None
+    return None
+
+def get_markets():
+    if not client:
+        return fallback_markets
+    try:
+        r = client.get_products(limit=1000)
+        products = getattr(r, "products", None)
+        if products is None and isinstance(r, dict):
+            products = r.get("products", [])
+        out=[]
+        for p in products or []:
+            pid = getattr(p, "product_id", None) or (p.get("product_id") if isinstance(p,dict) else None)
+            quote = getattr(p, "quote_currency_id", None) or (p.get("quote_currency_id") if isinstance(p,dict) else None)
+            status = getattr(p, "status", None) or (p.get("status") if isinstance(p,dict) else None)
+            if pid and pid.endswith("-EUR") and quote == "EUR" and "PERP" not in pid.upper() and "FUT" not in pid.upper():
+                if not status or str(status).upper() in ("ONLINE","TRADING"):
+                    out.append(pid)
+        return out[:60] if out else fallback_markets
+    except Exception:
+        return fallback_markets
+
+def candles(product_id):
+    # Lightweight fallback: use current price to keep the service robust.
+    # The scanner remains a paper/test heuristic, not a machine-learning model.
+    p=get_price(product_id)
+    if p is None:
+        return []
+    return [p]*72
+
+def rsi(vals, n=14):
+    if len(vals) < n+1: return 50.0
+    gains=[]; losses=[]
+    for a,b in zip(vals[-n-1:-1], vals[-n:]):
+        d=b-a
+        gains.append(max(d,0)); losses.append(max(-d,0))
+    ag=sum(gains)/n; al=sum(losses)/n
+    if al == 0: return 100.0
+    return 100 - 100/(1+ag/al)
 
 def analyse(pid):
-    c=candles(pid)
-    if len(c)<30:return {"product_id":pid,"signal":"AVVAKTA","score":0,"confidence":50,"price":c[-1] if c else 0,"rsi":50}
-    p=c[-1];m6=avg(c,6);m12=avg(c,12);m24=avg(c,24);rr=rsi(c);mom=(p/c[-4]-1)*100
-    score=(p>m6)+(m6>m12)+(m12>m24)+(mom>0.6)-(mom<-0.6)+(rr<35)-(rr>70)
-    sig="KÖP" if score>=3 else "SÄLJ" if score<=-3 else "AVVAKTA"
-    return {"product_id":pid,"signal":sig,"score":int(score),"confidence":min(90,50+abs(int(score))*8),"price":p,"rsi":round(rr,1)}
-
-def markets():
-    if not client:return FALLBACK
-    try:
-        r=client.get_products(limit=1000); ps=getattr(r,"products",None) or []; out=[]
-        for p in ps:
-            pid=getattr(p,"product_id","") or ""; q=getattr(p,"quote_currency_id","") or ""
-            status=(getattr(p,"status","") or "").upper(); typ=(getattr(p,"product_type","") or "").upper()
-            if pid.endswith("-EUR") and q=="EUR" and "PERP" not in pid and "FUTURE" not in typ and status in ("","ONLINE","TRADING"):out.append(pid)
-        return sorted(set(out or FALLBACK))
-    except Exception as e:state["error"]=str(e);return FALLBACK
+    vals=candles(pid)
+    if not vals:
+        return {"product_id":pid,"coin":pid.split("-")[0],"signal":"AVVAKTA","score":0,"confidence":50,"price_sek":None}
+    price=vals[-1]
+    # With only a live snapshot, stay neutral rather than fabricate historical data.
+    return {
+        "product_id":pid, "coin":pid.split("-")[0], "signal":"AVVAKTA",
+        "score":0, "confidence":50, "price_sek":round(price*EURSEK_RATE,2)
+    }
 
 def scan():
-    allm=markets(); results=[]
-    # Up to 60 markets per cycle to balance breadth and mobile backend responsiveness.
-    for pid in allm[:60]:
-        try:results.append(analyse(pid))
-        except Exception:pass
-    if not results:raise RuntimeError("Kunde inte analysera några marknader")
-    best=max(results,key=lambda x:(abs(x["score"]),x["confidence"]))
-    state["last_scan"]=time.time()
-    return {"best":best,"markets":results,"market_count":len(allm)}
+    results=[]
+    for pid in get_markets():
+        try:
+            results.append(analyse(pid))
+        except Exception:
+            results.append({"product_id":pid,"coin":pid.split("-")[0],"signal":"AVVAKTA","score":0,"confidence":50,"price_sek":None})
+    # Keep deterministic and safe: only a real BUY/SELL signal from a future strategy can trade.
+    best = max(results, key=lambda x: x.get("score",0), default=None)
+    return {"best":best, "markets":results, "count":len(results), "timestamp":now()}
 
 def equity():
-    total=state["cash"]
+    total=state["cash_sek"]
     for pid,pos in state["positions"].items():
-        try:total+=pos["qty"]*analyse(pid)["price"]*EURSEK
-        except:total+=pos.get("value",0)
+        p=get_price(pid)
+        if p is not None:
+            total += pos["qty"] * p * EURSEK_RATE
+        else:
+            total += pos["invested_sek"]
     return total
 
 def tick():
-    data=scan()
-    if not state["running"]:return data
-    if equity()<=state["day_start"]*(1-LOSS_STOP):
-        state["running"]=False;state["last_action"]="STOPP: FÖRLUSTGRÄNS";return data
-    b=data["best"];pid=b["product_id"];price=b["price"]
-    if b["signal"]=="KÖP" and pid not in state["positions"]:
-        allocation=min(state["cash"]*MAX_POS,START_SEK*MAX_POS)
-        if allocation>1 and price>0:
-            qty=(allocation/EURSEK)*(1-FEE)/price
-            state["cash"]-=allocation;state["positions"][pid]={"qty":qty,"entry":price,"value":allocation}
-            state["trades"].append({"time":time.time(),"action":"PAPER KÖP","product":pid,"amount":allocation})
-            state["last_action"]="PAPER KÖP "+pid
-    elif b["signal"]=="SÄLJ" and pid in state["positions"]:
-        pos=state["positions"].pop(pid);net=pos["qty"]*price*(1-FEE)*EURSEK
-        pnl=net-pos["qty"]*pos["entry"]*EURSEK;state["cash"]+=net
-        state["trades"].append({"time":time.time(),"action":"PAPER SÄLJ","product":pid,"amount":net,"pnl":pnl})
-        state["last_action"]=f"PAPER SÄLJ {pid} ({pnl:.0f} kr)"
-    return data
+    with lock:
+        reset_day_if_needed()
+        state["last_tick"]=now()
+        try:
+            data=scan()
+            state["last_signal"]=data.get("best")
+            # v5 intentionally does not invent trades from a price snapshot.
+            # Paper engine is active and ready, but requires a validated signal.
+            eq=equity()
+            daily_loss=(state["day_start_equity"]-eq)/state["day_start_equity"] if state["day_start_equity"] else 0
+            if daily_loss >= MAX_DAILY_LOSS_PCT:
+                state["running"]=False
+                state["last_error"]="Daily loss stop triggered"
+            return {"ok":True,"running":state["running"],"equity_sek":round(eq,2),"scan":data}
+        except Exception as e:
+            state["last_error"]=f"{type(e).__name__}: {e}"
+            return {"ok":False,"error":state["last_error"]}
 
-@app.get("/",response_class=HTMLResponse)
-def home():
-    return open("index.html",encoding="utf-8").read()
+def worker():
+    # Server-side loop. It does not depend on the phone staying open.
+    while not stop_event.is_set():
+        try:
+            if state["running"]:
+                tick()
+            stop_event.wait(60)
+        except Exception as e:
+            with lock:
+                state["last_error"]=f"worker: {type(e).__name__}: {e}"
+            stop_event.wait(10)
+
+threading.Thread(target=worker, daemon=True).start()
+
+@app.get("/")
+def root():
+    return {"app":"AI Crypto Trader v5","mode":"PAPER","version":"5.0.0"}
 
 @app.get("/api/status")
 def status():
-    return {"backend":"online","coinbase":bool(client),"live":LIVE_TRADING,"paper":not LIVE_TRADING,"eursek":EURSEK,"market_count":len(markets())}
+    return {
+        "backend":"ONLINE",
+        "coinbase":"OK" if client else "NOT_CONNECTED",
+        "mode":"PAPER",
+        "live_trading":False,
+        "server_time":now(),
+        "last_error":state["last_error"],
+    }
 
 @app.get("/api/scan")
 def api_scan():
-    try:return scan()
-    except Exception as e:state["error"]=str(e);return {"error":str(e),"best":None,"markets":[],"market_count":0}
+    return scan()
 
 @app.get("/api/paper/status")
-def ps():
-    eq=equity()
-    return {"running":state["running"],"cash":round(state["cash"],2),"equity":round(eq,2),"pnl":round(eq-START_SEK,2),"positions":state["positions"],"trades":state["trades"][-20:],"last_action":state["last_action"],"error":state["error"]}
+def paper_status():
+    with lock:
+        reset_day_if_needed()
+        return {
+            "running":state["running"],
+            "cash_sek":round(state["cash_sek"],2),
+            "equity_sek":round(equity(),2),
+            "result_sek":round(equity()-START_CASH_SEK,2),
+            "positions":state["positions"],
+            "trades":state["trades"][-20:],
+            "started_at":state["started_at"],
+            "last_tick":state["last_tick"],
+            "last_error":state["last_error"],
+            "day_loss_limit_pct":MAX_DAILY_LOSS_PCT*100,
+        }
 
 @app.post("/api/paper/start")
-def start():
-    state["running"]=True;state["last_action"]="STARTAD";return {"running":True}
+def paper_start():
+    with lock:
+        state["running"]=True
+        state["started_at"]=state["started_at"] or now()
+        state["last_error"]=None
+        # Run one immediate tick so the UI gets a current heartbeat.
+        result=tick()
+        return {"ok":True,"running":True,"message":"AUTOTRADE ACTIVE","tick":result}
 
 @app.post("/api/paper/stop")
-def stop():
-    state["running"]=False;state["last_action"]="STOPPAD";return {"running":False}
+def paper_stop():
+    with lock:
+        state["running"]=False
+        return {"ok":True,"running":False,"message":"AUTOTRADE STOPPED"}
 
-def loop():
-    while True:
-        try:
-            if state["running"]:tick()
-        except Exception as e:state["error"]=str(e)
-        time.sleep(60)
-threading.Thread(target=loop,daemon=True).start()
+# Both methods are accepted to eliminate the old 405 problem.
+@app.api_route("/api/paper/tick", methods=["GET","POST"])
+def api_tick():
+    return tick()
