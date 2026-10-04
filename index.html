@@ -1,84 +1,29 @@
-<!doctype html>
-<html lang="sv">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Crypto Trader v5</title>
+<!doctype html><html lang="sv"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI Crypto Trader v6</title>
 <style>
-body{font-family:Arial,sans-serif;background:#101216;color:#fff;margin:0;padding:16px}
-h1{font-size:25px;margin:0 0 12px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.card{background:#1b1f27;border-radius:14px;padding:14px;margin-bottom:10px}
-.big{font-size:20px;font-weight:700}.muted{color:#aeb6c2;font-size:13px}
-button{width:100%;padding:18px;border:0;border-radius:14px;font-size:18px;font-weight:700;margin:6px 0}
-.start{background:#25c26e;color:#07130c}.stop{background:#e54b4b;color:white}
-.ok{color:#42e58a}.bad{color:#ff7070}.yellow{color:#ffd35a}
-table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:7px;border-bottom:1px solid #303641;text-align:left}
-#err{white-space:pre-wrap}
-</style>
-</head>
-<body>
-<h1>🤖 AI Crypto Trader v5</h1>
-<div class="grid">
- <div class="card"><div class="muted">Backend</div><div id="backend" class="big">...</div></div>
- <div class="card"><div class="muted">Coinbase</div><div id="coinbase" class="big">...</div></div>
- <div class="card"><div class="muted">Läge</div><div id="mode" class="big">PAPER</div></div>
- <div class="card"><div class="muted">Autotrade</div><div id="run" class="big yellow">AV</div></div>
-</div>
-<div class="card">
- <button class="start" onclick="startBot()">▶ STARTA AUTOTRADE</button>
- <button class="stop" onclick="stopBot()">■ STOPPA</button>
- <div id="msg" class="muted">PAPER-läge: inga riktiga pengar används.</div>
-</div>
-<div class="grid">
- <div class="card"><div class="muted">Kontanter</div><div id="cash" class="big">0 kr</div></div>
- <div class="card"><div class="muted">Kontovärde</div><div id="eq" class="big">0 kr</div></div>
- <div class="card"><div class="muted">Resultat</div><div id="res" class="big">0 kr</div></div>
- <div class="card"><div class="muted">Coins</div><div id="coins" class="big">0</div></div>
-</div>
-<div class="card">
- <div class="muted">Bästa signal</div>
- <div id="best" class="big">AVVAKTA</div>
- <div id="bestinfo" class="muted"></div>
-</div>
-<div class="card">
- <div class="muted">Senaste heartbeat</div><div id="heartbeat">-</div>
- <div class="muted" style="margin-top:8px">Fel</div><div id="err">Inget</div>
-</div>
-<div class="card">
- <div class="muted">Marknader</div>
- <table><thead><tr><th>Coin</th><th>Signal</th><th>Poäng</th><th>Pris</th></tr></thead><tbody id="markets"></tbody></table>
-</div>
+body{font-family:Arial,sans-serif;background:#0d1117;color:#fff;margin:0;padding:16px}h1{font-size:25px}.card{background:#171d26;border-radius:16px;padding:15px;margin:10px 0}.ok{color:#52e08b}.bad{color:#ff7070}.big{font-size:22px;font-weight:700}button{width:100%;padding:18px;border:0;border-radius:14px;font-size:19px;font-weight:700;margin:6px 0}#start{background:#32c875}#stop{background:#e05252;color:#fff}.row{display:flex;justify-content:space-between;margin:8px 0}.signal{padding:10px;border-bottom:1px solid #29313d}.buy{color:#53e28c}.sell{color:#ff7070}.wait{color:#f3c969}.small{font-size:12px;color:#aeb8c5}
+</style></head><body>
+<h1>🤖 AI Crypto Trader v6</h1>
+<div class="card"><div class="row">Backend <b id="backend">...</b></div><div class="row">Coinbase <b id="cb">...</b></div><div class="row">Läge <b>PAPER</b></div><div class="row">Coins <b id="coins">...</b></div><div class="row">Autotrade <b id="run">...</b></div></div>
+<div class="card"><div class="big">💰 <span id="equity">0</span> kr</div><div>Resultat: <b id="result">0</b> kr</div><div class="small">Virtuellt startkapital: 1 000 kr · max 25% per position</div></div>
+<button id="start" onclick="start()">▶ STARTA PAPER AUTOTRADE</button><button id="stop" onclick="stop()">■ STOPPA</button>
+<div class="card"><div class="big">🏆 Bästa signal</div><div id="best">Laddar...</div></div>
+<div class="card"><div class="big">📊 Marknader</div><div id="list">Laddar...</div></div>
+<div class="card"><div class="big">🧾 Senaste affärer</div><div id="trades">Inga affärer ännu.</div></div>
 <script>
 const API="https://ai-crypto-trader-f8cz.onrender.com";
-const sek=n=>(Number(n||0)).toLocaleString("sv-SE",{maximumFractionDigits:2})+" kr";
-async function j(url,opt){const r=await fetch(API+url,opt);return await r.json()}
+async function get(u,o){let r=await fetch(API+u,o);return await r.json()}
 async function refresh(){
  try{
-  const [s,p,sc]=await Promise.all([j("/api/status"),j("/api/paper/status"),j("/api/scan")]);
-  backend.textContent=s.backend; backend.className=s.backend==="ONLINE"?"big ok":"big bad";
-  coinbase.textContent=s.coinbase; coinbase.className=s.coinbase==="OK"?"big ok":"big yellow";
-  mode.textContent="PAPER";
-  run.textContent=p.running?"🟢 AKTIV":"🔴 STOPPAD"; run.className=p.running?"big ok":"big bad";
-  cash.textContent=sek(p.cash_sek); eq.textContent=sek(p.equity_sek); res.textContent=sek(p.result_sek);
-  coins.textContent=sc.count||0;
-  if(!sc.count) msg.textContent="Inga marknader hämtades från Coinbase. Kontrollera Render/API-anslutningen.";
-  const b=sc.best||{}; best.textContent=(b.coin||"-")+" — "+(b.signal||"AVVAKTA");
-  bestinfo.textContent="Säkerhet "+(b.confidence||50)+"%";
-  heartbeat.textContent=p.last_tick||"-";
-  err.textContent=p.last_error||s.last_error||"Inget";
-  markets.innerHTML=(sc.markets||[]).map(x=>`<tr><td>${x.coin||"-"}</td><td>${x.signal||"-"}</td><td>${x.score??0}</td><td>${x.price_sek?sek(x.price_sek):"-"}</td></tr>`).join("");
- }catch(e){err.textContent="Appfel: "+e}
+  let s=await get("/api/status"), sc=await get("/api/scan"), p=await get("/api/paper/status");
+  backend.textContent=s.backend; backend.className="ok"; cb.textContent=s.coinbase; cb.className=s.coinbase=="OK"?"ok":"bad";
+  coins.textContent=sc.count; run.textContent=p.running?"AKTIV":"STOPPAD"; run.className=p.running?"ok":"bad";
+  equity.textContent=Math.round(p.equity_sek).toLocaleString("sv-SE"); result.textContent=Math.round(p.result_sek).toLocaleString("sv-SE");
+  if(sc.best){let b=sc.best;best.innerHTML=`<b>${b.product}</b> · <span class="${b.signal=="KÖP"?"buy":b.signal=="SÄLJ"?"sell":"wait"}">${b.signal}</span> · ${b.confidence}% · RSI ${b.rsi}`;} else best.textContent="Ingen signal – kontrollera Coinbase.";
+  list.innerHTML=sc.signals.map(x=>`<div class="signal"><b>${x.product}</b> · ${x.price_sek?Math.round(x.price_sek).toLocaleString("sv-SE")+" kr":"-"} · <span class="${x.signal=="KÖP"?"buy":x.signal=="SÄLJ"?"sell":"wait"}">${x.signal}</span> · ${x.confidence}%</div>`).join("")||"Inga marknader.";
+  trades.innerHTML=p.trades.length?p.trades.slice().reverse().map(t=>`<div class="signal">${t.side} · <b>${t.product}</b> · ${t.sek} kr</div>`).join(""):"Inga affärer ännu.";
+ }catch(e){backend.textContent="FEL";backend.className="bad"}
 }
-async function startBot(){
- msg.textContent="Startar AUTOTRADE...";
- try{const r=await j("/api/paper/start",{method:"POST"});msg.textContent=r.message||"AUTOTRADE ACTIVE";}catch(e){msg.textContent="Kunde inte starta: "+e}
- await refresh();
-}
-async function stopBot(){
- msg.textContent="Stoppar...";
- try{await j("/api/paper/stop",{method:"POST"});msg.textContent="AUTOTRADE STOPPAD";}catch(e){msg.textContent="Kunde inte stoppa: "+e}
- await refresh();
-}
-refresh(); setInterval(refresh,15000);
-</script>
-</body>
-</html>
+async function start(){await get("/api/paper/start",{method:"POST"});refresh()}
+async function stop(){await get("/api/paper/stop",{method:"POST"});refresh()}
+refresh();setInterval(refresh,10000);
+</script></body></html>
