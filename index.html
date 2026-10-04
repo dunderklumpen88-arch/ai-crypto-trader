@@ -5,7 +5,8 @@ body{font-family:Arial,sans-serif;background:#0d1117;color:#fff;margin:0;padding
 <h1>🤖 AI Crypto Trader v6</h1>
 <div class="card"><div class="row">Backend <b id="backend">...</b></div><div class="row">Coinbase <b id="cb">...</b></div><div class="row">Läge <b>PAPER</b></div><div class="row">Coins <b id="coins">...</b></div><div class="row">Autotrade <b id="run">...</b></div></div>
 <div class="card"><div class="big">💰 <span id="equity">0</span> kr</div><div>Resultat: <b id="result">0</b> kr</div><div class="small">Virtuellt startkapital: 1 000 kr · max 25% per position</div></div>
-<button id="start" onclick="start()">▶ STARTA PAPER AUTOTRADE</button><button id="stop" onclick="stop()">■ STOPPA</button>
+<button id="start" type="button">▶ STARTA PAPER AUTOTRADE</button><button id="stop" type="button">■ STOPPA</button>
+<div id="action" class="small">Tryck på STARTA för att starta PAPER-boten.</div>
 <div class="card"><div class="big">🏆 Bästa signal</div><div id="best">Laddar...</div></div>
 <div class="card"><div class="big">📊 Marknader</div><div id="list">Laddar...</div></div>
 <div class="card"><div class="big">🧾 Senaste affärer</div><div id="trades">Inga affärer ännu.</div></div>
@@ -23,7 +24,27 @@ async function refresh(){
   trades.innerHTML=p.trades.length?p.trades.slice().reverse().map(t=>`<div class="signal">${t.side} · <b>${t.product}</b> · ${t.sek} kr</div>`).join(""):"Inga affärer ännu.";
  }catch(e){backend.textContent="FEL";backend.className="bad"}
 }
-async function start(){await get("/api/paper/start",{method:"POST"});refresh()}
-async function stop(){await get("/api/paper/stop",{method:"POST"});refresh()}
+async function start(){
+  const a=document.getElementById("action");
+  a.textContent="Startar PAPER-boten...";
+  try{
+    const r=await fetch(API+"/api/paper/start",{method:"POST",headers:{"Content-Type":"application/json"}});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
+    a.textContent="✅ PAPER AUTOTRADE startad.";
+    await refresh();
+  }catch(e){a.textContent="❌ Start misslyckades: "+e.message;}
+}
+async function stop(){
+  const a=document.getElementById("action");
+  try{
+    const r=await fetch(API+"/api/paper/stop",{method:"POST",headers:{"Content-Type":"application/json"}});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    a.textContent="⏹ PAPER AUTOTRADE stoppad.";
+    await refresh();
+  }catch(e){a.textContent="❌ Stopp misslyckades: "+e.message;}
+}
+document.getElementById("start").addEventListener("click",start);
+document.getElementById("stop").addEventListener("click",stop);
 refresh();setInterval(refresh,10000);
 </script></body></html>
