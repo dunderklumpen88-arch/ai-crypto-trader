@@ -60,6 +60,7 @@ async function refresh(){
   run.textContent=p.running?"🟢 AKTIV":"🔴 STOPPAD"; run.className=p.running?"big ok":"big bad";
   cash.textContent=sek(p.cash_sek); eq.textContent=sek(p.equity_sek); res.textContent=sek(p.result_sek);
   coins.textContent=sc.count||0;
+  if(!sc.count) msg.textContent="Inga marknader hämtades från Coinbase. Kontrollera Render/API-anslutningen.";
   const b=sc.best||{}; best.textContent=(b.coin||"-")+" — "+(b.signal||"AVVAKTA");
   bestinfo.textContent="Säkerhet "+(b.confidence||50)+"%";
   heartbeat.textContent=p.last_tick||"-";
