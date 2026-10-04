@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from coinbase.rest import RESTClient
 
-app = FastAPI(title="AI Crypto Trader Backend", version="0.3.0")
+app = FastAPI(title="AI Crypto Trader Backend", version="0.4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["GET"], allow_headers=["*"])
 
 API_KEY = os.getenv("COINBASE_API_KEY", "").strip()
@@ -115,3 +115,99 @@ def signal():
             "reason":"Testmotor: trend + momentum + RSI + volym. Ingen order skickas."}
 
 # Ingen order-endpoint. Riktiga köp/sälj är avstängda.
+
+# ---------------- PAPER TRADING ENGINE ----------------
+PAPER_START_SEK = 1000.0
+MAX_POSITION_PCT = 0.25
+FEE_PCT = 0.001  # simulation only
+paper = {
+    "cash_sek": PAPER_START_SEK,
+    "positions": {},
+    "trades": [],
+    "equity": PAPER_START_SEK,
+    "running": True,
+    "last_tick": None,
+}
+
+def paper_snapshot(markets):
+    equity = paper["cash_sek"]
+    for p, pos in paper["positions"].items():
+        m = next((x for x in markets if x.get("product_id") == p), None)
+        if m and m.get("price"):
+            equity += pos["qty"] * m["price"]
+    paper["equity"] = round(equity, 2)
+    return {
+        "running": paper["running"],
+        "cash_sek": round(paper["cash_sek"], 2),
+        "equity_sek": round(paper["equity"], 2),
+        "pnl_sek": round(paper["equity"] - PAPER_START_SEK, 2),
+        "positions": paper["positions"],
+        "trades": paper["trades"][-20:],
+        "test_only": True,
+    }
+
+@app.get("/api/paper/status")
+def paper_status():
+    # Status without forcing a market scan.
+    return {
+        "running": paper["running"],
+        "cash_sek": round(paper["cash_sek"], 2),
+        "equity_sek": round(paper["equity"], 2),
+        "pnl_sek": round(paper["equity"] - PAPER_START_SEK, 2),
+        "positions": paper["positions"],
+        "trades": paper["trades"][-20:],
+        "test_only": True,
+        "automatic_buy_sell": True,
+        "last_tick": paper.get("last_tick"),
+        "last_action": paper.get("last_action", "STARTAR"),
+    }
+
+@app.get("/api/paper/tick")
+def paper_tick():
+    # Reuse the scanner endpoint and automatically act only in PAPER mode.
+    result = signal()
+    markets = result.get("markets", [])
+    if not paper["running"]:
+        return {"action": "STOPPAD", **paper_snapshot(markets)}
+
+    best = result.get("best")
+    action = "AVVAKTA"
+    if best:
+        pid = best["product_id"]
+        price = float(best["price"])
+        sig = best["signal"]
+        current = paper["positions"].get(pid)
+
+        # BUY: only if signal is strong and no position exists.
+        if sig == "KÖP" and not current and paper["cash_sek"] > 10:
+            budget = min(paper["cash_sek"] * MAX_POSITION_PCT, PAPER_START_SEK * MAX_POSITION_PCT)
+            qty = (budget * (1 - FEE_PCT)) / price
+            paper["cash_sek"] -= budget
+            paper["positions"][pid] = {"qty": qty, "entry_price": price, "entry_value": budget}
+            paper["trades"].append({"side":"KÖP","product_id":pid,"price":price,"value_sek":round(budget,2)})
+            action = "AUTOMATISKT KÖP"
+
+        # SELL: sell an existing position when the signal turns negative.
+        elif sig == "SÄLJ" and current:
+            proceeds = current["qty"] * price * (1 - FEE_PCT)
+            pnl = proceeds - current["entry_value"]
+            paper["cash_sek"] += proceeds
+            paper["trades"].append({"side":"SÄLJ","product_id":pid,"price":price,"value_sek":round(proceeds,2),"pnl_sek":round(pnl,2)})
+            del paper["positions"][pid]
+            action = "AUTOMATISKT SÄLJ"
+
+    paper["last_tick"] = time.time()
+    paper["last_action"] = action
+    snap = paper_snapshot(markets)
+    snap.update({"action": action, "best": best})
+    return snap
+
+@app.post("/api/paper/start")
+def paper_start():
+    paper["running"] = True
+    return {"running": True, "test_only": True}
+
+@app.post("/api/paper/stop")
+def paper_stop():
+    paper["running"] = False
+    return {"running": False, "test_only": True}
