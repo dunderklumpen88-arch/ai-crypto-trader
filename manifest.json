@@ -1,0 +1,9 @@
+{
+  "name": "AI Crypto Trader",
+  "short_name": "AI Trader",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#090b0e",
+  "theme_color": "#0b0d10",
+  "icons": []
+}
