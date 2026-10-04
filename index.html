@@ -1,38 +1,42 @@
 <!doctype html><html lang="sv"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Crypto Trader</title><style>
-body{font-family:Arial,sans-serif;background:#0d0f12;color:#fff;margin:0;padding:14px;max-width:900px;margin:auto}
-h1{font-size:28px;margin:8px 0 4px}.sub{color:#aaa;margin-bottom:14px}
-.card{background:#181b20;border:1px solid #292d34;border-radius:18px;padding:18px;margin:12px 0}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.stat{background:#111318;border-radius:14px;padding:14px}.label{font-size:12px;color:#999}.value{font-size:23px;font-weight:700;margin-top:5px}
-.best{font-size:27px;font-weight:800}.buy{color:#65e58b}.sell{color:#ff7070}.wait{color:#ffd166}
-button{width:100%;font-size:18px;padding:16px;border:0;border-radius:14px;font-weight:800;margin-top:8px}.start{background:#63df88}.stop{background:#ff6b6b}
-table{width:100%;border-collapse:collapse}th,td{padding:9px 5px;border-bottom:1px solid #2b2f36;text-align:left;font-size:13px}
-.scroll{max-height:480px;overflow:auto}.small{font-size:12px;color:#999}
+*{box-sizing:border-box}body{margin:0;background:#0c0e11;color:#fff;font-family:Arial,sans-serif;padding:12px;max-width:850px;margin:auto}
+h1{font-size:30px;margin:5px 0}.sub{color:#9da3ad;margin-bottom:14px}.card{background:#171a20;border-radius:20px;padding:18px;margin:12px 0;border:1px solid #292e37}
+.status{font-size:16px;line-height:1.7}.best{font-size:30px;font-weight:800;margin:8px 0}.buy{color:#58e58b}.sell{color:#ff6868}.wait{color:#ffd166}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.stat{background:#101216;padding:15px;border-radius:15px}.lab{font-size:12px;color:#9299a4}.val{font-size:25px;font-weight:800;margin-top:4px}
+button{display:block;width:100%;min-height:58px;border:0;border-radius:16px;font-size:20px;font-weight:800;margin:9px 0}.start{background:#5de389;color:#06100a}.stop{background:#ff6969;color:#180404}
+table{width:100%;border-collapse:collapse}th,td{padding:10px 5px;border-bottom:1px solid #2b3038;font-size:13px;text-align:left}.scroll{max-height:520px;overflow:auto}.small{font-size:12px;color:#9da3ad}
 </style></head><body>
-<h1>🤖 AI Crypto Trader</h1><div class="sub">Enkel vy · kronor (SEK) · PAPER-läge</div>
-<div class="card"><div id="connection">Ansluter...</div></div>
-<div class="card"><div class="label">BÄSTA SIGNAL</div><div id="best" class="best">-</div><div id="details" class="small"></div></div>
+<h1>🤖 AI Crypto Trader</h1><div class="sub">Enkel mobilvy · svenska kronor · PAPER</div>
+<div class="card"><div id="status" class="status">Ansluter...</div></div>
+<div class="card"><div class="lab">BÄSTA SIGNAL</div><div id="best" class="best">-</div><div id="detail" class="small"></div></div>
 <div class="card"><div class="grid">
-<div class="stat"><div class="label">KONTANTER</div><div id="cash" class="value">-</div></div>
-<div class="stat"><div class="label">KONTOVÄRDE</div><div id="equity" class="value">-</div></div>
-<div class="stat"><div class="label">RESULTAT</div><div id="pnl" class="value">-</div></div>
-<div class="stat"><div class="label">MARKNADER</div><div id="count" class="value">-</div></div>
+<div class="stat"><div class="lab">KONTANTER</div><div id="cash" class="val">-</div></div>
+<div class="stat"><div class="lab">KONTOVÄRDE</div><div id="equity" class="val">-</div></div>
+<div class="stat"><div class="lab">RESULTAT</div><div id="pnl" class="val">-</div></div>
+<div class="stat"><div class="lab">COINS</div><div id="coins" class="val">-</div></div>
 </div></div>
-<div class="card"><div class="label">AUTOMATISK TESTTRADING</div><button class="start" onclick="post('/api/paper/start')">▶ STARTA</button><button class="stop" onclick="post('/api/paper/stop')">■ STOPPA</button><p id="action" class="small"></p></div>
-<div class="card"><div class="label">MARKNADER</div><div class="scroll"><table><thead><tr><th>Coin</th><th>Signal</th><th>Score</th><th>RSI</th></tr></thead><tbody id="markets"></tbody></table></div></div>
-<div class="card"><div class="label">SENASTE AFFÄRER</div><div id="trades" class="small">Inga affärer.</div></div>
-<div class="card small">⚠️ Riktig trading är avstängd. Detta är PAPER-trading. Ändra inte till live innan testmotorn är verifierad.</div>
+<div class="card"><div class="lab">AUTOTRADE TEST</div>
+<button id="start" class="start" onclick="startBot()">▶ STARTA AUTOTRADE</button>
+<button id="stop" class="stop" onclick="stopBot()">■ STOPPA</button><div id="run" class="small"></div></div>
+<div class="card"><div class="lab">ALLA MARKNADER</div><div class="scroll"><table><thead><tr><th>Coin</th><th>Signal</th><th>Score</th><th>RSI</th></tr></thead><tbody id="rows"></tbody></table></div></div>
+<div class="card"><div class="lab">AFFÄRER</div><div id="trades" class="small">Inga affärer.</div></div>
+<div class="card small">🔒 Säkerhet: detta är PAPER-trading. Riktiga order är avstängda. Vi verifierar automatiseringen innan någon livehandel aktiveras.</div>
 <script>
 const API="https://ai-crypto-trader-f8cz.onrender.com";
-async function get(p){let r=await fetch(API+p);return await r.json()}async function post(p){await fetch(API+p,{method:"POST"});refresh()}
-function cls(s){return s==="KÖP"?"buy":s==="SÄLJ"?"sell":"wait"}
+async function get(p){let r=await fetch(API+p,{cache:"no-store"});return r.json()}
+async function post(p){await fetch(API+p,{method:"POST"});refresh()}
+function c(s){return s==="KÖP"?"buy":s==="SÄLJ"?"sell":"wait"}
+async function startBot(){let b=document.getElementById("start");b.disabled=true;b.textContent="STARTAR...";try{await post("/api/paper/start")}finally{b.disabled=false;b.textContent="▶ STARTA AUTOTRADE"}}
+async function stopBot(){await post("/api/paper/stop")}
 async function refresh(){try{
 let s=await get("/api/status"),sc=await get("/api/scan"),p=await get("/api/paper/status");
-document.getElementById("connection").innerHTML=`Backend: <b class="buy">ONLINE</b> · Coinbase: <b>${s.coinbase_configured?"OK":"EJ ANSLUTEN"}</b> · Läge: <b>${s.live_trading?"LIVE":"PAPER"}</b> · 1 € ≈ ${s.eursek} kr`;
-if(sc.best){let b=sc.best;document.getElementById("best").innerHTML=`${b.product_id} — <span class="${cls(b.signal)}">${b.signal}</span>`;document.getElementById("details").textContent=`Pris ${Number(b.price*s.eursek).toFixed(2)} kr · säkerhet ${b.confidence}% · score ${b.score} · RSI ${b.rsi}`}
-document.getElementById("cash").textContent=Number(p.cash_sek).toFixed(0)+" kr";document.getElementById("equity").textContent=Number(p.equity_sek).toFixed(0)+" kr";document.getElementById("pnl").textContent=Number(p.pnl_sek).toFixed(0)+" kr";document.getElementById("count").textContent=(sc.universe_count||sc.count)+" st";document.getElementById("action").textContent="Senaste: "+p.last_action;
-document.getElementById("markets").innerHTML=(sc.markets||[]).map(x=>`<tr><td>${x.product_id}</td><td class="${cls(x.signal)}">${x.signal}</td><td>${x.score}</td><td>${x.rsi??"-"}</td></tr>`).join("");
-document.getElementById("trades").innerHTML=p.trades.length?p.trades.slice().reverse().map(t=>`${new Date(t.time*1000).toLocaleString("sv-SE")} · ${t.action} · ${t.product||""}${t.pnl_sek!==undefined?" · "+Number(t.pnl_sek).toFixed(0)+" kr":""}`).join("<br>"):"Inga affärer ännu.";
-}catch(e){document.getElementById("connection").innerHTML='<b style="color:#ff6b6b">Backend svarar inte just nu.</b>'}}
+document.getElementById("status").innerHTML=`Backend: <b class="buy">ONLINE</b><br>Coinbase: <b>${s.coinbase?"OK":"EJ ANSLUTEN"}</b><br>Läge: <b>${s.live?"LIVE":"PAPER"}</b>`;
+if(sc.best){let b=sc.best;document.getElementById("best").innerHTML=`${b.product_id} — <span class="${c(b.signal)}">${b.signal}</span>`;document.getElementById("detail").textContent=`Pris ${Math.round(b.price*s.eursek).toLocaleString("sv-SE")} kr · säkerhet ${b.confidence}% · RSI ${b.rsi}`}
+document.getElementById("cash").textContent=Math.round(p.cash).toLocaleString("sv-SE")+" kr";document.getElementById("equity").textContent=Math.round(p.equity).toLocaleString("sv-SE")+" kr";document.getElementById("pnl").textContent=Math.round(p.pnl).toLocaleString("sv-SE")+" kr";document.getElementById("coins").textContent=(sc.market_count||0)+" st";
+document.getElementById("run").textContent=p.running?"🟢 AUTOTRADE TEST ÄR AKTIV":"⚪ AUTOTRADE TEST ÄR STOPPAD";
+document.getElementById("rows").innerHTML=(sc.markets||[]).map(x=>`<tr><td>${x.product_id.split("-")[0]}</td><td class="${c(x.signal)}">${x.signal}</td><td>${x.score}</td><td>${x.rsi??"-"}</td></tr>`).join("");
+document.getElementById("trades").innerHTML=p.trades.length?p.trades.slice().reverse().map(t=>`${new Date(t.time*1000).toLocaleString("sv-SE")} · ${t.action} · ${Math.round(t.amount||0).toLocaleString("sv-SE")} kr`).join("<br>"):"Inga affärer ännu.";
+}catch(e){document.getElementById("status").innerHTML='<b class="sell">Backend svarar inte just nu.</b>'}}
 refresh();setInterval(refresh,60000)
 </script></body></html>
