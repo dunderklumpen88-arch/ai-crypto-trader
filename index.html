@@ -1,84 +1,38 @@
-<!doctype html>
-<html lang="sv">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Crypto Trader v2</title>
-<style>
-body{font-family:Arial,sans-serif;background:#101114;color:#f4f4f4;margin:0;padding:16px}
-.card{background:#1a1c21;border-radius:14px;padding:16px;margin-bottom:12px}
-h1{font-size:22px;margin:0 0 12px}
-.big{font-size:25px;font-weight:700}
-.ok{color:#67e08a}.warn{color:#ffd166}.bad{color:#ff6b6b}
-button{padding:12px 16px;border:0;border-radius:10px;font-weight:700;margin-right:6px}
-table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:7px;border-bottom:1px solid #30333a;text-align:left}
-.small{font-size:12px;color:#aaa}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>🤖 AI Crypto Trader v2</h1>
-<div id="status">Laddar...</div>
-</div>
-
-<div class="card">
-<div class="small">Bästa signal</div>
-<div id="best" class="big">-</div>
-<div id="metrics"></div>
-</div>
-
-<div class="card">
-<div class="small">Testkonto</div>
-<div>Kontanter: <span id="cash">-</span> €</div>
-<div>Värde: <span id="equity">-</span> €</div>
-<div>Resultat: <span id="pnl">-</span> €</div>
-<div>Senaste åtgärd: <span id="action">-</span></div>
-<button onclick="start()">STARTA TEST</button>
-<button onclick="stop()">STOPPA</button>
-</div>
-
-<div class="card">
-<div class="small">Marknader <span id="count"></span></div>
-<table><thead><tr><th>Coin</th><th>Signal</th><th>Score</th><th>RSI</th></tr></thead><tbody id="markets"></tbody></table>
-</div>
-
-<div class="card">
-<div class="small">Senaste affärer</div>
-<div id="trades">-</div>
-</div>
-
-<div class="card small">
-⚠️ Säkerhetsläge: appen kör automatiskt i TEST/PAPER-läge som standard.
-Riktiga order skickas inte om <b>LIVE_TRADING=false</b>. Använd aldrig uttags-/transferbehörighet på API-nyckeln.
-</div>
-
+<!doctype html><html lang="sv"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Crypto Trader</title><style>
+body{font-family:Arial,sans-serif;background:#0d0f12;color:#fff;margin:0;padding:14px;max-width:900px;margin:auto}
+h1{font-size:28px;margin:8px 0 4px}.sub{color:#aaa;margin-bottom:14px}
+.card{background:#181b20;border:1px solid #292d34;border-radius:18px;padding:18px;margin:12px 0}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.stat{background:#111318;border-radius:14px;padding:14px}.label{font-size:12px;color:#999}.value{font-size:23px;font-weight:700;margin-top:5px}
+.best{font-size:27px;font-weight:800}.buy{color:#65e58b}.sell{color:#ff7070}.wait{color:#ffd166}
+button{width:100%;font-size:18px;padding:16px;border:0;border-radius:14px;font-weight:800;margin-top:8px}.start{background:#63df88}.stop{background:#ff6b6b}
+table{width:100%;border-collapse:collapse}th,td{padding:9px 5px;border-bottom:1px solid #2b2f36;text-align:left;font-size:13px}
+.scroll{max-height:480px;overflow:auto}.small{font-size:12px;color:#999}
+</style></head><body>
+<h1>🤖 AI Crypto Trader</h1><div class="sub">Enkel vy · kronor (SEK) · PAPER-läge</div>
+<div class="card"><div id="connection">Ansluter...</div></div>
+<div class="card"><div class="label">BÄSTA SIGNAL</div><div id="best" class="best">-</div><div id="details" class="small"></div></div>
+<div class="card"><div class="grid">
+<div class="stat"><div class="label">KONTANTER</div><div id="cash" class="value">-</div></div>
+<div class="stat"><div class="label">KONTOVÄRDE</div><div id="equity" class="value">-</div></div>
+<div class="stat"><div class="label">RESULTAT</div><div id="pnl" class="value">-</div></div>
+<div class="stat"><div class="label">MARKNADER</div><div id="count" class="value">-</div></div>
+</div></div>
+<div class="card"><div class="label">AUTOMATISK TESTTRADING</div><button class="start" onclick="post('/api/paper/start')">▶ STARTA</button><button class="stop" onclick="post('/api/paper/stop')">■ STOPPA</button><p id="action" class="small"></p></div>
+<div class="card"><div class="label">MARKNADER</div><div class="scroll"><table><thead><tr><th>Coin</th><th>Signal</th><th>Score</th><th>RSI</th></tr></thead><tbody id="markets"></tbody></table></div></div>
+<div class="card"><div class="label">SENASTE AFFÄRER</div><div id="trades" class="small">Inga affärer.</div></div>
+<div class="card small">⚠️ Riktig trading är avstängd. Detta är PAPER-trading. Ändra inte till live innan testmotorn är verifierad.</div>
 <script>
 const API="https://ai-crypto-trader-f8cz.onrender.com";
-async function get(path){const r=await fetch(API+path);return await r.json();}
-async function post(path){const r=await fetch(API+path,{method:"POST"});return await r.json();}
-function esc(x){return String(x??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));}
-async function refresh(){
- try{
-  const s=await get("/api/status");
-  document.getElementById("status").innerHTML =
-    `Backend: <span class="ok">ONLINE</span> · Coinbase: ${s.coinbase_configured?"<span class='ok'>OK</span>":"<span class='bad'>EJ ANSLUTEN</span>"} · Marknader: ${s.markets} · Läge: <b>${s.live_trading?"LIVE":"PAPER"}</b>`;
-  const scan=await get("/api/scan");
-  const b=scan.best;
-  document.getElementById("best").textContent=`${b.product_id} — ${b.signal}`;
-  document.getElementById("metrics").textContent=`Pris ${Number(b.price).toFixed(6)} · Säkerhet ${b.confidence}% · Score ${b.score} · RSI ${b.rsi}`;
-  document.getElementById("count").textContent=`(${scan.count})`;
-  document.getElementById("markets").innerHTML=scan.markets.map(x=>`<tr><td>${esc(x.product_id)}</td><td>${esc(x.signal)}</td><td>${x.score}</td><td>${x.rsi??"-"}</td></tr>`).join("");
-  const p=await get("/api/paper/status");
-  document.getElementById("cash").textContent=Number(p.cash).toFixed(2);
-  document.getElementById("equity").textContent=Number(p.equity).toFixed(2);
-  document.getElementById("pnl").textContent=Number(p.pnl).toFixed(2);
-  document.getElementById("action").textContent=p.last_action;
-  document.getElementById("trades").innerHTML=p.trades.length?p.trades.slice().reverse().map(t=>`${new Date(t.time*1000).toLocaleString("sv-SE")} · ${esc(t.action)} · ${esc(t.product||"")}${t.pnl_eur!==undefined?" · PnL "+Number(t.pnl_eur).toFixed(2)+" €":""}`).join("<br>"):"Inga affärer ännu.";
- }catch(e){document.getElementById("status").innerHTML="<span class='bad'>Backend svarar inte just nu.</span>";}
-}
-async function start(){await post("/api/paper/start");refresh();}
-async function stop(){await post("/api/paper/stop");refresh();}
-refresh();setInterval(refresh,60000);
-</script>
-</body>
-</html>
+async function get(p){let r=await fetch(API+p);return await r.json()}async function post(p){await fetch(API+p,{method:"POST"});refresh()}
+function cls(s){return s==="KÖP"?"buy":s==="SÄLJ"?"sell":"wait"}
+async function refresh(){try{
+let s=await get("/api/status"),sc=await get("/api/scan"),p=await get("/api/paper/status");
+document.getElementById("connection").innerHTML=`Backend: <b class="buy">ONLINE</b> · Coinbase: <b>${s.coinbase_configured?"OK":"EJ ANSLUTEN"}</b> · Läge: <b>${s.live_trading?"LIVE":"PAPER"}</b> · 1 € ≈ ${s.eursek} kr`;
+if(sc.best){let b=sc.best;document.getElementById("best").innerHTML=`${b.product_id} — <span class="${cls(b.signal)}">${b.signal}</span>`;document.getElementById("details").textContent=`Pris ${Number(b.price*s.eursek).toFixed(2)} kr · säkerhet ${b.confidence}% · score ${b.score} · RSI ${b.rsi}`}
+document.getElementById("cash").textContent=Number(p.cash_sek).toFixed(0)+" kr";document.getElementById("equity").textContent=Number(p.equity_sek).toFixed(0)+" kr";document.getElementById("pnl").textContent=Number(p.pnl_sek).toFixed(0)+" kr";document.getElementById("count").textContent=(sc.universe_count||sc.count)+" st";document.getElementById("action").textContent="Senaste: "+p.last_action;
+document.getElementById("markets").innerHTML=(sc.markets||[]).map(x=>`<tr><td>${x.product_id}</td><td class="${cls(x.signal)}">${x.signal}</td><td>${x.score}</td><td>${x.rsi??"-"}</td></tr>`).join("");
+document.getElementById("trades").innerHTML=p.trades.length?p.trades.slice().reverse().map(t=>`${new Date(t.time*1000).toLocaleString("sv-SE")} · ${t.action} · ${t.product||""}${t.pnl_sek!==undefined?" · "+Number(t.pnl_sek).toFixed(0)+" kr":""}`).join("<br>"):"Inga affärer ännu.";
+}catch(e){document.getElementById("connection").innerHTML='<b style="color:#ff6b6b">Backend svarar inte just nu.</b>'}}
+refresh();setInterval(refresh,60000)
+</script></body></html>
