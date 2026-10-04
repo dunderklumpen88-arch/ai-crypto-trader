@@ -67,15 +67,23 @@ def reset_day_if_needed():
 
 def get_price(product_id):
     try:
-        if client:
-            r = client.get_product(product_id)
-            p = getattr(r, "price", None)
-            if p is None and isinstance(r, dict):
-                p = r.get("price")
-            return float(p) if p is not None else None
+        if not client:
+            return None
+        r = client.get_product(product_id)
+        p = getattr(r, "price", None)
+        if p is None and isinstance(r, dict):
+            p = r.get("price")
+            if p is None and isinstance(r.get("product"), dict):
+                p = r["product"].get("price")
+        if p is None:
+            prod = getattr(r, "product", None)
+            if prod is not None:
+                p = getattr(prod, "price", None)
+                if p is None and isinstance(prod, dict):
+                    p = prod.get("price")
+        return float(p) if p is not None else None
     except Exception:
         return None
-    return None
 
 def get_markets():
     if not client:
@@ -199,6 +207,21 @@ def status():
 def api_scan():
     return scan()
 
+
+@app.get("/api/health")
+def health():
+    markets = get_markets()
+    sample = markets[:5]
+    prices = {pid: get_price(pid) for pid in sample}
+    return {
+        "ok": True,
+        "backend": "ONLINE",
+        "coinbase_client": bool(client),
+        "market_count": len(markets),
+        "sample_prices": prices,
+        "time": now()
+    }
+
 @app.get("/api/paper/status")
 def paper_status():
     with lock:
@@ -222,9 +245,9 @@ def paper_start():
         state["running"]=True
         state["started_at"]=state["started_at"] or now()
         state["last_error"]=None
-        # Run one immediate tick so the UI gets a current heartbeat.
-        result=tick()
-        return {"ok":True,"running":True,"message":"AUTOTRADE ACTIVE","tick":result}
+    # tick() acquires the lock itself; calling it inside the lock would deadlock.
+    result=tick()
+    return {"ok":True,"running":True,"message":"AUTOTRADE ACTIVE","tick":result}
 
 @app.post("/api/paper/stop")
 def paper_stop():
