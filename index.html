@@ -1,101 +1,15 @@
-<!doctype html>
-<html lang="sv">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0b0d10"><title>AI Crypto Trader</title>
-<style>
-*{box-sizing:border-box}body{margin:0;background:#0b0d10;color:#f5f7fa;font-family:Arial,sans-serif}
-main{max-width:540px;margin:auto;padding:20px 15px}h1{font-size:27px;margin:0}.sub{color:#9299a3;margin:5px 0 14px}
-.badge{display:inline-block;background:#123d25;color:#72e6a2;padding:6px 10px;border-radius:999px;font-size:12px}
-.card{background:#15181d;border:1px solid #292e36;border-radius:16px;padding:15px;margin-top:13px}
-.row{display:flex;justify-content:space-between;gap:10px;margin:9px 0}.label{color:#9299a3}.value{font-weight:bold}
-button{width:100%;padding:13px;border:0;border-radius:12px;background:#fff;color:#111;font-weight:bold;margin-top:8px}
-.small{font-size:13px;color:#9299a3;line-height:1.45}.green{color:#72e6a2}.yellow{color:#ffd166}
-.signal{font-size:26px;font-weight:bold}.market{padding:9px 0;border-top:1px solid #292e36}
-.pill{padding:4px 8px;border-radius:8px;background:#222730;font-size:12px}
-</style></head>
-<body><main>
-<h1>AI Crypto Trader</h1>
-<div class="sub">Automatisk Spot-trading · TESTLÄGE</div>
-<span class="badge">PAPER – INGA RIKTIGA ORDER</span>
-
-<div class="card">
-<div class="row"><span class="label">Status</span><span class="value green" id="status">AKTIV</span></div>
-<div class="row"><span class="label">Senaste körning</span><span class="value" id="last">—</span></div>
-<div class="row"><span class="label">Senaste åtgärd</span><span class="value" id="action">Startar…</span></div>
-<button onclick="togglePaper()" id="paperBtn">Stoppa paper-trading</button>
-</div>
-
-<div class="card"><h3>Bästa testsignal</h3>
-<div id="best"><span class="small">Scannar marknader…</span></div>
-</div>
-
-<div class="card"><h3>Paper-resultat</h3>
-<div class="row"><span class="label">Startkapital</span><span class="value">1 000 SEK</span></div>
-<div class="row"><span class="label">Kontanter</span><span class="value" id="cash">—</span></div>
-<div class="row"><span class="label">Totalt värde</span><span class="value" id="equity">—</span></div>
-<div class="row"><span class="label">Resultat</span><span class="value" id="pnl">—</span></div>
-<div class="row"><span class="label">Öppna positioner</span><span class="value" id="positions">0</span></div>
-</div>
-
-<div class="card"><h3>Marknadsscanning</h3><div id="markets"><span class="small">Väntar…</span></div></div>
-
-<div class="card"><h3>Handelshistorik</h3><div id="trades"><span class="small">Inga paper-affärer ännu.</span></div></div>
-
-<div class="card"><div class="small">
-<strong>Skydd:</strong> Spot only · ingen hävstång · inga uttag · inga riktiga order.
-Automatiska köp/sälj gäller endast paper-trading.
-</div></div>
-</main>
-<script>
-const API="https://ai-crypto-trader-f8cz.onrender.com";
-let running=true;
-
-function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
-function time(v){return v?new Date(v*1000).toLocaleTimeString("sv-SE"):"—";}
-
-async function tick(){
- try{
-  const r=await fetch(API+"/api/paper/tick",{cache:"no-store"}); const d=await r.json();
-  running=!!d.running;
-  document.getElementById("status").textContent=running?"AKTIV":"STOPPAD";
-  document.getElementById("status").className=running?"value green":"value yellow";
-  document.getElementById("paperBtn").textContent=running?"Stoppa paper-trading":"Starta paper-trading";
-  document.getElementById("last").textContent=time(d.last_tick)||new Date().toLocaleTimeString("sv-SE");
-  document.getElementById("action").textContent=d.action||"AVVAKTA";
-  document.getElementById("cash").textContent=(d.cash_sek??0).toFixed(2)+" SEK";
-  document.getElementById("equity").textContent=(d.equity_sek??0).toFixed(2)+" SEK";
-  document.getElementById("pnl").textContent=(d.pnl_sek>=0?"+":"")+Number(d.pnl_sek??0).toFixed(2)+" SEK";
-  document.getElementById("positions").textContent=Object.keys(d.positions||{}).length;
-
-  const b=d.best;
-  document.getElementById("best").innerHTML=b?
-   `<div class="row"><span class="signal">${esc(b.signal)}</span><span class="pill">${esc(b.product_id)}</span></div>
-    <div class="row"><span class="label">Pris</span><span>${esc(b.price)} EUR</span></div>
-    <div class="row"><span class="label">Säkerhet</span><span>${esc(b.confidence)}%</span></div>
-    <div class="small">${esc(b.reason)}</div>`
-   :'<span class="small">Ingen signal just nu.</span>';
-
-  const ms=(d.markets||[]);
-  document.getElementById("markets").innerHTML=ms.length?ms.map(x=>
-   `<div class="market"><div class="row"><b>${esc(x.product_id)}</b><span class="pill">${esc(x.signal)}</span></div>
-    <div class="small">score ${esc(x.score)} · RSI ${esc(x.rsi)} · säkerhet ${esc(x.confidence)}%</div></div>`
-  ).join(""):'<span class="small">Ingen marknadsdata.</span>';
-
-  const ts=(d.trades||[]).slice().reverse();
-  document.getElementById("trades").innerHTML=ts.length?ts.map(t=>
-   `<div class="market"><b>${esc(t.side)}</b> · ${esc(t.product_id)} · ${Number(t.price).toFixed(2)} EUR
-    <div class="small">${t.pnl_sek!==undefined?"Resultat: "+Number(t.pnl_sek).toFixed(2)+" SEK":""}</div></div>`
-  ).join(""):'<span class="small">Inga paper-affärer ännu.</span>';
- }catch(e){
-  document.getElementById("status").textContent="VÄNTAR PÅ BACKEND";
-  document.getElementById("action").textContent="Backend svarar inte ännu";
- }
-}
-async function togglePaper(){
- try{await fetch(API+(running?"/api/paper/stop":"/api/paper/start"),{method:"POST"}); await tick();}
- catch(e){}
-}
-tick();
-setInterval(tick,60000);
-</script></body></html>
+<!doctype html><html lang="sv"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI Crypto Trader</title>
+<style>body{margin:0;background:#0b1020;color:#eee;font-family:Arial}.w{max-width:760px;margin:auto;padding:16px}.c{background:#151d32;border:1px solid #293550;border-radius:16px;padding:16px;margin:12px 0}button{width:100%;padding:15px;border:0;border-radius:12px;font-weight:bold;font-size:17px}.go{background:#22c55e}.stop{background:#ef4444;color:white}.row,.market{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #293550}.big{font-size:28px;font-weight:bold}.muted{color:#9ca3af}</style></head><body><div class="w">
+<div class="c"><h1>🤖 AI Crypto Trader</h1><div class="muted">SPOT • PAPER TEST</div></div>
+<div class="c"><b id="backend">Backend: …</b><br><b id="coinbase">Coinbase: …</b><button id="btn" class="go" onclick="toggle()">STARTA TESTLÄGET</button></div>
+<div class="c"><h2>💰 Resultat</h2><div class="row"><span>Kontanter</span><b id="cash">1 000 kr</b></div><div class="row"><span>Totalt</span><b id="eq">1 000 kr</b></div><div class="row"><span>Resultat</span><b id="pnl">0 kr (0%)</b></div><div class="row"><span>Senaste</span><b id="act">–</b></div></div>
+<div class="c"><h2>🎯 Bästa signal</h2><div id="best" class="big">AVVAKTA</div><div id="info" class="muted">Laddar…</div></div>
+<div class="c"><h2>📊 Marknader</h2><div id="markets">Laddar…</div></div>
+<div class="c"><h2>🧾 Affärer</h2><div id="trades">Inga ännu.</div></div>
+<div class="c muted">🔒 Endast paper trading. Inga riktiga order, inga uttag, ingen hävstång.</div></div>
+<script>const API="https://ai-crypto-trader-f8cz.onrender.com";const money=x=>Number(x||0).toLocaleString("sv-SE",{maximumFractionDigits:2})+" kr";
+async function j(p,o){let r=await fetch(API+p,o);if(!r.ok)throw Error("HTTP "+r.status);return r.json()}
+function render(d){cash.textContent=money(d.cash);eq.textContent=money(d.equity);pnl.textContent=money(d.pnl_sek)+" ("+Number(d.pnl_pct||0).toFixed(2)+"%)";act.textContent=d.last_action||"–";let b=d.best;if(b){best.textContent=b.product_id+" – "+b.signal;info.textContent="Pris "+b.price+" EUR • "+b.confidence+"% • RSI "+b.rsi+" • "+b.reason}else{best.textContent="AVVAKTA";info.textContent=d.last_error||"Väntar på data"}markets.innerHTML=(d.markets||[]).map(m=>`<div class="market"><span><b>${m.product_id}</b> ${m.signal}</span><span>${m.confidence}% / ${m.score}</span></div>`).join("")||"Ingen data";trades.innerHTML=(d.trades||[]).slice().reverse().map(t=>`<div class="row"><span>${t.side} ${t.product_id}</span><span>${money(t.value)}</span></div>`).join("")||"Inga ännu.";btn.textContent=d.running?"STOPPA TESTLÄGET":"STARTA TESTLÄGET";btn.className=d.running?"stop":"go"}
+async function refresh(){try{let s=await j("/api/status");backend.innerHTML="Backend: 🟢 ANSLUTEN";coinbase.innerHTML=s.coinbase_credentials_configured?"Coinbase: 🟢 ANSLUTEN":"Coinbase: 🔴 SAKNAS";}catch(e){backend.innerHTML="Backend: 🔴 FEL"}try{render(await j("/api/paper/tick"))}catch(e){act.textContent="Backend svarar inte ännu"}}
+async function toggle(){let s=await j("/api/paper/status");render(await j(s.running?"/api/paper/stop":"/api/paper/start",{method:"POST"}))}
+refresh();setInterval(refresh,60000)</script></body></html>
