@@ -1,213 +1,140 @@
-import os
-import time
-from fastapi import FastAPI, HTTPException
+import os, time
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from coinbase.rest import RESTClient
 
-app = FastAPI(title="AI Crypto Trader Backend", version="0.4.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["GET"], allow_headers=["*"])
+APP_VERSION="1.0.0"
+START_SEK=1000.0
+MAX_POSITION=0.25
+FEE=0.001
+COINS=["BTC-EUR","ETH-EUR","SOL-EUR","XRP-EUR","ADA-EUR","AVAX-EUR","LINK-EUR","DOGE-EUR"]
 
-API_KEY = os.getenv("COINBASE_API_KEY", "").strip()
-API_SECRET = os.getenv("COINBASE_API_SECRET", "").strip()
+app=FastAPI(title="AI Crypto Trader",version=APP_VERSION)
+app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
 
-CANDIDATES = ["BTC-EUR","ETH-EUR","SOL-EUR","XRP-EUR","ADA-EUR","AVAX-EUR","LINK-EUR","DOGE-EUR"]
+paper={"running":False,"cash":START_SEK,"positions":{},"trades":[],"last_tick":None,"last_action":"Ingen åtgärd ännu","last_error":None}
 
 def client():
-    if not API_KEY or not API_SECRET:
-        raise HTTPException(status_code=503, detail="Coinbase credentials are not configured.")
-    try:
-        return RESTClient(api_key=API_KEY, api_secret=API_SECRET)
-    except Exception:
-        raise HTTPException(status_code=500, detail="Could not initialize Coinbase client.")
+    k=os.getenv("COINBASE_API_KEY"); s=os.getenv("COINBASE_API_SECRET")
+    if not k or not s: raise RuntimeError("Coinbase API-uppgifter saknas.")
+    return RESTClient(api_key=k,api_secret=s)
 
-def num(x):
-    try: return float(x)
-    except Exception: return None
+def num(x,d=0):
+    try:return float(x)
+    except:return d
 
-def candles_for(c, product_id):
-    now = int(time.time())
-    result = c.get_candles(product_id=product_id, start=str(now-72*60*60), end=str(now), granularity="ONE_HOUR", limit=72)
-    data = result.to_dict() if hasattr(result, "to_dict") else result
-    rows = []
-    for x in (data.get("candles", []) if isinstance(data, dict) else []):
-        close, ts, vol = num(x.get("close")), num(x.get("start")), num(x.get("volume")) or 0.0
-        if close is not None: rows.append((ts or 0, close, vol))
-    rows.sort(key=lambda z:z[0])
-    return rows
+def candles(product):
+    now=int(time.time())
+    r=client().get_candles(product_id=product,start=str(now-72*3600),end=str(now),granularity="ONE_HOUR")
+    out=[]
+    for c in (getattr(r,"candles",None) or []):
+        x=num(c.get("close") if isinstance(c,dict) else getattr(c,"close",0))
+        if x>0: out.append(x)
+    return out
 
-def rsi(closes, period=14):
-    if len(closes) <= period: return None
-    gains=[]; losses=[]
-    for i in range(-period,0):
-        d=closes[i]-closes[i-1]
-        gains.append(max(d,0)); losses.append(max(-d,0))
-    ag=sum(gains)/period; al=sum(losses)/period
-    if al == 0: return 100.0
-    rs=ag/al
-    return 100.0-(100.0/(1.0+rs))
+def sma(v,n): return sum(v[-n:])/n if len(v)>=n else None
 
-def analyze(product_id, rows):
-    closes=[r[1] for r in rows]; vols=[r[2] for r in rows]
-    if len(closes)<24: return None
-    short=sum(closes[-6:])/6; mid=sum(closes[-12:])/12; long=sum(closes[-24:])/24
-    mom=(closes[-1]/closes[-4]-1)*100
-    r=rsi(closes); avg_vol=sum(vols[-24:])/24 if any(vols[-24:]) else 0
-    vol_ratio=vols[-1]/avg_vol if avg_vol else 1
-    score=0; reasons=[]
-    if short>mid>long: score+=2; reasons.append("upptrend")
-    elif short<mid<long: score-=2; reasons.append("nedtrend")
-    if mom>0.35: score+=1; reasons.append("positivt momentum")
-    elif mom<-0.35: score-=1; reasons.append("negativt momentum")
-    if r is not None:
-        if 52<=r<=68: score+=1; reasons.append("RSI stödjer trend")
-        elif r>=75: score-=1; reasons.append("RSI överköpt")
-        elif r<=25: score+=1; reasons.append("RSI översåld")
-    if vol_ratio>=1.25:
-        score += 1 if mom>0 else -1
-        reasons.append("hög volym")
-    signal="KÖP" if score>=3 else ("SÄLJ" if score<=-3 else "AVVAKTA")
-    return {"product_id":product_id,"signal":signal,"confidence":min(90,50+abs(score)*10),
-            "price_eur":round(closes[-1],2),"rsi":round(r,1) if r is not None else None,
-            "momentum_pct":round(mom,2),"score":score,"volume_ratio":round(vol_ratio,2),
-            "reason":", ".join(reasons) if reasons else "svag blandad signal","test_only":True}
+def rsi(v,n=14):
+    if len(v)<=n:return 50
+    g=[max(v[i]-v[i-1],0) for i in range(-n,0)]
+    l=[max(v[i-1]-v[i],0) for i in range(-n,0)]
+    if sum(l)==0:return 100
+    return 100-100/(1+(sum(g)/n)/(sum(l)/n))
+
+def analyse(p):
+    v=candles(p)
+    if len(v)<30: raise RuntimeError(p+": för lite data")
+    price=v[-1]; a=sma(v,6); b=sma(v,12); c=sma(v,24)
+    mom=(price/v[-4]-1)*100; rr=rsi(v); score=0; why=[]
+    if a>b>c: score+=2; why.append("positiv trend")
+    elif a<b<c: score-=2; why.append("negativ trend")
+    if mom>.35: score+=1; why.append("positivt momentum")
+    elif mom<-.35: score-=1; why.append("negativt momentum")
+    if 52<=rr<=68: score+=1; why.append("RSI stödjer")
+    elif rr>=75: score-=1; why.append("RSI överköpt")
+    elif rr<=25: score+=1; why.append("RSI översåld")
+    sig="KÖP" if score>=3 else "SÄLJ" if score<=-3 else "AVVAKTA"
+    return {"product_id":p,"price":round(price,6),"score":score,"signal":sig,
+            "confidence":min(90,50+abs(score)*10),"rsi":round(rr,1),
+            "momentum":round(mom,2),"reason":", ".join(why) or "ingen tydlig signal"}
+
+def scan():
+    m=[]; e=[]
+    for p in COINS:
+        try:m.append(analyse(p))
+        except Exception as x:e.append(str(x))
+    m.sort(key=lambda x:(x["score"],x["confidence"]),reverse=True)
+    return {"best":m[0] if m else None,"markets":m,"errors":e,"scanned":len(m),"universe":COINS}
+
+def equity():
+    total=paper["cash"]
+    for p,pos in paper["positions"].items():
+        total+=pos["qty"]*(analyse(p)["price"] if True else pos["entry"])
+    return total
+
+def snap():
+    e=equity(); pnl=e-START_SEK
+    return {"running":paper["running"],"cash":round(paper["cash"],2),"equity":round(e,2),
+            "pnl_sek":round(pnl,2),"pnl_pct":round(pnl/START_SEK*100,2),
+            "positions":paper["positions"],"trades":paper["trades"][-20:],
+            "last_tick":paper["last_tick"],"last_action":paper["last_action"],
+            "last_error":paper["last_error"],"paper_trading":True,"real_orders":False}
 
 @app.get("/")
-def root(): return {"service":"AI Crypto Trader Backend","mode":"read-only","trading_enabled":False}
+def root(): return {"service":"AI Crypto Trader","version":APP_VERSION,"mode":"paper","real_orders":False,"leverage":False}
 
 @app.get("/health")
-def health(): return {"ok":True,"trading_enabled":False}
+def health(): return {"status":"ok","version":APP_VERSION}
 
 @app.get("/api/status")
-def status():
-    return {"backend":"online","coinbase_credentials_configured":bool(API_KEY and API_SECRET),
-            "mode":"read-only","trading_enabled":False,"leverage":False,"paper_trading":True}
-
-@app.get("/api/balances")
-def balances():
-    c=client()
-    try:
-        result=c.get_accounts(); data=result.to_dict() if hasattr(result,"to_dict") else result
-        accounts=data.get("accounts",[]) if isinstance(data,dict) else []
-        out=[]
-        for a in accounts:
-            if not a.get("active",True): continue
-            bal=a.get("available_balance",{}) or {}; hold=a.get("hold",{}) or {}
-            out.append({"currency":a.get("currency"),"available":bal.get("value"),"hold":hold.get("value"),"active":a.get("active"),"ready":a.get("ready")})
-        return {"balances":out}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Coinbase request failed: {type(e).__name__}")
+def status(): return {"backend":"online","version":APP_VERSION,
+ "coinbase_credentials_configured":bool(os.getenv("COINBASE_API_KEY") and os.getenv("COINBASE_API_SECRET")),
+ "mode":"paper","trading_enabled":False,"real_orders":False,"leverage":False,"paper_trading":True}
 
 @app.get("/api/signal")
 def signal():
-    c=client(); results=[]
-    for product_id in CANDIDATES:
-        try:
-            a=analyze(product_id,candles_for(c,product_id))
-            if a: results.append(a)
-        except Exception: continue
-    if not results:
-        raise HTTPException(status_code=502, detail="No supported EUR spot market data available.")
-    best=max(results,key=lambda x:(abs(x["score"]),x["confidence"],x["volume_ratio"]))
-    return {"signal":best["signal"],"best":best,
-            "markets":sorted(results,key=lambda x:(x["score"],x["confidence"]),reverse=True),
-            "scanned":len(results),"universe":[x["product_id"] for x in results],
-            "paper_trading":True,"test_only":True,
-            "reason":"Testmotor: trend + momentum + RSI + volym. Ingen order skickas."}
-
-# Ingen order-endpoint. Riktiga köp/sälj är avstängda.
-
-# ---------------- PAPER TRADING ENGINE ----------------
-PAPER_START_SEK = 1000.0
-MAX_POSITION_PCT = 0.25
-FEE_PCT = 0.001  # simulation only
-paper = {
-    "cash_sek": PAPER_START_SEK,
-    "positions": {},
-    "trades": [],
-    "equity": PAPER_START_SEK,
-    "running": True,
-    "last_tick": None,
-}
-
-def paper_snapshot(markets):
-    equity = paper["cash_sek"]
-    for p, pos in paper["positions"].items():
-        m = next((x for x in markets if x.get("product_id") == p), None)
-        if m and m.get("price"):
-            equity += pos["qty"] * m["price"]
-    paper["equity"] = round(equity, 2)
-    return {
-        "running": paper["running"],
-        "cash_sek": round(paper["cash_sek"], 2),
-        "equity_sek": round(paper["equity"], 2),
-        "pnl_sek": round(paper["equity"] - PAPER_START_SEK, 2),
-        "positions": paper["positions"],
-        "trades": paper["trades"][-20:],
-        "test_only": True,
-    }
+    try:return {**scan(),"paper_trading":True,"test_only":True}
+    except Exception as e:return {"best":None,"markets":[],"errors":[str(e)],"scanned":0,"universe":COINS,"paper_trading":True,"test_only":True}
 
 @app.get("/api/paper/status")
-def paper_status():
-    # Status without forcing a market scan.
-    return {
-        "running": paper["running"],
-        "cash_sek": round(paper["cash_sek"], 2),
-        "equity_sek": round(paper["equity"], 2),
-        "pnl_sek": round(paper["equity"] - PAPER_START_SEK, 2),
-        "positions": paper["positions"],
-        "trades": paper["trades"][-20:],
-        "test_only": True,
-        "automatic_buy_sell": True,
-        "last_tick": paper.get("last_tick"),
-        "last_action": paper.get("last_action", "STARTAR"),
-    }
-
-@app.get("/api/paper/tick")
-def paper_tick():
-    # Reuse the scanner endpoint and automatically act only in PAPER mode.
-    result = signal()
-    markets = result.get("markets", [])
-    if not paper["running"]:
-        return {"action": "STOPPAD", **paper_snapshot(markets)}
-
-    best = result.get("best")
-    action = "AVVAKTA"
-    if best:
-        pid = best["product_id"]
-        price = float(best["price"])
-        sig = best["signal"]
-        current = paper["positions"].get(pid)
-
-        # BUY: only if signal is strong and no position exists.
-        if sig == "KÖP" and not current and paper["cash_sek"] > 10:
-            budget = min(paper["cash_sek"] * MAX_POSITION_PCT, PAPER_START_SEK * MAX_POSITION_PCT)
-            qty = (budget * (1 - FEE_PCT)) / price
-            paper["cash_sek"] -= budget
-            paper["positions"][pid] = {"qty": qty, "entry_price": price, "entry_value": budget}
-            paper["trades"].append({"side":"KÖP","product_id":pid,"price":price,"value_sek":round(budget,2)})
-            action = "AUTOMATISKT KÖP"
-
-        # SELL: sell an existing position when the signal turns negative.
-        elif sig == "SÄLJ" and current:
-            proceeds = current["qty"] * price * (1 - FEE_PCT)
-            pnl = proceeds - current["entry_value"]
-            paper["cash_sek"] += proceeds
-            paper["trades"].append({"side":"SÄLJ","product_id":pid,"price":price,"value_sek":round(proceeds,2),"pnl_sek":round(pnl,2)})
-            del paper["positions"][pid]
-            action = "AUTOMATISKT SÄLJ"
-
-    paper["last_tick"] = time.time()
-    paper["last_action"] = action
-    snap = paper_snapshot(markets)
-    snap.update({"action": action, "best": best})
-    return snap
+def pstatus(): return snap()
 
 @app.post("/api/paper/start")
-def paper_start():
-    paper["running"] = True
-    return {"running": True, "test_only": True}
+def start():
+    paper["running"]=True; paper["last_error"]=None; paper["last_action"]="Testläge startat"; return snap()
 
 @app.post("/api/paper/stop")
-def paper_stop():
-    paper["running"] = False
-    return {"running": False, "test_only": True}
+def stop():
+    paper["running"]=False; paper["last_action"]="Testläge stoppat"; return snap()
+
+@app.get("/api/paper/tick")
+def tick():
+    paper["last_tick"]=int(time.time())
+    if not paper["running"]:
+        paper["last_action"]="Väntar – starta testläget"; return snap()
+    try:
+        r=scan(); best=r["best"]
+        if not best:
+            paper["last_action"]="AVVAKTA – ingen giltig marknadsdata"; paper["last_error"]="; ".join(r["errors"][-3:])
+            return {**snap(),"best":None,"markets":r["markets"]}
+        p=best.get("product_id"); price=num(best.get("price")); sig=best.get("signal","AVVAKTA")
+        if not p or price<=0:
+            paper["last_action"]="AVVAKTA – ogiltig signaldata"; return {**snap(),"best":best,"markets":r["markets"]}
+        pos=paper["positions"].get(p)
+        if sig=="KÖP" and not pos:
+            budget=min(paper["cash"],START_SEK*MAX_POSITION)
+            if budget>=5:
+                fee=budget*FEE; qty=(budget-fee)/price; paper["cash"]-=budget
+                paper["positions"][p]={"qty":qty,"entry_price":price,"cost":budget}
+                paper["trades"].append({"time":int(time.time()),"side":"KÖP","product_id":p,"price":price,"qty":qty,"value":budget,"paper":True})
+                paper["last_action"]=f"PAPER KÖP {p} för {budget:.2f} kr"
+        elif sig=="SÄLJ" and pos:
+            gross=pos["qty"]*price; net=gross-gross*FEE; paper["cash"]+=net
+            paper["trades"].append({"time":int(time.time()),"side":"SÄLJ","product_id":p,"price":price,"qty":pos["qty"],"value":net,"pnl_sek":net-pos["cost"],"paper":True})
+            del paper["positions"][p]; paper["last_action"]=f"PAPER SÄLJ {p} för {net:.2f} kr"
+        else: paper["last_action"]=f"AVVAKTA – {p}: {sig} ({best.get('confidence',0)}%)"
+        paper["last_error"]=None
+        return {**snap(),"best":best,"markets":r["markets"]}
+    except Exception as e:
+        paper["last_error"]=str(e); paper["last_action"]="AVVAKTA – tekniskt fel, ingen order"
+        return {**snap(),"best":None,"markets":[],"error":str(e)}
