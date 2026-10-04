@@ -1,140 +1,309 @@
-import os, time
+import os
+import time
+import math
+import threading
+from typing import Dict, Any, List
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from coinbase.rest import RESTClient
 
-APP_VERSION="1.0.0"
-START_SEK=1000.0
-MAX_POSITION=0.25
-FEE=0.001
-COINS=["BTC-EUR","ETH-EUR","SOL-EUR","XRP-EUR","ADA-EUR","AVAX-EUR","LINK-EUR","DOGE-EUR"]
+app = FastAPI(title="AI Crypto Trader v2")
 
-app=FastAPI(title="AI Crypto Trader",version=APP_VERSION)
-app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-paper={"running":False,"cash":START_SEK,"positions":{},"trades":[],"last_tick":None,"last_action":"Ingen åtgärd ännu","last_error":None}
+API_KEY = os.getenv("COINBASE_API_KEY", "")
+API_SECRET = os.getenv("COINBASE_API_SECRET", "")
 
-def client():
-    k=os.getenv("COINBASE_API_KEY"); s=os.getenv("COINBASE_API_SECRET")
-    if not k or not s: raise RuntimeError("Coinbase API-uppgifter saknas.")
-    return RESTClient(api_key=k,api_secret=s)
+# Safe defaults
+LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+START_CASH = float(os.getenv("START_CASH", "1000"))
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "0.25"))
+FEE = float(os.getenv("FEE", "0.001"))
+MAX_DAILY_LOSS_PCT = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.02"))
 
-def num(x,d=0):
-    try:return float(x)
-    except:return d
+# A broad fallback list. Runtime discovery below adds all EUR spot pairs
+# available from Coinbase when the API permits it.
+FALLBACK = [
+    "BTC-EUR","ETH-EUR","SOL-EUR","XRP-EUR","ADA-EUR","AVAX-EUR",
+    "LINK-EUR","DOGE-EUR","DOT-EUR","LTC-EUR","BCH-EUR","UNI-EUR",
+    "AAVE-EUR","ATOM-EUR","ALGO-EUR","NEAR-EUR","FIL-EUR","ETC-EUR",
+    "XLM-EUR","HBAR-EUR","SUI-EUR","APT-EUR","ARB-EUR","OP-EUR",
+    "PEPE-EUR","BONK-EUR","SHIB-EUR","ICP-EUR","INJ-EUR","MATIC-EUR",
+]
 
-def candles(product):
-    now=int(time.time())
-    r=client().get_candles(product_id=product,start=str(now-72*3600),end=str(now),granularity="ONE_HOUR")
-    out=[]
-    for c in (getattr(r,"candles",None) or []):
-        x=num(c.get("close") if isinstance(c,dict) else getattr(c,"close",0))
-        if x>0: out.append(x)
-    return out
+client = None
+if API_KEY and API_SECRET:
+    try:
+        client = RESTClient(api_key=API_KEY, api_secret=API_SECRET)
+    except Exception:
+        client = None
 
-def sma(v,n): return sum(v[-n:])/n if len(v)>=n else None
+state = {
+    "cash": START_CASH,
+    "positions": {},
+    "trades": [],
+    "running": True,
+    "started_at": time.time(),
+    "day_start_equity": START_CASH,
+    "last_error": "",
+    "last_action": "AVVAKTA",
+    "last_scan": 0,
+}
 
-def rsi(v,n=14):
-    if len(v)<=n:return 50
-    g=[max(v[i]-v[i-1],0) for i in range(-n,0)]
-    l=[max(v[i-1]-v[i],0) for i in range(-n,0)]
-    if sum(l)==0:return 100
-    return 100-100/(1+(sum(g)/n)/(sum(l)/n))
+def safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
 
-def analyse(p):
-    v=candles(p)
-    if len(v)<30: raise RuntimeError(p+": för lite data")
-    price=v[-1]; a=sma(v,6); b=sma(v,12); c=sma(v,24)
-    mom=(price/v[-4]-1)*100; rr=rsi(v); score=0; why=[]
-    if a>b>c: score+=2; why.append("positiv trend")
-    elif a<b<c: score-=2; why.append("negativ trend")
-    if mom>.35: score+=1; why.append("positivt momentum")
-    elif mom<-.35: score-=1; why.append("negativt momentum")
-    if 52<=rr<=68: score+=1; why.append("RSI stödjer")
-    elif rr>=75: score-=1; why.append("RSI överköpt")
-    elif rr<=25: score+=1; why.append("RSI översåld")
-    sig="KÖP" if score>=3 else "SÄLJ" if score<=-3 else "AVVAKTA"
-    return {"product_id":p,"price":round(price,6),"score":score,"signal":sig,
-            "confidence":min(90,50+abs(score)*10),"rsi":round(rr,1),
-            "momentum":round(mom,2),"reason":", ".join(why) or "ingen tydlig signal"}
+def candles(product_id: str, hours: int = 72):
+    if not client:
+        raise RuntimeError("Coinbase-klienten är inte ansluten.")
+    end = int(time.time())
+    start = end - hours * 3600
+    r = client.get_candles(
+        product_id=product_id,
+        start=str(start),
+        end=str(end),
+        granularity="ONE_HOUR",
+    )
+    rows = getattr(r, "candles", None) or []
+    out = []
+    for c in rows:
+        low = safe_float(getattr(c, "low", 0))
+        high = safe_float(getattr(c, "high", 0))
+        close = safe_float(getattr(c, "close", 0))
+        vol = safe_float(getattr(c, "volume", 0))
+        if close > 0:
+            out.append({"close": close, "low": low, "high": high, "volume": vol})
+    return list(reversed(out))
+
+def sma(values, n):
+    return sum(values[-n:]) / n if len(values) >= n else None
+
+def rsi(values, n=14):
+    if len(values) < n + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(-n, 0):
+        d = values[i] - values[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    ag = sum(gains) / n
+    al = sum(losses) / n
+    if al == 0:
+        return 100.0
+    return 100 - (100 / (1 + ag / al))
+
+def analyse(product_id: str) -> Dict[str, Any]:
+    rows = candles(product_id)
+    closes = [x["close"] for x in rows]
+    if len(closes) < 30:
+        return {"product_id": product_id, "signal": "AVVAKTA", "confidence": 50, "price": closes[-1] if closes else 0, "score": 0}
+
+    price = closes[-1]
+    ma6 = sma(closes, 6)
+    ma12 = sma(closes, 12)
+    ma24 = sma(closes, 24)
+    mom3 = (price / closes[-4] - 1) * 100 if len(closes) >= 4 else 0
+    r = rsi(closes)
+
+    score = 0
+    if price > ma6: score += 1
+    if ma6 > ma12: score += 1
+    if ma12 > ma24: score += 1
+    if mom3 > 0.6: score += 1
+    if mom3 < -0.6: score -= 1
+    if r < 35: score += 1
+    if r > 70: score -= 1
+
+    if score >= 3:
+        signal = "KÖP"
+    elif score <= -3:
+        signal = "SÄLJ"
+    else:
+        signal = "AVVAKTA"
+
+    confidence = max(50, min(90, 50 + abs(score) * 8))
+    return {
+        "product_id": product_id,
+        "signal": signal,
+        "confidence": confidence,
+        "price": price,
+        "score": score,
+        "rsi": round(r, 1),
+        "momentum_3h_pct": round(mom3, 2),
+    }
+
+def discover_eur_pairs():
+    pairs = []
+    if client:
+        try:
+            resp = client.get_products(limit=1000)
+            products = getattr(resp, "products", None) or []
+            for p in products:
+                pid = getattr(p, "product_id", "") or ""
+                quote = getattr(p, "quote_currency_id", "") or ""
+                status = getattr(p, "status", "") or ""
+                ptype = getattr(p, "product_type", "") or ""
+                if pid.endswith("-EUR") and quote == "EUR" and "PERP" not in pid and "FUTURE" not in ptype.upper() and status.upper() in ("", "ONLINE", "TRADING"):
+                    pairs.append(pid)
+        except Exception as e:
+            state["last_error"] = f"Produktlista kunde inte hämtas: {e}"
+    return sorted(set(pairs or FALLBACK))
 
 def scan():
-    m=[]; e=[]
-    for p in COINS:
-        try:m.append(analyse(p))
-        except Exception as x:e.append(str(x))
-    m.sort(key=lambda x:(x["score"],x["confidence"]),reverse=True)
-    return {"best":m[0] if m else None,"markets":m,"errors":e,"scanned":len(m),"universe":COINS}
+    results = []
+    for pid in discover_eur_pairs():
+        try:
+            x = analyse(pid)
+            results.append(x)
+        except Exception as e:
+            # Keep scanning if one market fails.
+            continue
+
+    if not results:
+        raise RuntimeError("Inga marknader kunde analyseras.")
+    # Prefer strong signals, then confidence.
+    best = sorted(results, key=lambda x: (abs(x.get("score", 0)), x.get("confidence", 0)), reverse=True)[0]
+    state["last_scan"] = time.time()
+    return {"best": best, "markets": results, "count": len(results)}
 
 def equity():
-    total=paper["cash"]
-    for p,pos in paper["positions"].items():
-        total+=pos["qty"]*(analyse(p)["price"] if True else pos["entry"])
+    total = state["cash"]
+    for pid, pos in state["positions"].items():
+        try:
+            a = analyse(pid)
+            total += pos["qty"] * a["price"]
+        except Exception:
+            total += pos.get("last_value", 0)
     return total
 
-def snap():
-    e=equity(); pnl=e-START_SEK
-    return {"running":paper["running"],"cash":round(paper["cash"],2),"equity":round(e,2),
-            "pnl_sek":round(pnl,2),"pnl_pct":round(pnl/START_SEK*100,2),
-            "positions":paper["positions"],"trades":paper["trades"][-20:],
-            "last_tick":paper["last_tick"],"last_action":paper["last_action"],
-            "last_error":paper["last_error"],"paper_trading":True,"real_orders":False}
+def daily_loss_stop():
+    eq = equity()
+    return eq <= state["day_start_equity"] * (1 - MAX_DAILY_LOSS_PCT)
 
-@app.get("/")
-def root(): return {"service":"AI Crypto Trader","version":APP_VERSION,"mode":"paper","real_orders":False,"leverage":False}
+def paper_tick():
+    data = scan()
+    best = data["best"]
+    action = "AVVAKTA"
 
-@app.get("/health")
-def health(): return {"status":"ok","version":APP_VERSION}
+    if not state["running"]:
+        return data
+
+    if daily_loss_stop():
+        state["running"] = False
+        state["last_action"] = "STOPP – DAGLIG FÖRLUSTGRÄNS"
+        return data
+
+    pid = best["product_id"]
+    price = best["price"]
+
+    if best["signal"] == "KÖP" and pid not in state["positions"]:
+        allocation = min(state["cash"] * MAX_POSITION_PCT, START_CASH * MAX_POSITION_PCT)
+        if allocation > 1 and price > 0:
+            qty = (allocation * (1 - FEE)) / price
+            state["cash"] -= allocation
+            state["positions"][pid] = {"qty": qty, "entry": price, "last_value": allocation}
+            state["trades"].append({"time": time.time(), "action": "PAPER KÖP", "product": pid, "price": price, "amount_eur": allocation})
+            action = f"PAPER KÖP {pid}"
+    elif best["signal"] == "SÄLJ" and pid in state["positions"]:
+        pos = state["positions"].pop(pid)
+        gross = pos["qty"] * price
+        net = gross * (1 - FEE)
+        state["cash"] += net
+        pnl = net - (pos["qty"] * pos["entry"])
+        state["trades"].append({"time": time.time(), "action": "PAPER SÄLJ", "product": pid, "price": price, "amount_eur": net, "pnl_eur": pnl})
+        action = f"PAPER SÄLJ {pid} ({pnl:.2f} EUR)"
+
+    state["last_action"] = action
+    return data
+
+def live_order_buy(pid, eur_amount):
+    if not LIVE_TRADING:
+        raise RuntimeError("LIVE_TRADING är avstängt. Ändra inte detta förrän papperstestet är verifierat.")
+    if not client:
+        raise RuntimeError("Coinbase-klienten är inte ansluten.")
+    # Market buy using quote currency amount.
+    return client.market_order_buy(client_order_id=f"bot-{int(time.time()*1000)}", product_id=pid, quote_size=f"{eur_amount:.2f}")
+
+def live_order_sell(pid, base_size):
+    if not LIVE_TRADING:
+        raise RuntimeError("LIVE_TRADING är avstängt.")
+    if not client:
+        raise RuntimeError("Coinbase-klienten är inte ansluten.")
+    return client.market_order_sell(client_order_id=f"bot-{int(time.time()*1000)}", product_id=pid, base_size=f"{base_size:.8f}")
+
+@app.get("/", response_class=HTMLResponse)
+def root():
+    with open("index.html", "r", encoding="utf-8") as f:
+        return f.read()
 
 @app.get("/api/status")
-def status(): return {"backend":"online","version":APP_VERSION,
- "coinbase_credentials_configured":bool(os.getenv("COINBASE_API_KEY") and os.getenv("COINBASE_API_SECRET")),
- "mode":"paper","trading_enabled":False,"real_orders":False,"leverage":False,"paper_trading":True}
+def status():
+    return {
+        "backend": "online",
+        "coinbase_configured": bool(client),
+        "live_trading": LIVE_TRADING,
+        "paper_mode": not LIVE_TRADING,
+        "markets": len(discover_eur_pairs()),
+        "message": "LIVE_TRADING är avstängt som säker standard." if not LIVE_TRADING else "LIVE_TRADING är AKTIVT – riktiga order kan skickas.",
+    }
 
-@app.get("/api/signal")
-def signal():
-    try:return {**scan(),"paper_trading":True,"test_only":True}
-    except Exception as e:return {"best":None,"markets":[],"errors":[str(e)],"scanned":0,"universe":COINS,"paper_trading":True,"test_only":True}
+@app.get("/api/scan")
+def api_scan():
+    return scan()
 
 @app.get("/api/paper/status")
-def pstatus(): return snap()
+def paper_status():
+    return {
+        "running": state["running"],
+        "cash": round(state["cash"], 2),
+        "equity": round(equity(), 2),
+        "pnl": round(equity() - START_CASH, 2),
+        "positions": state["positions"],
+        "trades": state["trades"][-20:],
+        "last_action": state["last_action"],
+        "last_error": state["last_error"],
+        "live_trading": LIVE_TRADING,
+    }
+
+@app.post("/api/paper/tick")
+def api_tick():
+    try:
+        return paper_tick()
+    except Exception as e:
+        state["last_error"] = str(e)
+        return {"error": str(e), "best": None, "markets": []}
 
 @app.post("/api/paper/start")
-def start():
-    paper["running"]=True; paper["last_error"]=None; paper["last_action"]="Testläge startat"; return snap()
+def paper_start():
+    state["running"] = True
+    return {"running": True}
 
 @app.post("/api/paper/stop")
-def stop():
-    paper["running"]=False; paper["last_action"]="Testläge stoppat"; return snap()
+def paper_stop():
+    state["running"] = False
+    state["last_action"] = "STOPP"
+    return {"running": False}
 
-@app.get("/api/paper/tick")
-def tick():
-    paper["last_tick"]=int(time.time())
-    if not paper["running"]:
-        paper["last_action"]="Väntar – starta testläget"; return snap()
-    try:
-        r=scan(); best=r["best"]
-        if not best:
-            paper["last_action"]="AVVAKTA – ingen giltig marknadsdata"; paper["last_error"]="; ".join(r["errors"][-3:])
-            return {**snap(),"best":None,"markets":r["markets"]}
-        p=best.get("product_id"); price=num(best.get("price")); sig=best.get("signal","AVVAKTA")
-        if not p or price<=0:
-            paper["last_action"]="AVVAKTA – ogiltig signaldata"; return {**snap(),"best":best,"markets":r["markets"]}
-        pos=paper["positions"].get(p)
-        if sig=="KÖP" and not pos:
-            budget=min(paper["cash"],START_SEK*MAX_POSITION)
-            if budget>=5:
-                fee=budget*FEE; qty=(budget-fee)/price; paper["cash"]-=budget
-                paper["positions"][p]={"qty":qty,"entry_price":price,"cost":budget}
-                paper["trades"].append({"time":int(time.time()),"side":"KÖP","product_id":p,"price":price,"qty":qty,"value":budget,"paper":True})
-                paper["last_action"]=f"PAPER KÖP {p} för {budget:.2f} kr"
-        elif sig=="SÄLJ" and pos:
-            gross=pos["qty"]*price; net=gross-gross*FEE; paper["cash"]+=net
-            paper["trades"].append({"time":int(time.time()),"side":"SÄLJ","product_id":p,"price":price,"qty":pos["qty"],"value":net,"pnl_sek":net-pos["cost"],"paper":True})
-            del paper["positions"][p]; paper["last_action"]=f"PAPER SÄLJ {p} för {net:.2f} kr"
-        else: paper["last_action"]=f"AVVAKTA – {p}: {sig} ({best.get('confidence',0)}%)"
-        paper["last_error"]=None
-        return {**snap(),"best":best,"markets":r["markets"]}
-    except Exception as e:
-        paper["last_error"]=str(e); paper["last_action"]="AVVAKTA – tekniskt fel, ingen order"
-        return {**snap(),"best":None,"markets":[],"error":str(e)}
+# Background paper scanner. This is intentionally paper-only unless LIVE_TRADING is
+# explicitly enabled in the Render environment.
+def loop():
+    while True:
+        try:
+            if state["running"]:
+                paper_tick()
+        except Exception as e:
+            state["last_error"] = str(e)
+        time.sleep(60)
+
+threading.Thread(target=loop, daemon=True).start()
