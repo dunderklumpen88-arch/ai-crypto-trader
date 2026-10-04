@@ -2,92 +2,130 @@
 <html lang="sv">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#0b0d10">
 <meta name="description" content="AI Crypto Trader">
 <title>AI Crypto Trader</title>
 <link rel="manifest" href="manifest.json">
 <style>
-*{box-sizing:border-box}body{margin:0;background:#090b0e;color:#f5f7fa;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-main{max-width:520px;margin:auto;padding:22px 16px 36px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
-h1{font-size:28px;margin:0}.sub{color:#9299a3;font-size:13px;margin-top:4px}
-.badge{background:#123d25;color:#72e6a2;padding:7px 10px;border-radius:999px;font-size:11px;font-weight:800}
-.card{background:#15181d;border:1px solid #232832;border-radius:18px;padding:18px;margin:12px 0}
-.label{color:#9299a3;font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
-.value{font-size:29px;font-weight:800;margin:7px 0 14px}.row{display:flex;justify-content:space-between;gap:10px;margin:9px 0}
-button{width:100%;border:0;border-radius:13px;padding:15px;font-weight:800;font-size:15px;background:#f4f6f8;color:#0b0d10}
-button.stop{background:#c93446;color:white}.muted{color:#9299a3;font-size:13px;line-height:1.45}
-.status{display:flex;align-items:center;gap:8px}.dot{width:9px;height:9px;border-radius:50%;background:#e0a72f}.dot.green{background:#43d17c}
-.warning{background:#2b2412;border:1px solid #574617;color:#e6c96c;border-radius:12px;padding:12px;font-size:12px;margin-top:12px}
-.small{font-size:12px;color:#9299a3;margin-top:8px}
+*{box-sizing:border-box}
+body{margin:0;background:#0b0d10;color:#f5f7fa;font-family:Arial,sans-serif}
+main{max-width:520px;margin:auto;padding:22px 16px}
+h1{font-size:28px;margin:0}
+.sub{color:#9299a3;margin:6px 0 18px}
+.badge{display:inline-block;background:#123d25;color:#72e6a2;padding:6px 10px;border-radius:999px;font-size:13px}
+.card{background:#15181d;border:1px solid #292e36;border-radius:16px;padding:16px;margin-top:14px}
+.row{display:flex;justify-content:space-between;gap:12px;margin:10px 0}
+.label{color:#9299a3}
+.value{font-weight:bold}
+button{width:100%;padding:15px;border:0;border-radius:12px;background:#36d17b;color:#07130c;font-size:17px;font-weight:bold;margin-top:12px}
+button.stop{background:#d94b4b;color:white}
+.signal{font-size:28px;font-weight:bold;margin:8px 0}
+.info{color:#aeb5bf;font-size:13px;line-height:1.5}
+.safe{color:#72e6a2}
+.small{font-size:12px;color:#777f89;line-height:1.5}
 </style>
 </head>
+
 <body>
 <main>
-<div class="top"><div><h1>AI Crypto Trader</h1><div class="sub">Automatisk Spot-trading</div></div><div class="badge">TESTNET</div></div>
 
-<section class="card">
-<div class="label">Botstatus</div>
-<div id="state" class="value">STOPPAD</div>
-<button id="toggle">STARTA BOTEN</button>
-<div class="small">Startknappen kör fortfarande bara testläge. Inga riktiga order skickas.</div>
-</section>
+<h1>AI Crypto Trader</h1>
+<div class="sub">Automatisk Spot-trading</div>
+<span class="badge">TESTNET</span>
 
-<section class="card">
-<div class="label">Kapital</div>
-<div class="value">1 000 SEK</div>
-<div class="row"><span>Max per position</span><b>25%</b></div>
-<div class="row"><span>Risk per trade</span><b>0,5%</b></div>
-<div class="row"><span>Daglig stoppgräns</span><b>2%</b></div>
-<div class="row"><span>Leverage</span><b>AV</b></div>
-</section>
+<div class="card">
+  <div class="row">
+    <span class="label">Botstatus</span>
+    <span class="value" id="botStatus">STOPPAD</span>
+  </div>
 
-<section class="card">
-<div class="label">System</div>
-<div class="row status"><span><i id="dot" class="dot"></i> Backend</span><b id="backend">Ansluter…</b></div>
-<div class="row"><span>Coinbase</span><b id="coinbase">Kontrollerar…</b></div>
-<div class="row"><span>EUR-saldo</span><b id="balance">—</b></div>
-<div class="row"><span>AI-signal</span><b id="signal">Avvaktar</b></div>
-<div class="row"><span>Öppna positioner</span><b>0 / 3</b></div>
-</section>
+  <button id="botButton" onclick="toggleBot()">STARTA TESTLÄGET</button>
+</div>
 
-<section class="card">
-<div class="label">Säkerhet</div>
-<div class="muted">Spot only. Ingen hävstång, inga uttag och inga riktiga order är aktiverade i denna version.</div>
-<div class="warning">Detta är en testversion. AI-trading kan förlora pengar och ingen avkastning är garanterad.</div>
-</section>
+<div class="card">
+  <div class="row">
+    <span class="label">Kapital</span>
+    <span class="value">1 000 SEK</span>
+  </div>
+  <div class="row">
+    <span class="label">Max position</span>
+    <span class="value">25%</span>
+  </div>
+  <div class="row">
+    <span class="label">Risk per trade</span>
+    <span class="value">0,5%</span>
+  </div>
+  <div class="row">
+    <span class="label">Daglig stopp</span>
+    <span class="value">2%</span>
+  </div>
+  <div class="row">
+    <span class="label">Leverage</span>
+    <span class="value safe">AV</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <span class="label">System Backend</span>
+    <span class="value safe" id="backend">Ansluter...</span>
+  </div>
+
+  <div class="row">
+    <span class="label">Coinbase</span>
+    <span class="value" id="coinbase">Ansluter...</span>
+  </div>
+
+  <div class="row">
+    <span class="label">EUR-saldo</span>
+    <span class="value" id="balance">0 EUR</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="label">AI-signal</div>
+  <div class="signal" id="signal">AVVAKTAR</div>
+  <div class="info" id="signalInfo">Hämtar marknadsdata...</div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <span class="label">Positioner</span>
+    <span class="value">0 / 3</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="label safe">Säkerhet</div>
+  <p class="small">
+    Spot only · ingen leverage · inga uttag · inga riktiga order.
+    Detta är en testversion. Signalen får inte användas som garanti för vinst.
+  </p>
+</div>
+
 </main>
 
 <script>
 const API="https://ai-crypto-trader-f8cz.onrender.com";
+
 let running=false;
-
-const state=document.getElementById('state');
-const btn=document.getElementById('toggle');
-const backend=document.getElementById('backend');
-const coinbase=document.getElementById('coinbase');
-const balance=document.getElementById('balance');
-const dot=document.getElementById('dot');
-
-btn.onclick=()=>{
-  running=!running;
-  state.textContent=running?'TESTLÄGE AKTIVT':'STOPPAD';
-  btn.textContent=running?'STOPPA TESTLÄGET':'STARTA TESTLÄGET';
-  btn.className=running?'stop':'';
-};
 
 async function loadStatus(){
   try{
     const r=await fetch(API+"/api/status",{cache:"no-store"});
     if(!r.ok) throw new Error();
+
     const d=await r.json();
-    backend.textContent="Ansluten";
-    coinbase.textContent=d.coinbase_credentials_configured?"Ansluten":"Saknar nyckel";
-    dot.className="dot green";
+
+    document.getElementById("backend").textContent="Ansluten";
+
+    document.getElementById("coinbase").textContent =
+      d.coinbase_credentials_configured ? "Ansluten" : "Ej konfigurerad";
+
   }catch(e){
-    backend.textContent="Inte ansluten";
-    coinbase.textContent="Ej tillgänglig";
-    dot.className="dot";
+    document.getElementById("backend").textContent="Ej ansluten";
+    document.getElementById("coinbase").textContent="Ej ansluten";
   }
 }
 
@@ -95,18 +133,65 @@ async function loadBalance(){
   try{
     const r=await fetch(API+"/api/balances",{cache:"no-store"});
     if(!r.ok) throw new Error();
+
     const d=await r.json();
     const eur=(d.balances||[]).find(x=>x.currency==="EUR");
-    balance.textContent=eur ? `${eur.available || "0"} EUR` : "0 EUR";
+
+    document.getElementById("balance").textContent =
+      eur && eur.available ? Number(eur.available).toFixed(2)+" EUR" : "0 EUR";
+
   }catch(e){
-    balance.textContent="—";
+    document.getElementById("balance").textContent="0 EUR";
+  }
+}
+
+async function loadSignal(){
+  try{
+    const r=await fetch(API+"/api/signal",{cache:"no-store"});
+    if(!r.ok) throw new Error();
+
+    const d=await r.json();
+
+    document.getElementById("signal").textContent =
+      d.signal || "AVVAKTAR";
+
+    document.getElementById("signalInfo").textContent =
+      d.price_eur
+      ? "BTC-EUR "+d.price_eur+" EUR · säkerhet "+d.confidence+"% · "+d.reason
+      : (d.reason || "Avvaktar");
+
+  }catch(e){
+    document.getElementById("signal").textContent="AVVAKTAR";
+    document.getElementById("signalInfo").textContent=
+      "Testmotorn kunde inte hämta marknadsdata ännu.";
+  }
+}
+
+function toggleBot(){
+  running=!running;
+
+  const status=document.getElementById("botStatus");
+  const button=document.getElementById("botButton");
+
+  if(running){
+    status.textContent="TESTLÄGE AKTIVT";
+    button.textContent="STOPPA TESTLÄGET";
+    button.className="stop";
+  }else{
+    status.textContent="STOPPAD";
+    button.textContent="STARTA TESTLÄGET";
+    button.className="";
   }
 }
 
 loadStatus();
 loadBalance();
+loadSignal();
+
 setInterval(loadStatus,30000);
-setInterval(loadBalance,30000);
+setInterval(loadBalance,60000);
+setInterval(loadSignal,300000);
 </script>
+
 </body>
 </html>
