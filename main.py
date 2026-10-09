@@ -2,7 +2,7 @@ import os, time, threading, math, traceback
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
+from trader_intelligence import collect_public_signals
 try:
     from coinbase.rest import RESTClient
 except Exception:
@@ -260,7 +260,9 @@ def paper_stop():
 @app.api_route("/api/paper/tick",methods=["GET","POST"])
 def api_tick():
     return {"ok":paper_tick()}
-
+@app.get("/api/trader-intelligence/status")
+def trader_intelligence_status():
+    return collect_public_signals()
 @app.get("/")
 def root():
     return {"app":"AI Crypto Trader","version":APP_VERSION,"mode":"PAPER"}
