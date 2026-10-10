@@ -50,6 +50,28 @@ th{color:#9caac4}
 </div>
 
 <div class="card">
+<h2>Automatisk pappershandel</h2>
+<div class="note">Endast simulering. Max 100 kr per affär, högst 4 affärer per dygn. Kontroll var 15:e minut.</div>
+<div class="row" style="margin-top:12px">
+<button onclick="autoAction('start')">Starta automatisk handel</button>
+<button class="secondary" onclick="autoAction('stop')">Stoppa</button>
+<button class="secondary" onclick="loadAuto()">Uppdatera status</button>
+</div>
+<div id="autostatus" class="status">Hämtar status…</div>
+</div>
+ 
+<div class="card">
+<div class="card">
+<h2>Automatisk pappershandel</h2>
+<div class="note">Endast simulering. Max 100 kr per affär, högst 4 affärer per dygn. Kontroll var 15:e minut.</div>
+<div class="row" style="margin-top:12px">
+<button onclick="autoAction('start')">Starta automatisk handel</button>
+<button class="secondary" onclick="autoAction('stop')">Stoppa</button>
+<button class="secondary" onclick="loadAuto()">Uppdatera status</button>
+</div>
+<div id="autostatus" class="status">Hämtar status…</div>
+</div>
+
 <h2>Simulerad order</h2>
 <div class="row">
 <div><label for="product">Kryptovaluta</label>
@@ -152,6 +174,46 @@ async function loadScan(){
  }
 }
 
+async function loadAuto(){
+  try{
+    const response = await fetch('/api/auto/status');
+    const data = await response.json();
+
+    document.getElementById('autostatus').textContent =
+      (data.enabled ? 'AKTIV' : 'AVSTÄNGD') +
+      ' · ' + data.mode +
+      ' · Max ' + data.max_sek_per_trade + ' kr/affär' +
+      ' · ' + data.trades_today + '/' + data.max_trades_per_day +
+      ' affärer idag · Kontroll var ' + data.interval_minutes +
+      ' min. ' + data.message;
+  } catch(error){
+    document.getElementById('autostatus').textContent =
+      'Kunde inte hämta status. Kontrollera anslutningen.';
+  }
+}
+
+async function autoAction(action){
+  try{
+    const response = await fetch('/api/auto/' + action, {
+      method: 'POST'
+    });
+    const data = await response.json();
+
+    if(!response.ok){
+      throw new Error(data.detail || 'Serverfel');
+    }
+
+    await loadAuto();
+    document.getElementById('globalstatus').textContent =
+      action === 'start'
+      ? 'Automatisk pappershandel aktiverad.'
+      : 'Automatisk pappershandel stoppad.';
+  } catch(error){
+    document.getElementById('autostatus').textContent =
+      'Fel: ' + error.message;
+  }
+}
+
 async function placeOrder(side){
  const status=el('orderstatus');
  status.textContent='Skickar simulerad order…';
@@ -174,6 +236,10 @@ async function placeOrder(side){
 
 refresh();
 loadScan();
+ refresh();
+loadScan();
+loadAuto();
+setInterval(refresh,20000);
 setInterval(refresh,20000);
 </script>
 </body>
