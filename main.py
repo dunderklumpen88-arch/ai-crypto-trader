@@ -472,3 +472,167 @@ def tax_summary():
             "Detta är endast testunderlag, inte en färdig K4."
         ),
     }
+# AUTOMATISK PAPPERSHANDEL – ENDAST SIMULERING
+import asyncio
+
+AUTO_MAX_PER_TRADE_SEK = 100
+AUTO_MAX_TRADES_PER_DAY = 4
+AUTO_INTERVAL_SECONDS = 900
+AUTO_MIN_CONFIDENCE = 60
+
+auto_settings = {
+    "enabled": False,
+    "trades_today": 0,
+    "day": datetime.now(timezone.utc).date().isoformat(),
+    "last_message": "Automatisk handel är avstängd",
+    "last_run": None,
+}
+
+
+def run_auto_paper_cycle():
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    with lock:
+        if auto_settings["day"] != today:
+            auto_settings["day"] = today
+            auto_settings["trades_today"] = 0
+
+        if not auto_settings["enabled"]:
+            return
+
+        if auto_settings["trades_today"] >= AUTO_MAX_TRADES_PER_DAY:
+            auto_settings["last_message"] = "Dagens affärsgräns är nådd"
+            return
+
+    try:
+        markets = market_data()
+        signals = [analyse(item) for item in markets]
+
+        with lock:
+            held = set(state["positions"].keys())
+            cash = state["cash_sek"]
+
+        # Sälj ett befintligt innehav vid en tydligt negativ signal.
+        for signal in signals:
+            product = signal.get("product")
+            if (
+                product in held
+                and signal.get("signal") == "NEGATIV"
+                and signal.get("confidence", 0) >= AUTO_MIN_CONFIDENCE
+            ):
+                with lock:
+                    position = state["positions"].get(product)
+                if not position:
+                    continue
+
+                price = signal.get("price_eur")
+                if not price or price <= 0:
+                    continue
+
+                amount = position["quantity"] * price * EURSEK
+                if amount > 1:
+                    paper_order(PaperOrder(
+                        product=product,
+                        side="SÄLJ",
+                        amount_sek=amount
+                    ))
+                    with lock:
+                        auto_settings["trades_today"] += 1
+                        auto_settings["last_message"] = (
+                            "Simulerad försäljning: " + product
+                        )
+                        auto_settings["last_run"] = now_iso()
+                    return
+
+        # Köp högst en ny valuta per kontroll.
+        for signal in signals:
+            product = signal.get("product")
+            if (
+                product not in held
+                and signal.get("signal") == "POSITIV"
+                and signal.get("confidence", 0) >= AUTO_MIN_CONFIDENCE
+                and cash >= 10
+            ):
+                with lock:
+                    if (
+                        not auto_settings["enabled"]
+                        or auto_settings["trades_today"] >= AUTO_MAX_TRADES_PER_DAY
+                    ):
+                        return
+
+                amount = min(AUTO_MAX_PER_TRADE_SEK, cash)
+                paper_order(PaperOrder(
+                    product=product,
+                    side="KÖP",
+                    amount_sek=amount
+                ))
+                with lock:
+                    auto_settings["trades_today"] += 1
+                    auto_settings["last_message"] = (
+                        "Simulerat köp: " + product
+                    )
+                    auto_settings["last_run"] = now_iso()
+                return
+
+        with lock:
+            auto_settings["last_message"] = (
+                "Ingen affär: ingen tillräckligt stark signal eller saldo saknas"
+            )
+            auto_settings["last_run"] = now_iso()
+
+    except Exception as exc:
+        with lock:
+            auto_settings["last_message"] = "Fel i automatisk analys: " + str(exc)[:150]
+
+
+async def auto_paper_worker():
+    while True:
+        try:
+            with lock:
+                enabled = auto_settings["enabled"]
+
+            if enabled:
+                await asyncio.to_thread(run_auto_paper_cycle)
+
+        except Exception:
+            pass
+
+        await asyncio.sleep(AUTO_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def start_auto_paper_worker():
+    asyncio.create_task(auto_paper_worker())
+
+
+@app.get("/api/auto/status")
+def auto_paper_status():
+    with lock:
+        return {
+            "enabled": auto_settings["enabled"],
+            "mode": "PAPER ONLY",
+            "real_orders_enabled": False,
+            "max_sek_per_trade": AUTO_MAX_PER_TRADE_SEK,
+            "max_trades_per_day": AUTO_MAX_TRADES_PER_DAY,
+            "trades_today": auto_settings["trades_today"],
+            "interval_minutes": AUTO_INTERVAL_SECONDS // 60,
+            "last_run": auto_settings["last_run"],
+            "message": auto_settings["last_message"],
+        }
+
+
+@app.post("/api/auto/start")
+def start_auto_paper():
+    with lock:
+        auto_settings["enabled"] = True
+        auto_settings["last_message"] = "Automatisk pappershandel aktiverad"
+    return auto_paper_status()
+
+
+@app.post("/api/auto/stop")
+def stop_auto_paper():
+    with lock:
+        auto_settings["enabled"] = False
+        auto_settings["last_message"] = "Automatisk pappershandel stoppad"
+    return auto_paper_status()
+            
