@@ -594,10 +594,11 @@ async def auto_paper_worker():
             if enabled:
                 await asyncio.to_thread(run_auto_paper_cycle)
 
-        except Exception:
-            pass
-
-        await asyncio.sleep(AUTO_INTERVAL_SECONDS)
+        except Exception as exc:
+    with lock:
+        auto_settings["last_message"] = (
+            "Fel i automatisk loop: " + str(exc)[:150]
+        )
 
 
 @app.on_event("startup")
