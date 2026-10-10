@@ -1,50 +1,180 @@
-<!doctype html><html lang="sv"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI Crypto Trader v6</title>
+
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Crypto Trader</title>
 <style>
-body{font-family:Arial,sans-serif;background:#0d1117;color:#fff;margin:0;padding:16px}h1{font-size:25px}.card{background:#171d26;border-radius:16px;padding:15px;margin:10px 0}.ok{color:#52e08b}.bad{color:#ff7070}.big{font-size:22px;font-weight:700}button{width:100%;padding:18px;border:0;border-radius:14px;font-size:19px;font-weight:700;margin:6px 0}#start{background:#32c875}#stop{background:#e05252;color:#fff}.row{display:flex;justify-content:space-between;margin:8px 0}.signal{padding:10px;border-bottom:1px solid #29313d}.buy{color:#53e28c}.sell{color:#ff7070}.wait{color:#f3c969}.small{font-size:12px;color:#aeb8c5}
-</style></head><body>
-<h1>🤖 AI Crypto Trader v6</h1>
-<div class="card"><div class="row">Backend <b id="backend">...</b></div><div class="row">Coinbase <b id="cb">...</b></div><div class="row">Läge <b>PAPER</b></div><div class="row">Coins <b id="coins">...</b></div><div class="row">Autotrade <b id="run">...</b></div></div>
-<div class="card"><div class="big">💰 <span id="equity">0</span> kr</div><div>Resultat: <b id="result">0</b> kr</div><div class="small">Virtuellt startkapital: 1 000 kr · max 25% per position</div></div>
-<button id="start" type="button">▶ STARTA PAPER AUTOTRADE</button><button id="stop" type="button">■ STOPPA</button>
-<div id="action" class="small">Tryck på STARTA för att starta PAPER-boten.</div>
-<div class="card"><div class="big">🏆 Bästa signal</div><div id="best">Laddar...</div></div>
-<div class="card"><div class="big">📊 Marknader</div><div id="list">Laddar...</div></div>
-<div class="card"><div class="big">🧾 Senaste affärer</div><div id="trades">Inga affärer ännu.</div></div>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0b1020;color:#eef2ff;font:15px system-ui,sans-serif}
+header{padding:22px 16px;background:linear-gradient(120deg,#172554,#111827);border-bottom:1px solid #26324b}
+main{max-width:1050px;margin:auto;padding:16px}
+h1{font-size:24px;margin:0 0 6px}
+h2{font-size:17px;margin:0 0 12px}
+.muted{color:#9caac4;font-size:13px}
+.pill{display:inline-block;border:1px solid #2c936b;color:#8ff0bd;border-radius:999px;padding:5px 10px;font-size:12px;margin-top:7px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}
+.card{background:#131c30;border:1px solid #25324b;border-radius:14px;padding:15px;margin:12px 0}
+.metric{font-size:23px;font-weight:700;margin-top:5px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:end}
+.row>div{flex:1;min-width:125px}
+button,select,input{font:inherit;border-radius:9px;border:1px solid #35425d;padding:10px;background:#0d1527;color:#fff}
+button{background:#2563eb;border:0;font-weight:650;cursor:pointer}
+button.secondary{background:#263248}
+label{display:block;color:#9caac4;font-size:12px;margin:8px 0 5px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #26324b}
+th{color:#9caac4}
+.tablewrap{overflow-x:auto}
+.good{color:#8ff0bd}.bad{color:#ff9b9b}.warn{color:#ffd580}
+.note{background:#292414;border:1px solid #655322;padding:12px;border-radius:10px;color:#ffe5a3;font-size:13px}
+.status{margin:10px 0;color:#9caac4;font-size:13px}
+</style>
+</head>
+<body>
+<header>
+<h1>AI Crypto Trader</h1>
+<div class="muted">Marknadsanalys · simulerad handel · historik</div>
+<span class="pill">PAPER MODE — INGA RIKTIGA ORDER</span>
+</header>
+<main>
+<div class="note">Testmiljö: alla köp och sälj är simulerade. Signaler är ingen garanti för framtida avkastning. Skatteexporten är testhistorik, inte en färdig K4.</div>
+
+<div class="grid">
+<div class="card"><div class="muted">Simulerat saldo</div><div id="cash" class="metric">—</div></div>
+<div class="card"><div class="muted">Portföljvärde</div><div id="equity" class="metric">—</div></div>
+<div class="card"><div class="muted">Resultat sedan start</div><div id="result" class="metric">—</div></div>
+<div class="card"><div class="muted">Startsaldo</div><div id="start" class="metric">—</div></div>
+</div>
+
+<div class="card">
+<h2>Simulerad order</h2>
+<div class="row">
+<div><label for="product">Kryptovaluta</label>
+<select id="product">
+<option value="BTC-EUR">Bitcoin (BTC)</option>
+<option value="ETH-EUR">Ethereum (ETH)</option>
+<option value="SOL-EUR">Solana (SOL)</option>
+<option value="XRP-EUR">XRP</option>
+<option value="SHIB-EUR">Shiba Inu (SHIB)</option>
+<option value="ADA-EUR">Cardano (ADA)</option>
+<option value="DOGE-EUR">Dogecoin (DOGE)</option>
+<option value="LINK-EUR">Chainlink (LINK)</option>
+<option value="AVAX-EUR">Avalanche (AVAX)</option>
+<option value="DOT-EUR">Polkadot (DOT)</option>
+</select></div>
+<div><label for="amount">Belopp i SEK</label><input id="amount" type="number" min="1" step="1" value="100"></div>
+<div><button onclick="placeOrder('KÖP')">Simulera köp</button></div>
+<div><button class="secondary" onclick="placeOrder('SÄLJ')">Simulera sälj</button></div>
+</div>
+<div id="orderstatus" class="status">Välj marknad och belopp.</div>
+</div>
+
+<div class="card">
+<div class="row" style="justify-content:space-between">
+<h2>Marknadsanalys</h2>
+<button class="secondary" onclick="loadScan()">Uppdatera analys</button>
+</div>
+<div class="muted">Publika marknadsdata och teknisk analys. Signalen kan bli AVVAKTA om data saknas.</div>
+<div class="tablewrap"><table>
+<thead><tr><th>Valuta</th><th>Pris (SEK)</th><th>Signal</th><th>Säkerhet</th><th>Förklaring</th></tr></thead>
+<tbody id="signals"><tr><td colspan="5">Laddar analys…</td></tr></tbody>
+</table></div>
+</div>
+
+<div class="card">
+<div class="row" style="justify-content:space-between">
+<h2>Simulerade innehav</h2>
+<button class="secondary" onclick="refresh()">Uppdatera saldo</button>
+</div>
+<div class="tablewrap"><table>
+<thead><tr><th>Marknad</th><th>Antal</th><th>Inköpspris (EUR)</th></tr></thead>
+<tbody id="positions"></tbody>
+</table></div>
+</div>
+
+<div class="card">
+<div class="row" style="justify-content:space-between">
+<h2>Handelshistorik</h2>
+<button onclick="location.href='/api/tax.csv'">Exportera CSV</button>
+</div>
+<div class="muted">CSV-filen kan öppnas i Excel. Simulerade affärer är inte verkliga skattehändelser.</div>
+<div class="tablewrap"><table>
+<thead><tr><th>Tid</th><th>Typ</th><th>Marknad</th><th>Belopp (SEK)</th><th>Kommentar</th></tr></thead>
+<tbody id="trades"></tbody>
+</table></div>
+</div>
+<div id="globalstatus" class="status">Ansluter till backend…</div>
+</main>
+
 <script>
-const API="https://ai-crypto-trader-f8cz.onrender.com";
-async function get(u,o){let r=await fetch(API+u,o);return await r.json()}
+const el=id=>document.getElementById(id);
+const sek=n=>n==null?'—':Number(n).toLocaleString('sv-SE',{style:'currency',currency:'SEK',maximumFractionDigits:2});
+
+async function api(url,opts){
+ const r=await fetch(url,opts);
+ const d=await r.json().catch(()=>({}));
+ if(!r.ok)throw Error(d.detail||'Något gick fel');
+ return d;
+}
+
 async function refresh(){
  try{
-  let s=await get("/api/status"), sc=await get("/api/scan"), p=await get("/api/paper/status");
-  backend.textContent=s.backend; backend.className="ok"; cb.textContent=s.coinbase; cb.className=s.coinbase=="OK"?"ok":"bad";
-  coins.textContent=sc.count; run.textContent=p.running?"AKTIV":"STOPPAD"; run.className=p.running?"ok":"bad";
-  equity.textContent=Math.round(p.equity_sek).toLocaleString("sv-SE"); result.textContent=Math.round(p.result_sek).toLocaleString("sv-SE");
-  if(sc.best){let b=sc.best;best.innerHTML=`<b>${b.product}</b> · <span class="${b.signal=="KÖP"?"buy":b.signal=="SÄLJ"?"sell":"wait"}">${b.signal}</span> · ${b.confidence}% · RSI ${b.rsi}`;} else best.textContent="Ingen signal – kontrollera Coinbase.";
-  list.innerHTML=sc.signals.map(x=>`<div class="signal"><b>${x.product}</b> · ${x.price_sek?Math.round(x.price_sek).toLocaleString("sv-SE")+" kr":"-"} · <span class="${x.signal=="KÖP"?"buy":x.signal=="SÄLJ"?"sell":"wait"}">${x.signal}</span> · ${x.confidence}%</div>`).join("")||"Inga marknader.";
-  trades.innerHTML=p.trades.length?p.trades.slice().reverse().map(t=>`<div class="signal">${t.side} · <b>${t.product}</b> · ${t.sek} kr</div>`).join(""):"Inga affärer ännu.";
- }catch(e){backend.textContent="FEL";backend.className="bad"}
+  const d=await api('/api/paper/status');
+  el('cash').textContent=sek(d.cash_sek);
+  el('equity').textContent=sek(d.equity_sek);
+  el('result').textContent=sek(d.result_sek);
+  el('result').className='metric '+(d.result_sek>=0?'good':'bad');
+  el('start').textContent=sek(d.start_cash_sek);
+  const p=d.positions||{};
+  el('positions').innerHTML=Object.keys(p).length
+   ?Object.entries(p).map(([k,v])=>'<tr><td>'+k+'</td><td>'+Number(v.quantity).toPrecision(8)+'</td><td>'+Number(v.entry_price_eur).toLocaleString('sv-SE')+'</td></tr>').join('')
+   :'<tr><td colspan="3">Inga innehav ännu.</td></tr>';
+  el('trades').innerHTML=(d.trades||[]).slice().reverse().map(t=>'<tr><td>'+new Date(t.time).toLocaleString('sv-SE')+'</td><td>'+t.side+'</td><td>'+t.product+'</td><td>'+sek(t.amount_sek)+'</td><td>'+(t.note||'Simulerad order')+'</td></tr>').join('')
+   ||'<tr><td colspan="5">Ingen handelshistorik ännu.</td></tr>';
+  el('globalstatus').textContent='Backend online · PAPER MODE · inga riktiga order skickas.';
+ }catch(e){
+  el('globalstatus').textContent='Kunde inte läsa backend: '+e.message;
+ }
 }
-async function start(){
-  const a=document.getElementById("action");
-  a.textContent="Startar PAPER-boten...";
-  try{
-    const r=await fetch(API+"/api/paper/start",{method:"POST",headers:{"Content-Type":"application/json"}});
-    const d=await r.json();
-    if(!r.ok) throw new Error(d.detail||("HTTP "+r.status));
-    a.textContent="✅ PAPER AUTOTRADE startad.";
-    await refresh();
-  }catch(e){a.textContent="❌ Start misslyckades: "+e.message;}
+
+async function loadScan(){
+ const body=el('signals');
+ body.innerHTML='<tr><td colspan="5">Hämtar marknadsdata…</td></tr>';
+ try{
+  const d=await api('/api/scan');
+  body.innerHTML=(d.signals||[]).map(s=>'<tr><td>'+s.name+' ('+s.product.split('-')[0]+')</td><td>'+(s.price_sek==null?'—':sek(s.price_sek))+'</td><td class="'+(s.signal==='POSITIV'?'good':s.signal==='NEGATIV'?'bad':'warn')+'">'+s.signal+'</td><td>'+(s.confidence||0)+'%</td><td>'+s.reason+'</td></tr>').join('')
+   ||'<tr><td colspan="5">Ingen analysdata tillgänglig.</td></tr>';
+ }catch(e){
+  body.innerHTML='<tr><td colspan="5">Analysen misslyckades: '+e.message+'</td></tr>';
+ }
 }
-async function stop(){
-  const a=document.getElementById("action");
-  try{
-    const r=await fetch(API+"/api/paper/stop",{method:"POST",headers:{"Content-Type":"application/json"}});
-    if(!r.ok) throw new Error("HTTP "+r.status);
-    a.textContent="⏹ PAPER AUTOTRADE stoppad.";
-    await refresh();
-  }catch(e){a.textContent="❌ Stopp misslyckades: "+e.message;}
+
+async function placeOrder(side){
+ const status=el('orderstatus');
+ status.textContent='Skickar simulerad order…';
+ try{
+  const d=await api('/api/paper/order',{
+   method:'POST',
+   headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({
+    product:el('product').value,
+    side,
+    amount_sek:Number(el('amount').value)
+   })
+  });
+  status.textContent='Klart: '+d.trade.side+' '+d.trade.product+' för '+sek(d.trade.amount_sek)+'. Endast simulerad order.';
+  await refresh();
+ }catch(e){
+  status.textContent='Ordern genomfördes inte: '+e.message;
+ }
 }
-document.getElementById("start").addEventListener("click",start);
-document.getElementById("stop").addEventListener("click",stop);
-refresh();setInterval(refresh,10000);
-</script></body></html>
+
+refresh();
+loadScan();
+setInterval(refresh,20000);
+</script>
+</body>
+</html>
