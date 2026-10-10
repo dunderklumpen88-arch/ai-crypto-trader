@@ -593,7 +593,56 @@ async def auto_paper_worker():
 
             if enabled:
                 await asyncio.to_thread(run_auto_paper_cycle)
-
+2026-10-10T08:39:18.761011777Z     with lock:
+2026-10-10T08:39:18.761014927Z IndentationError: expected an indented block after 'except' statement on line 597
+2026-10-10T08:39:20.007617597Z ==> Exited with status 1
+2026-10-10T08:39:20.010131964Z ==> Common ways to troubleshoot your deploy: https://render.com/docs/troubleshooting-deploys
+2026-10-10T08:39:21.031645431Z ==> Running 'uvicorn main:app --host 0.0.0.0 --port $PORT'
+2026-10-10T08:39:22.222000359Z Traceback (most recent call last):
+2026-10-10T08:39:22.223054282Z   File "/opt/render/project/src/.venv/bin/uvicorn", line 7, in <module>
+2026-10-10T08:39:22.223072232Z     sys.exit(main())
+2026-10-10T08:39:22.223079063Z              ~~~~^^
+2026-10-10T08:39:22.223086073Z   File "/opt/render/project/src/.venv/lib/python3.14/site-packages/click/core.py", line 1631, in __call__
+2026-10-10T08:39:22.223096613Z     return self.main(*args, **kwargs)
+2026-10-10T08:39:22.223134674Z            ~~~~~~~~~^^^^^^^^^^^^^^^^^
+2026-10-10T08:39:22.223139474Z   File "/opt/render/project/src/.venv/lib/python3.14/site-packages/click/core.py", line 1552, in main
+2026-10-10T08:39:22.223144774Z     rv = self.invoke(ctx)
+2026-10-10T08:39:22.223148544Z   File "/opt/render/project/src/.venv/lib/python3.14/site-packages/click/core.py", line 1415, in invoke
+2026-10-10T08:39:22.223152764Z     return ctx.invoke(self.callback, **ctx.params)
+2026-10-10T08:39:22.223156564Z            ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-10T08:39:22.223160294Z   File "/opt/render/project/src/.venv/lib/python3.14/site-packages/click/core.py", line 910, in invoke
+2026-10-10T08:39:22.223164094Z     return callback(*args, **kwargs)
+2026-10-10T08:39:22.223167874Z   File "/opt/render/project/src/.venv/lib/python3.14/site-packages/uvicorn/main.py", line 448, in main
+2026-10-10T08:39:22.223171725Z     run(
+2026-10-10T08:39:22.223175565Z     ~~~^
+2026-10-10T08:39:22.223179405Z         app,
+2026-10-10T08:39:22.223183255Z         ^^^^
+2026-10-10T08:39:22.223187065Z     ...<49 lines>...
+2026-10-10T08:39:22.223190915Z         reset_contextvars=reset_contextvars,
+2026-10-10T08:39:22.223194685Z         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-10T08:39:22.223198425Z     )
+2026-10-10T08:39:22.223202235Z     ^
+2026-10-10T08:39:22.223206085Z   File "/opt/render/project/src/.venv/lib/python3.14/site-packages/uvicorn/main.py", line 620, in run
+2026-10-10T08:39:22.223209875Z     config.load_app()
+2026-10-10T08:39:22.223213575Z     ~~~~~~~~~~~~~~~^^
+2026-10-10T08:39:22.223217306Z   File "/opt/render/project/src/.venv/lib/python3.14/site-packages/uvicorn/config.py", line 434, in load_app
+2026-10-10T08:39:22.223221056Z     return import_from_string(self.app)
+2026-10-10T08:39:22.223226536Z   File "/opt/render/project/src/.venv/lib/python3.14/site-packages/uvicorn/importer.py", line 19, in import_from_string
+2026-10-10T08:39:22.223230286Z     module = importlib.import_module(module_str)
+2026-10-10T08:39:22.223234246Z   File "/opt/render/project/python/Python-3.14.3/lib/python3.14/importlib/__init__.py", line 88, in import_module
+2026-10-10T08:39:22.223237946Z     return _bootstrap._gcd_import(name[level:], package, level)
+2026-10-10T08:39:22.223241656Z            ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-10-10T08:39:22.223245516Z   File "<frozen importlib._bootstrap>", line 1398, in _gcd_import
+2026-10-10T08:39:22.223249376Z   File "<frozen importlib._bootstrap>", line 1371, in _find_and_load
+2026-10-10T08:39:22.223253206Z   File "<frozen importlib._bootstrap>", line 1342, in _find_and_load_unlocked
+2026-10-10T08:39:22.223256936Z   File "<frozen importlib._bootstrap>", line 938, in _load_unlocked
+2026-10-10T08:39:22.223279977Z   File "<frozen importlib._bootstrap_external>", line 755, in exec_module
+2026-10-10T08:39:22.224679778Z   File "<frozen importlib._bootstrap_external>", line 893, in get_code
+2026-10-10T08:39:22.224689388Z   File "<frozen importlib._bootstrap_external>", line 823, in source_to_code
+2026-10-10T08:39:22.224695548Z   File "<frozen importlib._bootstrap>", line 491, in _call_with_frames_removed
+2026-10-10T08:39:22.224724419Z   File "/opt/render/project/src/main.py", line 598
+2026-10-10T08:39:22.224727329Z     with lock:
+2026-10-10T08:39:22.224730999Z IndentationError: expected an indented block after 'except' statement on line 597
         except Exception as exc:
     with lock:
         auto_settings["last_message"] = (
