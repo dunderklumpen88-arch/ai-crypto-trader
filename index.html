@@ -1,236 +1,154 @@
 
-<!doctype html>
+<!DOCTYPE html>
 <html lang="sv">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Crypto Trader</title>
 <style>
-:root{color-scheme:dark}
 *{box-sizing:border-box}
-body{margin:0;background:#0b1020;color:#eef2ff;font:15px system-ui,sans-serif}
-header{padding:22px 16px;background:linear-gradient(120deg,#172554,#111827);border-bottom:1px solid #26324b}
-main{max-width:1050px;margin:auto;padding:16px}
-h1{font-size:24px;margin:0 0 6px}
-h2{font-size:17px;margin:0 0 12px}
-.muted{color:#9caac4;font-size:13px}
-.pill{display:inline-block;border:1px solid #2c936b;color:#8ff0bd;border-radius:999px;padding:5px 10px;font-size:12px;margin-top:7px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}
-.card{background:#131c30;border:1px solid #25324b;border-radius:14px;padding:15px;margin:12px 0}
-.metric{font-size:23px;font-weight:700;margin-top:5px}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:end}
-.row>div{flex:1;min-width:125px}
-button,select,input{font:inherit;border-radius:9px;border:1px solid #35425d;padding:10px;background:#0d1527;color:#fff}
-button{background:#2563eb;border:0;font-weight:650;cursor:pointer}
-button.secondary{background:#263248}
-label{display:block;color:#9caac4;font-size:12px;margin:8px 0 5px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:9px 7px;border-bottom:1px solid #26324b}
-th{color:#9caac4}
-.tablewrap{overflow-x:auto}
-.good{color:#8ff0bd}.bad{color:#ff9b9b}.warn{color:#ffd580}
-.note{background:#292414;border:1px solid #655322;padding:12px;border-radius:10px;color:#ffe5a3;font-size:13px}
-.status{margin:10px 0;color:#9caac4;font-size:13px}
+body{margin:0;background:#0b1020;color:#edf2ff;font:15px system-ui,sans-serif}
+header{padding:22px 16px;background:#172554}
+main{max-width:950px;margin:auto;padding:14px}
+h1{margin:0;font-size:25px}h2{font-size:18px}
+.muted{color:#a9b6ce;font-size:13px}
+.pill{display:inline-block;padding:6px 10px;border:1px solid #36a875;border-radius:20px;color:#9bf0c2;margin-top:10px;font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+.card{background:#141e32;border:1px solid #2b3850;border-radius:13px;padding:15px;margin:12px 0}
+.metric{font-size:23px;font-weight:bold;margin-top:5px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:end}
+.row>div{flex:1;min-width:120px}
+button,select,input{padding:11px;border-radius:8px;border:1px solid #40506a;background:#0b1427;color:white;font:inherit}
+button{background:#2563eb;border:0;cursor:pointer;font-weight:bold}
+button.secondary{background:#334155}
+label{display:block;font-size:12px;color:#a9b6ce;margin:8px 0 5px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+td,th{text-align:left;padding:9px 6px;border-bottom:1px solid #2b3850;vertical-align:top}
+th{color:#a9b6ce}.tablewrap{overflow-x:auto}
+.good{color:#8ff0bd}.bad{color:#ff9b9b}.warn{color:#ffdc8a}
+.note{padding:12px;border-radius:9px;background:#302817;color:#ffe4a0;font-size:13px}
+.status{font-size:13px;color:#b9c6db;margin-top:12px;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
 <header>
 <h1>AI Crypto Trader</h1>
-<div class="muted">Marknadsanalys · simulerad handel · historik</div>
+<div class="muted">Marknadsanalys · simulerad handel · transaktionshistorik</div>
 <span class="pill">PAPER MODE — INGA RIKTIGA ORDER</span>
 </header>
 <main>
-<div class="note">Testmiljö: alla köp och sälj är simulerade. Signaler är ingen garanti för framtida avkastning. Skatteexporten är testhistorik, inte en färdig K4.</div>
+<div class="note">Endast testhandel med låtsaspengar. Automatisk handel använder enkla prisbaserade signaler, inte garanterade prognoser. Saldo och historik kan försvinna när servern startar om. CSV-filen är inte ett färdigt K4-underlag för verklig handel.</div>
 
 <div class="grid">
-<div class="card"><div class="muted">Simulerat saldo</div><div id="cash" class="metric">—</div></div>
-<div class="card"><div class="muted">Portföljvärde</div><div id="equity" class="metric">—</div></div>
-<div class="card"><div class="muted">Resultat sedan start</div><div id="result" class="metric">—</div></div>
-<div class="card"><div class="muted">Startsaldo</div><div id="start" class="metric">—</div></div>
+<div class="card"><div class="muted">Kontantsaldo</div><div class="metric" id="cash">—</div></div>
+<div class="card"><div class="muted">Portföljvärde</div><div class="metric" id="equity">—</div></div>
+<div class="card"><div class="muted">Resultat sedan start</div><div class="metric" id="result">—</div></div>
+<div class="card"><div class="muted">Antal affärer</div><div class="metric" id="count">—</div></div>
 </div>
 
 <div class="card">
 <h2>Automatisk pappershandel</h2>
-<div class="note">Endast simulering. Max 100 kr per affär, högst 4 affärer per dygn. Kontroll var 15:e minut.</div>
+<div class="muted">Max 100 kr per affär och högst 4 automatiska affärer per dygn.</div>
 <div class="row" style="margin-top:12px">
-<button onclick="autoAction('start')">Starta automatisk handel</button>
+<button onclick="autoAction('start')">Starta</button>
 <button class="secondary" onclick="autoAction('stop')">Stoppa</button>
 <button class="secondary" onclick="loadAuto()">Uppdatera status</button>
 </div>
-<div id="autostatus" class="status">Hämtar status…</div>
+<div id="autostatus" class="status">Laddar…</div>
 </div>
- 
 
-
+<div class="card">
 <h2>Simulerad order</h2>
 <div class="row">
 <div><label for="product">Kryptovaluta</label>
 <select id="product">
-<option value="BTC-EUR">Bitcoin (BTC)</option>
-<option value="ETH-EUR">Ethereum (ETH)</option>
-<option value="SOL-EUR">Solana (SOL)</option>
-<option value="XRP-EUR">XRP</option>
-<option value="SHIB-EUR">Shiba Inu (SHIB)</option>
-<option value="ADA-EUR">Cardano (ADA)</option>
-<option value="DOGE-EUR">Dogecoin (DOGE)</option>
-<option value="LINK-EUR">Chainlink (LINK)</option>
-<option value="AVAX-EUR">Avalanche (AVAX)</option>
-<option value="DOT-EUR">Polkadot (DOT)</option>
+<option value="BTC">Bitcoin (BTC)</option><option value="ETH">Ethereum (ETH)</option>
+<option value="SOL">Solana (SOL)</option><option value="XRP">XRP</option><option value="SHIB">Shiba Inu (SHIB)</option>
 </select></div>
-<div><label for="amount">Belopp i SEK</label><input id="amount" type="number" min="1" step="1" value="100"></div>
-<div><button onclick="placeOrder('KÖP')">Simulera köp</button></div>
-<div><button class="secondary" onclick="placeOrder('SÄLJ')">Simulera sälj</button></div>
+<div><label for="amount">Belopp i SEK (max 100)</label><input id="amount" type="number" min="1" max="100" value="100"></div>
+<div><button onclick="placeOrder('buy')">Simulera köp</button></div>
+<div><button class="secondary" onclick="placeOrder('sell')">Simulera sälj</button></div>
 </div>
-<div id="orderstatus" class="status">Välj marknad och belopp.</div>
-</div>
-
-<div class="card">
-<div class="row" style="justify-content:space-between">
-<h2>Marknadsanalys</h2>
-<button class="secondary" onclick="loadScan()">Uppdatera analys</button>
-</div>
-<div class="muted">Publika marknadsdata och teknisk analys. Signalen kan bli AVVAKTA om data saknas.</div>
-<div class="tablewrap"><table>
-<thead><tr><th>Valuta</th><th>Pris (SEK)</th><th>Signal</th><th>Säkerhet</th><th>Förklaring</th></tr></thead>
-<tbody id="signals"><tr><td colspan="5">Laddar analys…</td></tr></tbody>
-</table></div>
+<div id="orderstatus" class="status">Välj valuta och belopp.</div>
 </div>
 
 <div class="card">
-<div class="row" style="justify-content:space-between">
-<h2>Simulerade innehav</h2>
-<button class="secondary" onclick="refresh()">Uppdatera saldo</button>
-</div>
-<div class="tablewrap"><table>
-<thead><tr><th>Marknad</th><th>Antal</th><th>Inköpspris (EUR)</th></tr></thead>
-<tbody id="positions"></tbody>
-</table></div>
+<div class="row" style="justify-content:space-between"><h2>Marknadsanalys</h2><button class="secondary" onclick="loadScan()">Uppdatera</button></div>
+<div class="tablewrap"><table><thead><tr><th>Valuta</th><th>Pris</th><th>Signal</th><th>Förklaring</th></tr></thead><tbody id="signals"><tr><td colspan="4">Laddar…</td></tr></tbody></table></div>
 </div>
 
 <div class="card">
-<div class="row" style="justify-content:space-between">
-<h2>Handelshistorik</h2>
-<button onclick="location.href='/api/tax.csv'">Exportera CSV</button>
+<div class="row" style="justify-content:space-between"><h2>Innehav</h2><button class="secondary" onclick="refresh()">Uppdatera saldo</button></div>
+<div class="tablewrap"><table><thead><tr><th>Valuta</th><th>Antal</th><th>Marknadsvärde</th></tr></thead><tbody id="positions"></tbody></table></div>
 </div>
-<div class="muted">CSV-filen kan öppnas i Excel. Simulerade affärer är inte verkliga skattehändelser.</div>
-<div class="tablewrap"><table>
-<thead><tr><th>Tid</th><th>Typ</th><th>Marknad</th><th>Belopp (SEK)</th><th>Kommentar</th></tr></thead>
-<tbody id="trades"></tbody>
-</table></div>
+
+<div class="card">
+<div class="row" style="justify-content:space-between"><h2>Affärshistorik</h2><button onclick="location.href='/api/tax.csv'">Exportera CSV</button></div>
+<div class="tablewrap"><table><thead><tr><th>Tid</th><th>Sida</th><th>Valuta</th><th>Belopp</th><th>Ordertyp</th></tr></thead><tbody id="trades"></tbody></table></div>
 </div>
-<div id="globalstatus" class="status">Ansluter till backend…</div>
+<div id="globalstatus" class="status">Ansluter till servern…</div>
 </main>
 
 <script>
-const el=id=>document.getElementById(id);
+const $=id=>document.getElementById(id);
 const sek=n=>n==null?'—':Number(n).toLocaleString('sv-SE',{style:'currency',currency:'SEK',maximumFractionDigits:2});
-
-async function api(url,opts){
- const r=await fetch(url,opts);
- const d=await r.json().catch(()=>({}));
- if(!r.ok)throw Error(d.detail||'Något gick fel');
- return d;
+async function api(url,options={}){
+ const response=await fetch(url,options);
+ const data=await response.json().catch(()=>({}));
+ if(!response.ok)throw Error(data.detail||'Serverfel');
+ return data;
 }
-
 async function refresh(){
  try{
   const d=await api('/api/paper/status');
-  el('cash').textContent=sek(d.cash_sek);
-  el('equity').textContent=sek(d.equity_sek);
-  el('result').textContent=sek(d.result_sek);
-  el('result').className='metric '+(d.result_sek>=0?'good':'bad');
-  el('start').textContent=sek(d.start_cash_sek);
-  const p=d.positions||{};
-  el('positions').innerHTML=Object.keys(p).length
-   ?Object.entries(p).map(([k,v])=>'<tr><td>'+k+'</td><td>'+Number(v.quantity).toPrecision(8)+'</td><td>'+Number(v.entry_price_eur).toLocaleString('sv-SE')+'</td></tr>').join('')
-   :'<tr><td colspan="3">Inga innehav ännu.</td></tr>';
-  el('trades').innerHTML=(d.trades||[]).slice().reverse().map(t=>'<tr><td>'+new Date(t.time).toLocaleString('sv-SE')+'</td><td>'+t.side+'</td><td>'+t.product+'</td><td>'+sek(t.amount_sek)+'</td><td>'+(t.note||'Simulerad order')+'</td></tr>').join('')
-   ||'<tr><td colspan="5">Ingen handelshistorik ännu.</td></tr>';
-  el('globalstatus').textContent='Backend online · PAPER MODE · inga riktiga order skickas.';
- }catch(e){
-  el('globalstatus').textContent='Kunde inte läsa backend: '+e.message;
- }
+  $('cash').textContent=sek(d.balance_sek);
+  $('count').textContent=d.trade_count;
+  const holds=d.holdings||{};
+  let value=0,rows=[];
+  const market=await api('/api/market');
+  for(const [s,h] of Object.entries(holds)){
+   const q=Number(h.quantity||0),p=market.prices?.[s]?.price_sek;
+   if(p!=null)value+=q*p;
+   rows.push('<tr><td>'+s+'</td><td>'+q.toPrecision(8)+'</td><td>'+sek(p==null?null:q*p)+'</td></tr>');
+  }
+  $('positions').innerHTML=rows.join('')||'<tr><td colspan="3">Inga innehav ännu.</td></tr>';
+  const equity=Number(d.balance_sek)+value;
+  $('equity').textContent=sek(equity);
+  $('result').textContent=sek(equity-1000);
+  $('result').className='metric '+(equity>=1000?'good':'bad');
+  $('trades').innerHTML=(d.trades||[]).slice().reverse().map(t=>'<tr><td>'+new Date(t.time).toLocaleString('sv-SE')+'</td><td>'+t.side.toUpperCase()+'</td><td>'+t.symbol+'</td><td>'+sek(t.amount_sek)+'</td><td>'+((t.automatic)?'Automatisk':'Manuell')+'</td></tr>').join('')||'<tr><td colspan="5">Ingen historik.</td></tr>';
+  $('globalstatus').textContent='Backend online · endast simulerad handel.';
+ }catch(e){$('globalstatus').textContent='Kunde inte läsa kontot: '+e.message}
 }
-
 async function loadScan(){
- const body=el('signals');
- body.innerHTML='<tr><td colspan="5">Hämtar marknadsdata…</td></tr>';
+ $('signals').innerHTML='<tr><td colspan="4">Hämtar analys…</td></tr>';
  try{
   const d=await api('/api/scan');
-  body.innerHTML=(d.signals||[]).map(s=>'<tr><td>'+s.name+' ('+s.product.split('-')[0]+')</td><td>'+(s.price_sek==null?'—':sek(s.price_sek))+'</td><td class="'+(s.signal==='POSITIV'?'good':s.signal==='NEGATIV'?'bad':'warn')+'">'+s.signal+'</td><td>'+(s.confidence||0)+'%</td><td>'+s.reason+'</td></tr>').join('')
-   ||'<tr><td colspan="5">Ingen analysdata tillgänglig.</td></tr>';
- }catch(e){
-  body.innerHTML='<tr><td colspan="5">Analysen misslyckades: '+e.message+'</td></tr>';
- }
+  $('signals').innerHTML=(d.signals||[]).map(s=>'<tr><td>'+(s.name||s.symbol||s.product)+'</td><td>'+sek(s.price_sek)+'</td><td class="'+(s.signal==='POSITIV'?'good':s.signal==='NEGATIV'?'bad':'warn')+'">'+(s.signal||'AVVAKTA')+'</td><td>'+(s.reason||'Ingen tydlig signal')+'</td></tr>').join('')||'<tr><td colspan="4">Ingen signaldata.</td></tr>';
+ }catch(e){$('signals').innerHTML='<tr><td colspan="4">Analysfel: '+e.message+'</td></tr>'}
 }
-
 async function loadAuto(){
-  try{
-    const response = await fetch('/api/auto/status');
-    const data = await response.json();
-
-    document.getElementById('autostatus').textContent =
-      (data.enabled ? 'AKTIV' : 'AVSTÄNGD') +
-      ' · ' + data.mode +
-      ' · Max ' + data.max_sek_per_trade + ' kr/affär' +
-      ' · ' + data.trades_today + '/' + data.max_trades_per_day +
-      ' affärer idag · Kontroll var ' + data.interval_minutes +
-      ' min. ' + data.message;
-  } catch(error){
-    document.getElementById('autostatus').textContent =
-      'Kunde inte hämta status. Kontrollera anslutningen.';
-  }
-}
-
-async function autoAction(action){
-  try{
-    const response = await fetch('/api/auto/' + action, {
-      method: 'POST'
-    });
-    const data = await response.json();
-
-    if(!response.ok){
-      throw new Error(data.detail || 'Serverfel');
-    }
-
-    await loadAuto();
-    document.getElementById('globalstatus').textContent =
-      action === 'start'
-      ? 'Automatisk pappershandel aktiverad.'
-      : 'Automatisk pappershandel stoppad.';
-  } catch(error){
-    document.getElementById('autostatus').textContent =
-      'Fel: ' + error.message;
-  }
-}
-
-async function placeOrder(side){
- const status=el('orderstatus');
- status.textContent='Skickar simulerad order…';
  try{
-  const d=await api('/api/paper/order',{
-   method:'POST',
-   headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({
-    product:el('product').value,
-    side,
-    amount_sek:Number(el('amount').value)
-   })
-  });
-  status.textContent='Klart: '+d.trade.side+' '+d.trade.product+' för '+sek(d.trade.amount_sek)+'. Endast simulerad order.';
-  await refresh();
- }catch(e){
-  status.textContent='Ordern genomfördes inte: '+e.message;
- }
+  const d=await api('/api/auto/status');
+  $('autostatus').textContent=(d.enabled?'AKTIV':'AVSTÄNGD')+' · '+d.mode+' · '+(d.trades_today??0)+'/'+(d.max_trades_per_day??4)+' automatiska affärer idag · '+(d.message||'');
+ }catch(e){$('autostatus').textContent='Statusfel: '+e.message}
 }
-
-refresh();
-loadScan();
- refresh();
-loadScan();
-loadAuto();
-setInterval(refresh,20000);
-setInterval(refresh,20000);
+async function autoAction(action){
+ try{await api('/api/auto/'+action,{method:'POST'});await loadAuto()}
+ catch(e){$('autostatus').textContent='Fel: '+e.message}
+}
+async function placeOrder(side){
+ const amount=Number($('amount').value);
+ if(amount<=0||amount>100){$('orderstatus').textContent='Ange ett belopp mellan 1 och 100 kr.';return}
+ try{
+  const d=await api('/api/paper/order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({product:$('product').value,side,amount_sek:amount})});
+  $('orderstatus').textContent='Simulerad order registrerad: '+d.trade.symbol+' '+side+'.';
+  await refresh();
+ }catch(e){$('orderstatus').textContent='Orderfel: '+e.message}
+}
+refresh();loadScan();loadAuto();
+setInterval(refresh,30000);
+setInterval(loadAuto,60000);
 </script>
 </body>
 </html>
