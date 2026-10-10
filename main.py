@@ -22,7 +22,21 @@ COINS = {
     "SHIB-EUR": "Shiba Inu", "LINK-EUR": "Chainlink", "AVAX-EUR": "Avalanche",
     "DOT-EUR": "Polkadot"
 }
+from fastapi.responses import FileResponse
+from pathlib import Path
+
+@app.get("/", include_in_schema=False)
+def home():
+    return FileResponse(Path(__file__).parent / "index.html")
+
 app = FastAPI(title="AI Crypto Trader — Paper Trading", version=APP_VERSION)
+from fastapi.responses import FileResponse
+from pathlib import Path
+
+@app.get("/", include_in_schema=False)
+def home():
+    return FileResponse(Path(__file__).parent / "index.html")
+    
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 lock = RLock()
 state = {"cash_sek": START_CASH_SEK, "starting_cash_sek": START_CASH_SEK, "positions": {}, "trades": [], "last_updated": None}
