@@ -3,14 +3,17 @@ from io import StringIO
 import csv
 import threading
 import time
+import os
+import json
 
 import requests
+import psycopg
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="AI Crypto Trader", version="4.0-paper-tax")
+app = FastAPI(title="AI Crypto Trader", version="5.0-paper-tax-db")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,6 +50,68 @@ state = {
     "last_prices": {},
     "last_auto_run": None,
 }
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_READY = False
+DB_ERROR = None
+
+def db_connect():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL saknas i Render Environment")
+    db_url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    return psycopg.connect(db_url, connect_timeout=10)
+
+def init_database():
+    global DB_READY, DB_ERROR, state
+    if not DATABASE_URL:
+        DB_ERROR = "DATABASE_URL saknas"
+        return
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "CREATE TABLE IF NOT EXISTS ai_trader_state (id INTEGER PRIMARY KEY, state_json JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+                )
+                cur.execute("SELECT state_json FROM ai_trader_state WHERE id = 1")
+                row = cur.fetchone()
+                if row and row[0]:
+                    saved = row[0]
+                    if isinstance(saved, str):
+                        saved = json.loads(saved)
+                    state.update(saved)
+                else:
+                    cur.execute(
+                        "INSERT INTO ai_trader_state (id, state_json) VALUES (1, %s) ON CONFLICT (id) DO NOTHING",
+                        (json.dumps(state),),
+                    )
+        DB_READY = True
+        DB_ERROR = None
+    except Exception as exc:
+        DB_READY = False
+        DB_ERROR = str(exc)[:240]
+
+def save_state():
+    global DB_READY, DB_ERROR
+    if not DATABASE_URL:
+        DB_READY = False
+        DB_ERROR = "DATABASE_URL saknas"
+        return False
+    try:
+        with lock:
+            snapshot = json.dumps(state)
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ai_trader_state (id, state_json, updated_at) VALUES (1, %s, NOW()) ON CONFLICT (id) DO UPDATE SET state_json = EXCLUDED.state_json, updated_at = NOW()",
+                    (snapshot,),
+                )
+        DB_READY = True
+        DB_ERROR = None
+        return True
+    except Exception as exc:
+        DB_READY = False
+        DB_ERROR = str(exc)[:240]
+        return False
 
 
 class PaperOrder(BaseModel):
@@ -138,6 +203,7 @@ def make_signals():
     with lock:
         state["last_prices"] = prices
         state["last_scan"] = datetime.now(timezone.utc).isoformat()
+    save_state()
     return signals
 
 
@@ -149,7 +215,7 @@ def _open_lots(symbol):
 
 
 def execute_paper_trade(symbol, side, amount_sek, automatic):
-    """Simulated trade only. FIFO cost basis is tracked for sells and tax export."""
+    """Simulated trade only. Swedish average-cost basis is tracked for tax export."""
     symbol = symbol.upper()
     side = side.lower()
     if symbol not in COINS:
@@ -246,6 +312,7 @@ def execute_paper_trade(symbol, side, amount_sek, automatic):
             "automatic": automatic,
         }
         state["trades"].append(trade)
+    save_state()
     return True, trade
 
 
@@ -355,10 +422,25 @@ def dashboard():
 def health():
     return {
         "status": "online",
-        "version": "4.0-paper-tax",
+        "version": "5.0-paper-tax-db",
         "mode": "PAPER ONLY",
         "real_orders_enabled": False,
         "estimated_fee_rate": FEE_RATE,
+        "database_configured": bool(DATABASE_URL),
+        "database_connected": DB_READY,
+        "database_error": DB_ERROR,
+    }
+
+
+@app.get("/api/database/status")
+def database_status():
+    init_database()
+    return {
+        "database_configured": bool(DATABASE_URL),
+        "database_connected": DB_READY,
+        "database_error": DB_ERROR,
+        "persistence": "PostgreSQL JSONB state storage" if DB_READY else "NOT ACTIVE",
+        "mode": "PAPER ONLY",
     }
 
 
@@ -385,6 +467,7 @@ def auto_start():
             "Automatisk pappershandel aktiverad. Första analys inom cirka en minut. "
             "Endast simulerade affärer; inga riktiga ordrar skickas."
         )
+    save_state()
     return status_data()
 
 
@@ -393,6 +476,7 @@ def auto_stop():
     with lock:
         state["auto_enabled"] = False
         state["auto_message"] = "Automatisk pappershandel stoppad."
+    save_state()
     return status_data()
 
 
@@ -465,4 +549,5 @@ def tax_summary():
     }
 
 
+init_database()
 threading.Thread(target=auto_worker, daemon=True, name="paper-auto-worker").start()
