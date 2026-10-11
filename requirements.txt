@@ -3,3 +3,4 @@ fastapi
 uvicorn
 requests
 coinbase-advanced-py
+psycopg[binary]
