@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, date
 from io import StringIO
 import csv, json, os, threading, time
-
+import trader_intelligence
 import psycopg
 from psycopg.types.json import Jsonb
 import requests
