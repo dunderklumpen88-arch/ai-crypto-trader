@@ -141,3 +141,81 @@ def trader_intelligence_adjustment(base_score: float, signal: dict[str, Any],
 
 def reset_signal_cache() -> None:
     _cache.update({"at": 0.0, "signals": [], "source_status": [], "updated_at": None})
+
+def collect_market_signals():
+    """Hämta publika Coinbase-candles och skapa tekniska signaler."""
+    import time
+
+    results = []
+
+    for product in ("BTC-EUR", "ETH-EUR"):
+        try:
+            end = int(time.time())
+            start = end - (50 * 5 * 60)
+
+            url = (
+                "https://api.coinbase.com/api/v3/brokerage/market/"
+                f"products/{product}/candles"
+                f"?start={start}&end={end}"
+                "&granularity=FIVE_MINUTE&limit=50"
+            )
+
+            payload = _fetch_json(url)
+            candles = payload.get("candles", [])
+
+            candles = sorted(
+                candles,
+                key=lambda candle: int(candle.get("start", 0))
+            )
+            closes = [
+                float(candle["close"])
+                for candle in candles
+                if float(candle.get("close", 0)) > 0
+            ]
+
+            if len(closes) < 25:
+                results.append({
+                    "product": product,
+                    "status": "insufficient_data"
+                })
+                continue
+
+            def calculate_ema(values, period):
+                alpha = 2 / (period + 1)
+                value = values[0]
+                for price in values[1:]:
+                    value = alpha * price + (1 - alpha) * value
+                return value
+
+            ema9 = calculate_ema(closes[-40:], 9)
+            ema21 = calculate_ema(closes[-40:], 21)
+
+            if ema9 > ema21:
+                signal = "LONG"
+            elif ema9 < ema21:
+                signal = "SHORT"
+            else:
+                signal = "NEUTRAL"
+
+            results.append({
+                "product": product,
+                "status": "ok",
+                "signal": signal,
+                "price": closes[-1],
+                "ema9": round(ema9, 4),
+                "ema21": round(ema21, 4),
+                "source": "Coinbase public market data",
+                "verified_trader_signal": False
+            })
+
+        except Exception as exc:
+            results.append({
+                "product": product,
+                "status": "error",
+                "error": str(exc)[:200]
+            })
+
+    return {
+        "ok": any(item.get("status") == "ok" for item in results),
+        "signals": results
+    }
