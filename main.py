@@ -152,7 +152,11 @@ def trader_intelligence_status():
             "ok": False,
             "error": str(exc)[:200]
         }
-        
+  
+@app.get("/api/trader-intelligence/market")
+def trader_intelligence_market():
+    return trader_intelligence.collect_market_signals()
+    
 def analyze_symbol(symbol):
     data = market_prices().get(symbol, {})
     if "price_sek" not in data:
