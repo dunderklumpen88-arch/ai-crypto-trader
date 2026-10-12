@@ -157,7 +157,11 @@ def trader_intelligence_status():
 def trader_intelligence_market():
     return trader_intelligence.collect_market_signals()
     
-def analyze_symbol(symbol):
+
+@app.get("/api/trader-intelligence/market")
+def trader_intelligence_market():
+    return trader_intelligence.collect_market_signals()
+
     data = market_prices().get(symbol, {})
     if "price_sek" not in data:
         return {"name":symbol,"product":COINS[symbol],"signal":"AVVAKTA","reason":"Marknadspris saknas."}
@@ -181,7 +185,34 @@ def analyze_symbol(symbol):
             elif 32 <= current_rsi < 50: score -= 1
             elif current_rsi > 75: score -= 1
             elif current_rsi < 25: score += 1
-        if score >= 2:
+       def make_signals():
+    try:
+        market_data = trader_intelligence.collect_market_signals()
+
+        market_by_product = {
+            item.get("product"): item
+            for item in market_data.get("signals", [])
+            if item.get("status") == "ok"
+        }
+    except Exception:
+        market_by_product = {}
+
+    signals = [
+        analyze_symbol(
+            symbol,
+            market_by_product.get(COINS[symbol])
+        )
+        for symbol in COINS
+    ]
+
+    prices = market_prices()
+
+    with lock:
+        state["last_prices"] = prices
+        state["last_scan"] = datetime.now(timezone.utc).isoformat()
+        persist()
+
+    return signals if score >= 2:
             signal, reason = "KÖP", "Trend och momentum lutar positivt."
         elif score <= -2:
             signal, reason = "SÄLJ", "Trend och momentum lutar negativt."
