@@ -1,13 +1,8 @@
 from datetime import datetime, timezone
 from io import StringIO
 import csv
-import json
-import os
 import threading
 import time
-
-import psycopg
-from psycopg.types.json import Jsonb
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -15,7 +10,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="AI Crypto Trader", version="6.0-paper-tax-db")
+app = FastAPI(title="AI Crypto Trader", version="5.1-paper-tax-simple")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,8 +27,6 @@ INTERVAL_MINUTES = 15
 # Estimated fee assumption for simulation/reporting. Change to match the exchange.
 FEE_RATE = 0.005
 COINBASE_BASE = "https://api.exchange.coinbase.com"
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-db_status = {"configured": bool(DATABASE_URL), "connected": False, "error": None}
 
 COINS = {
     "BTC": "BTC-EUR",
@@ -56,54 +49,6 @@ state = {
 }
 
 
-def _db_connect():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL saknas i Render Environment.")
-    # Render may provide postgres://; psycopg accepts postgresql:// most reliably.
-    url = DATABASE_URL
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
-    return psycopg.connect(url, connect_timeout=8)
-
-
-def persist_state():
-    """Save paper account and tax history to PostgreSQL after each trade."""
-    payload = {key: state[key] for key in (
-        "balance_sek", "holdings", "trades", "tax_events", "last_scan",
-        "last_prices", "last_auto_run"
-    )}
-    try:
-        with _db_connect() as conn:
-            conn.execute(""" CREATE TABLE IF NOT EXISTS paper_trader_state ( id SMALLINT PRIMARY KEY CHECK (id = 1), payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() ) """)
-            conn.execute(""" INSERT INTO paper_trader_state (id, payload, updated_at) VALUES (1, %s, NOW()) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW() """, (Jsonb(payload),))
-            conn.commit()
-        db_status.update({"configured": True, "connected": True, "error": None})
-        return True
-    except Exception as exc:
-        db_status.update({"configured": bool(DATABASE_URL), "connected": False, "error": str(exc)[:240]})
-        return False
-
-
-def load_database_state():
-    try:
-        with _db_connect() as conn:
-            conn.execute(""" CREATE TABLE IF NOT EXISTS paper_trader_state ( id SMALLINT PRIMARY KEY CHECK (id = 1), payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() ) """)
-            row = conn.execute("SELECT payload FROM paper_trader_state WHERE id = 1").fetchone()
-            conn.commit()
-        if row and isinstance(row[0], dict):
-            saved = row[0]
-            with lock:
-                for key in ("balance_sek", "holdings", "trades", "tax_events", "last_scan", "last_prices", "last_auto_run"):
-                    if key in saved:
-                        state[key] = saved[key]
-                # Do not resume automatic trading by itself after a restart.
-                state["auto_enabled"] = False
-                state["auto_message"] = "Historik laddad från PostgreSQL. Pappershandel stoppad efter omstart."
-        db_status.update({"configured": True, "connected": True, "error": None})
-    except Exception as exc:
-        db_status.update({"configured": bool(DATABASE_URL), "connected": False, "error": str(exc)[:240]})
-
-
 class PaperOrder(BaseModel):
     product: str = "BTC"
     side: str
@@ -114,7 +59,7 @@ def get_price_eur(product_id: str) -> float:
     response = requests.get(
         f"{COINBASE_BASE}/products/{product_id}/ticker",
         timeout=10,
-        headers={"User-Agent": "AI-Crypto-Trader-Paper/4.0"},
+        headers={"User-Agent": "AI-Crypto-Trader-Paper/5.1"},
     )
     response.raise_for_status()
     return float(response.json()["price"])
@@ -150,7 +95,7 @@ def get_closes(product_id: str):
         f"{COINBASE_BASE}/products/{product_id}/candles",
         params={"granularity": 900},
         timeout=10,
-        headers={"User-Agent": "AI-Crypto-Trader-Paper/4.0"},
+        headers={"User-Agent": "AI-Crypto-Trader-Paper/5.1"},
     )
     response.raise_for_status()
     candles = sorted(response.json(), key=lambda candle: candle[0])
@@ -301,9 +246,6 @@ def execute_paper_trade(symbol, side, amount_sek, automatic):
             "automatic": automatic,
         }
         state["trades"].append(trade)
-    if not persist_state():
-        with lock:
-            state["auto_message"] = "VARNING: Databasen kunde inte spara senaste ändringen. Kontrollera /api/database/status."
     return True, trade
 
 
@@ -413,28 +355,10 @@ def dashboard():
 def health():
     return {
         "status": "online",
-        "version": "6.0-paper-tax-db",
+        "version": "5.1-paper-tax-simple",
         "mode": "PAPER ONLY",
         "real_orders_enabled": False,
         "estimated_fee_rate": FEE_RATE,
-        "database_connected": db_status["connected"],
-    }
-
-
-@app.get("/api/database/status")
-def database_status():
-    try:
-        with _db_connect() as conn:
-            conn.execute("SELECT 1").fetchone()
-        db_status.update({"configured": True, "connected": True, "error": None})
-    except Exception as exc:
-        db_status.update({"configured": bool(DATABASE_URL), "connected": False, "error": str(exc)[:240]})
-    return {
-        "configured": db_status["configured"],
-        "connected": db_status["connected"],
-        "persistence_enabled": db_status["connected"],
-        "error": db_status["error"],
-        "note": "Endast PAPER-historik sparas; riktiga ordrar är avstängda.",
     }
 
 
@@ -541,5 +465,4 @@ def tax_summary():
     }
 
 
-load_database_state()
 threading.Thread(target=auto_worker, daemon=True, name="paper-auto-worker").start()
