@@ -132,6 +132,27 @@ def rsi(values, period=14):
         return 100.0 if avg_gain > 0 else 50.0
     return 100 - (100/(1+avg_gain/avg_loss))
 
+@app.get("/api/trader-intelligence/status")
+def trader_intelligence_status():
+    try:
+        result = trader_intelligence.collect_public_signals()
+        return {
+            "ok": True,
+            "enabled": result.get("enabled", False),
+            "signals_found": len(result.get("signals", [])),
+            "sources": result.get("sources", []),
+            "updated_at": result.get("updated_at"),
+            "message": (
+                "Status kontrollerad. Externa källor kan behöva en adapter "
+                "innan deras data kan användas som tradersignaler."
+            )
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc)[:200]
+        }
+        
 def analyze_symbol(symbol):
     data = market_prices().get(symbol, {})
     if "price_sek" not in data:
