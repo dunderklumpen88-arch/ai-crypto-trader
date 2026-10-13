@@ -663,12 +663,28 @@ def shutdown():
 
 @app.get("/")
 def root():
-    return {"status":"online","version":APP_VERSION,"mode":MODE,"real_orders_enabled":False,
-            "auto_enabled":bool(state["auto_enabled"]),"message":"PAPER-läge: inga riktiga order skickas. Inget fast köpbeloppstak; total förlustgräns 500 SEK.",
-            "endpoints":["/api/health","/api/market","/api/signals","/api/scan","/api/paper/status",
-            "/api/paper/history","/api/auto/status","/api/auto/start","/api/auto/stop",
-            "/api/tax/summary","/api/tax/audit","/api/tax.csv","/api/tax/k4.csv","/api/trades.csv",
-            "/api/risk/status","/api/risk/events","/api/backtest","/api/database/status","/docs"]}
+    # Visa den svenska instrumentpanelen på startsidan.
+    from fastapi.responses import FileResponse
+
+    dashboard = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "index.html"
+    )
+
+    if os.path.isfile(dashboard):
+        return FileResponse(
+            dashboard,
+            media_type="text/html"
+        )
+
+    return {
+        "status": "online",
+        "version": APP_VERSION,
+        "mode": MODE,
+        "real_orders_enabled": False,
+        "auto_enabled": bool(state["auto_enabled"]),
+        "message": "PAPER-läge: inga riktiga order skickas."
+    }
 
 
 @app.head("/")
