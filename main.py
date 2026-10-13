@@ -1,811 +1,681 @@
-from datetime import datetime, timezone
-from io import StringIO
+""" AI Crypto Trader — PAPER-only backend Version: 7.0-paper-risk-tax Safety: - Real exchange orders are intentionally disabled. - This module simulates fills locally; it does not submit orders to Coinbase or any exchange. - Auto trading starts disabled. Enable only after reviewing the PAPER controls. - Tax ledger records every simulated fill and uses FIFO cost basis for disposals. """
+from __future__ import annotations
+
 import csv
+import io
 import json
+import logging
+import math
 import os
 import threading
 import time
+import uuid
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 import requests
-import trader_intelligence
-import psycopg
-from psycopg.types.json import Jsonb
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
-app = FastAPI(title="AI Crypto Trader", version="6.4-paper-tax-audit")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+APP_VERSION = "7.0-paper-risk-tax"
+MODE = "PAPER ONLY"
+REAL_ORDERS_ENABLED = False
+SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SHIB"]
+PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
+DEFAULT_START_BALANCE_SEK = 1000.0
+DEFAULT_FEE_RATE = 0.005
+MAX_TRADE_SEK = 100.0
+MAX_DAILY_TRADES = 4
+MAX_DAILY_LOSS_SEK = 100.0
+MAX_POSITION_SEK = 300.0
+STOP_LOSS_PCT = 3.0
+TAKE_PROFIT_PCT = 6.0
+MIN_CONFIDENCE = 65
+AUTO_INTERVAL_SECONDS = 900
+STATE_FILE = os.getenv("PAPER_STATE_FILE", "/tmp/ai_trader_paper_state.json")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+log = logging.getLogger("paper-trader")
+app = FastAPI(title="AI Crypto Trader PAPER", version=APP_VERSION)
 lock = threading.RLock()
+stop_event = threading.Event()
 
-START_BALANCE_SEK = 1000.0
-MAX_PER_TRADE = 100.0
-MAX_AUTO_TRADES_PER_DAY = 4
-INTERVAL_MINUTES = 15
-FEE_RATE = 0.005
-STOP_LOSS_PCT = 0.03
-TAKE_PROFIT_PCT = 0.06
-COINBASE_BASE = "https://api.exchange.coinbase.com"
-COINS = {
-    "BTC": "BTC-EUR",
-    "ETH": "ETH-EUR",
-    "SOL": "SOL-EUR",
-    "XRP": "XRP-EUR",
-    "SHIB": "SHIB-EUR",
-}
-
-DEFAULT = {
-    "balance_sek": START_BALANCE_SEK,
+state: Dict[str, Any] = {
+    "mode": MODE,
+    "real_orders_enabled": False,
+    "auto_enabled": False,
+    "balance_sek": DEFAULT_START_BALANCE_SEK,
+    "fee_rate": DEFAULT_FEE_RATE,
     "holdings": {},
     "trades": [],
     "tax_events": [],
-    "auto_enabled": False,
-    "auto_message": "Automatisk pappershandel är stoppad.",
-    "last_scan": None,
-    "last_prices": {},
-    "last_auto_run": None,
     "risk_events": [],
+    "daily_stats": {},
+    "equity_history": [],
+    "last_auto_run": None,
+    "last_error": None,
 }
+market_cache: Dict[str, Any] = {"at": 0.0, "prices": {}}
+price_history: Dict[str, deque] = {s: deque(maxlen=240) for s in SYMBOLS}
+auto_thread_started = False
 
 
-def db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL saknas i Render Environment")
-    url = DATABASE_URL
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
-    return psycopg.connect(url, connect_timeout=10)
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def init_db():
-    with db() as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS paper_trader_state ( id INTEGER PRIMARY KEY CHECK (id = 1), payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL )"""
-        )
-
-
-def persist():
-    with db() as conn:
-        conn.execute(
-            """INSERT INTO paper_trader_state (id, payload, updated_at) VALUES (1, %s, %s) ON CONFLICT (id) DO UPDATE SET payload=EXCLUDED.payload, updated_at=EXCLUDED.updated_at""",
-            (Jsonb(state), datetime.now(timezone.utc)),
-        )
-
-
-def restore():
-    with db() as conn:
-        row = conn.execute(
-            "SELECT payload FROM paper_trader_state WHERE id=1"
-        ).fetchone()
-    if not row:
-        return dict(DEFAULT)
+def fnum(value: Any, default: float = 0.0) -> float:
     try:
-        saved = row[0]
-        if isinstance(saved, str):
-            saved = json.loads(saved)
-        restored = dict(DEFAULT)
-        restored.update(saved)
-        restored["auto_enabled"] = False
-        restored["auto_message"] = (
-            "Omstart klar. Automatisk pappershandel är stoppad tills du startar den igen."
-        )
-        restored.setdefault("tax_events", [])
-        restored.setdefault("trades", [])
-        restored.setdefault("holdings", {})
-        restored.setdefault("risk_events", [])
-        return restored
-    except Exception:
-        return dict(DEFAULT)
+        value = float(value)
+        return value if math.isfinite(value) else default
+    except (TypeError, ValueError):
+        return default
 
 
-init_db()
-state = restore()
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 
-class PaperOrder(BaseModel):
-    product: str = "BTC"
-    side: str
-    amount_sek: float = Field(gt=0, le=MAX_PER_TRADE)
-
-
-def get_price_eur(product_id):
-    response = requests.get(
-        f"{COINBASE_BASE}/products/{product_id}/ticker",
-        timeout=10,
-        headers={"User-Agent": "AI-Crypto-Trader-Paper/6.4"},
-    )
-    response.raise_for_status()
-    price = float(response.json()["price"])
-    if price <= 0:
-        raise ValueError("Ogiltigt pris")
-    return price
-
-
-def eur_to_sek():
+def persist() -> None:
+    """Best-effort local persistence. Render ephemeral disks may reset on deploy."""
     try:
-        response = requests.get(
-            "https://api.frankfurter.app/latest",
-            params={"from": "EUR", "to": "SEK"},
-            timeout=10,
-        )
-        response.raise_for_status()
-        rate = float(response.json()["rates"]["SEK"])
-        if rate > 0:
-            return rate
-    except Exception:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, STATE_FILE)
+    except Exception as exc:
+        log.warning("Could not persist PAPER state: %s", exc)
+
+
+def restore() -> None:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+        if isinstance(saved, dict):
+            # Never restore a setting that could enable real orders.
+            state.update(saved)
+            state["real_orders_enabled"] = False
+            state["mode"] = MODE
+            state["auto_enabled"] = False
+            state.setdefault("holdings", {})
+            state.setdefault("trades", [])
+            state.setdefault("tax_events", [])
+            state.setdefault("risk_events", [])
+            state.setdefault("daily_stats", {})
+            state.setdefault("equity_history", [])
+    except FileNotFoundError:
         pass
-    return 11.0
+    except Exception as exc:
+        log.warning("Could not restore PAPER state: %s", exc)
 
 
-def market_prices():
-    rate, output = eur_to_sek(), {}
-    for symbol, product in COINS.items():
-        try:
-            price = get_price_eur(product)
-            output[symbol] = {
-                "price_eur": price,
-                "price_sek": round(price * rate, 8),
-            }
-        except Exception:
-            output[symbol] = {"error": "Pris tillfälligt otillgängligt"}
-    return output
+restore()
 
 
-def get_candles(product_id, limit=100):
-    response = requests.get(
-        f"{COINBASE_BASE}/products/{product_id}/candles",
-        params={"granularity": 900},
-        timeout=10,
-        headers={"User-Agent": "AI-Crypto-Trader-Paper/6.4"},
+def record_risk(event: str, detail: str) -> None:
+    state.setdefault("risk_events", []).append(
+        {"time": now_iso(), "event": event, "detail": detail}
     )
-    response.raise_for_status()
-    rows = sorted(response.json(), key=lambda row: row[0])
-    return [
-        {
-            "time": int(candle[0]),
-            "low": float(candle[1]),
-            "high": float(candle[2]),
-            "open": float(candle[3]),
-            "close": float(candle[4]),
-            "volume": float(candle[5]),
-        }
-        for candle in rows
-        if len(candle) >= 6
-    ][-limit:]
+    state["risk_events"] = state["risk_events"][-500:]
 
 
-def ema(values, period):
-    if not values:
-        return []
-    alpha = 2.0 / (period + 1)
-    output = [values[0]]
-    for value in values[1:]:
-        output.append(alpha * value + (1 - alpha) * output[-1])
-    return output
-
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
-    gains = [max(value, 0) for value in changes[-period:]]
-    losses = [max(-value, 0) for value in changes[-period:]]
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else 50.0
-    return 100 - (100 / (1 + avg_gain / avg_loss))
-
-
-@app.get("/api/trader-intelligence/status")
-def trader_intelligence_status():
+def get_prices(force: bool = False) -> Dict[str, float]:
+    """Fetch public Coinbase spot prices and convert EUR to SEK using a rough FX fallback."""
+    with lock:
+        if not force and time.time() - market_cache["at"] < 20 and market_cache["prices"]:
+            return dict(market_cache["prices"])
+    prices: Dict[str, float] = {}
+    eur_sek = 11.2
     try:
-        result = trader_intelligence.collect_public_signals()
-        return {
-            "ok": True,
-            "enabled": result.get("enabled", False),
-            "signals_found": len(result.get("signals", [])),
-            "sources": result.get("sources", []),
-            "updated_at": result.get("updated_at"),
-            "message": (
-                "Externa tradersignaler behöver en fungerande adapter innan de kan användas."
-            ),
-        }
+        fx = requests.get(
+            "https://api.frankfurter.app/latest?from=EUR&to=SEK", timeout=5
+        )
+        if fx.ok:
+            eur_sek = fnum(fx.json().get("rates", {}).get("SEK"), eur_sek)
     except Exception as exc:
-        return {"ok": False, "error": str(exc)[:200]}
-
-
-@app.get("/api/trader-intelligence/market")
-def trader_intelligence_market():
-    try:
-        return trader_intelligence.collect_market_signals()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Marknadsanalysen misslyckades: {str(exc)[:180]}",
-        )
-
-
-def analyze_symbol(symbol, market_signal=None):
-    data = market_prices().get(symbol, {})
-    if "price_sek" not in data:
-        return {
-            "name": symbol,
-            "product": COINS[symbol],
-            "signal": "AVVAKTA",
-            "reason": "Marknadspris saknas.",
-            "indicators": {},
-        }
-    try:
-        candles = get_candles(COINS[symbol], 100)
-        closes = [candle["close"] for candle in candles]
-        if len(closes) < 30:
-            return {
-                "name": symbol,
-                "product": COINS[symbol],
-                "price_sek": data["price_sek"],
-                "signal": "AVVAKTA",
-                "reason": "För få historiska datapunkter.",
-                "indicators": {},
-            }
-        fast, slow = ema(closes, 9), ema(closes, 21)
-        current_rsi, latest = rsi(closes), closes[-1]
-        score = 0
-        if fast[-1] > slow[-1]:
-            score += 1
-        elif fast[-1] < slow[-1]:
-            score -= 1
-        if latest > fast[-1]:
-            score += 1
-        elif latest < fast[-1]:
-            score -= 1
-        if current_rsi is not None:
-            if 50 <= current_rsi <= 68:
-                score += 1
-            elif 32 <= current_rsi < 50:
-                score -= 1
-            elif current_rsi > 75:
-                score -= 1
-            elif current_rsi < 25:
-                score += 1
-        market_used = None
-        if market_signal and market_signal.get("status") == "ok":
-            market_used = market_signal.get("signal")
-            if market_used == "LONG":
-                score += 1
-            elif market_used == "SHORT":
-                score -= 1
-        if score >= 2:
-            signal, reason = "KÖP", "Trend och momentum lutar positivt."
-        elif score <= -2:
-            signal, reason = "SÄLJ", "Trend och momentum lutar negativt."
-        else:
-            signal, reason = "AVVAKTA", "Indikatorerna ger ingen tillräckligt stark samsignal."
-        return {
-            "name": symbol,
-            "product": COINS[symbol],
-            "price_sek": data["price_sek"],
-            "signal": signal,
-            "reason": reason,
-            "indicators": {
-                "ema9": round(fast[-1], 8),
-                "ema21": round(slow[-1], 8),
-                "rsi14": round(current_rsi, 2) if current_rsi is not None else None,
-                "score": score,
-                "points": len(closes),
-                "market_signal": market_used,
-            },
-        }
-    except Exception:
-        return {
-            "name": symbol,
-            "product": COINS[symbol],
-            "price_sek": data["price_sek"],
-            "signal": "AVVAKTA",
-            "reason": "Historiska prisdata kunde inte analyseras.",
-            "indicators": {},
-        }
-
-
-def make_signals():
-    try:
-        market_data = trader_intelligence.collect_market_signals()
-        by_product = {
-            item.get("product"): item
-            for item in market_data.get("signals", [])
-            if item.get("status") == "ok"
-        }
-    except Exception:
-        by_product = {}
-    signals = [
-        analyze_symbol(symbol, by_product.get(COINS[symbol]))
-        for symbol in COINS
-    ]
-    prices = market_prices()
-    with lock:
-        state["last_prices"] = prices
-        state["last_scan"] = datetime.now(timezone.utc).isoformat()
-        persist()
-    return signals
-
-
-def execute_paper_trade(symbol, side, amount_sek, automatic):
-    """Paper trade only; sales record net proceeds and average-cost basis."""
-    symbol, side = str(symbol).upper(), str(side).lower()
-    if symbol not in COINS:
-        return False, "Okänd kryptovaluta"
-    if side not in ("buy", "sell"):
-        return False, "Ange buy eller sell"
-    try:
-        price = get_price_eur(COINS[symbol]) * eur_to_sek()
-    except Exception:
-        return False, "Kunde inte hämta marknadspris"
-    if price <= 0:
-        return False, "Ogiltigt pris"
-
-    with lock:
-        today = datetime.now(timezone.utc).date().isoformat()
-        count_today = sum(
-            1 for trade in state["trades"]
-            if trade.get("automatic") and trade["time"][:10] == today
-        )
-        if automatic and count_today >= MAX_AUTO_TRADES_PER_DAY:
-            return False, "Gränsen på fyra automatiska affärer är nådd."
-
-        amount_sek = min(float(amount_sek), MAX_PER_TRADE)
-        holding = state["holdings"].setdefault(
-            symbol, {"quantity": 0.0, "cost_basis_sek": 0.0}
-        )
-        current_qty = float(holding.get("quantity", 0.0))
-        current_basis = float(holding.get("cost_basis_sek", 0.0))
-        now = datetime.now(timezone.utc)
-        fee = 0.0
-        tax_event = None
-
-        if side == "buy":
-            if amount_sek > float(state["balance_sek"]):
-                return False, "Otillräckligt simulerat saldo"
-            fee = amount_sek * FEE_RATE
-            quantity = (amount_sek - fee) / price
-            if quantity <= 0:
-                return False, "Köpet gav ingen mängd kryptovaluta"
-            state["balance_sek"] -= amount_sek
-            holding["quantity"] = current_qty + quantity
-            # Total acquisition cost includes the buy fee.
-            holding["cost_basis_sek"] = current_basis + amount_sek
-            trade_amount = amount_sek
-        else:
-            if current_qty <= 0:
-                return False, "Det finns inget innehav att sälja"
-            quantity = min(amount_sek / price, current_qty)
-            if quantity <= 0:
-                return False, "Det finns inget innehav att sälja"
-            gross = quantity * price
-            fee = gross * FEE_RATE
-            net_proceeds = gross - fee
-            acquisition_cost = (
-                current_basis * quantity / current_qty if current_qty > 0 else 0.0
-            )
-            realized = net_proceeds - acquisition_cost
-            state["balance_sek"] += net_proceeds
-            remaining_qty = max(0.0, current_qty - quantity)
-            remaining_basis = max(0.0, current_basis - acquisition_cost)
-            if remaining_qty < 1e-12:
-                remaining_qty, remaining_basis = 0.0, 0.0
-            holding["quantity"] = remaining_qty
-            holding["cost_basis_sek"] = remaining_basis
-            trade_amount = gross
-            tax_event = {
-                "date": now.date().isoformat(),
-                "time": now.isoformat(),
-                "symbol": symbol,
-                "quantity_sold": round(quantity, 12),
-                "sale_price_sek": round(price, 8),
-                "gross_proceeds_sek": round(gross, 8),
-                "sale_fee_sek": round(fee, 8),
-                "net_proceeds_sek": round(net_proceeds, 8),
-                "acquisition_cost_sek": round(acquisition_cost, 8),
-                "realized_gain_loss_sek": round(realized, 8),
-                "buy_and_sell_fees_included": True,
-                "method": "Genomsnittsmetoden (simulerad)",
-                "mode": "PAPER ONLY",
-            }
-
-        trade = {
-            "time": now.isoformat(),
-            "symbol": symbol,
-            "side": side,
-            "amount_sek": round(trade_amount, 8),
-            "price_sek": round(price, 8),
-            "quantity": round(quantity, 12),
-            "fee_sek": round(fee, 8),
-            "fee_rate": FEE_RATE,
-            "mode": "PAPER ONLY",
-            "automatic": bool(automatic),
-        }
-        state["trades"].append(trade)
-        if tax_event is not None:
-            state.setdefault("tax_events", []).append(tax_event)
-        persist()
-    return True, trade
-
-
-def check_risk_exits():
-    events = []
-    with lock:
-        holdings = [
-            (symbol, dict(holding))
-            for symbol, holding in state["holdings"].items()
-            if float(holding.get("quantity", 0)) > 0
-        ]
-    for symbol, holding in holdings:
-        quantity = float(holding.get("quantity", 0))
-        basis = float(holding.get("cost_basis_sek", 0))
-        if quantity <= 0 or basis <= 0:
-            continue
+        log.info("FX fallback used: %s", exc)
+    for symbol, product in PRODUCTS.items():
         try:
-            price = get_price_eur(COINS[symbol]) * eur_to_sek()
-        except Exception:
-            continue
-        avg_cost = basis / quantity
-        change = price / avg_cost - 1 if avg_cost else 0
-        reason = (
-            "STOP-LOSS" if change <= -STOP_LOSS_PCT
-            else "VINSTHEMTAGNING" if change >= TAKE_PROFIT_PCT
-            else None
-        )
-        if reason:
-            ok, _ = execute_paper_trade(
-                symbol, "sell", min(MAX_PER_TRADE, quantity * price), True
+            response = requests.get(
+                f"https://api.exchange.coinbase.com/products/{product}/ticker",
+                timeout=5,
             )
-            if ok:
-                events.append(f"{reason} {symbol}: {change * 100:.2f}%")
-    if events:
-        with lock:
-            state.setdefault("risk_events", []).extend(
-                {"time": datetime.now(timezone.utc).isoformat(), "event": event}
-                for event in events
-            )
-            persist()
-    return events
-
-
-def run_automatic_scan():
-    signals = make_signals()
-    risk_actions = check_risk_exits()
-    actions = []
-    for item in signals:
-        if item["signal"] not in ("KÖP", "SÄLJ"):
-            continue
-        symbol = item["name"]
-        with lock:
-            holding = state["holdings"].get(symbol, {"quantity": 0.0})
-            quantity = float(holding.get("quantity", 0))
-            balance = float(state["balance_sek"])
-        if item["signal"] == "KÖP":
-            if quantity > 0:
-                continue
-            amount = min(MAX_PER_TRADE, balance)
-            if amount <= 0:
-                continue
-            ok, result = execute_paper_trade(symbol, "buy", amount, True)
-        else:
-            if quantity <= 0:
-                continue
-            amount = min(MAX_PER_TRADE, quantity * float(item.get("price_sek", 0)))
-            if amount <= 0:
-                continue
-            ok, result = execute_paper_trade(symbol, "sell", amount, True)
-        if ok:
-            actions.append(f"{item['signal']} {symbol}: {result['amount_sek']:.2f} kr")
-    with lock:
-        state["last_auto_run"] = datetime.now(timezone.utc).isoformat()
-        details = actions + risk_actions
-        state["auto_message"] = (
-            "Senaste papperskörning: " + ", ".join(details)
-            if details
-            else "Analys klar. Inga affärer gjordes; botten avvaktar eller saknar innehav."
-        )
-        persist()
-
-
-def auto_worker():
-    while True:
-        time.sleep(60)
-        with lock:
-            enabled, last = state["auto_enabled"], state["last_auto_run"]
-        if not enabled:
-            continue
-        try:
-            due = (
-                not last
-                or (
-                    datetime.now(timezone.utc) - datetime.fromisoformat(last)
-                ).total_seconds() >= INTERVAL_MINUTES * 60
-            )
-            if due:
-                run_automatic_scan()
+            if response.ok:
+                price_eur = fnum(response.json().get("price"))
+                if price_eur > 0:
+                    prices[symbol] = price_eur * eur_sek
         except Exception as exc:
-            with lock:
-                state["auto_message"] = "Fel vid analys: " + str(exc)[:180]
-                persist()
-
-
-def status_data():
-    today = datetime.now(timezone.utc).date().isoformat()
+            log.info("Price fetch failed for %s: %s", symbol, exc)
     with lock:
-        trades_today = sum(
-            1 for trade in state["trades"]
-            if trade.get("automatic") and trade["time"][:10] == today
-        )
+        if prices:
+            market_cache.update({"at": time.time(), "prices": prices})
+            for symbol, price in prices.items():
+                price_history.setdefault(symbol, deque(maxlen=240)).append(
+                    {"time": time.time(), "price": price}
+                )
+            return dict(prices)
+        if market_cache["prices"]:
+            return dict(market_cache["prices"])
+    raise HTTPException(status_code=503, detail="Marknadspriser kunde inte hämtas.")
+
+
+def indicators(symbol: str, current_price: float) -> Dict[str, Any]:
+    """EMA, RSI, MACD-like momentum, volatility and short trend from cached observations."""
+    points = list(price_history.get(symbol, []))
+    prices = [fnum(p.get("price")) for p in points if fnum(p.get("price")) > 0]
+    if not prices or abs(prices[-1] - current_price) > current_price * 0.0001:
+        prices.append(current_price)
+    if len(prices) < 3:
         return {
-            "enabled": state["auto_enabled"],
-            "mode": "PAPER ONLY",
-            "real_orders_enabled": False,
-            "max_sek_per_trade": MAX_PER_TRADE,
-            "max_trades_per_day": MAX_AUTO_TRADES_PER_DAY,
-            "trades_today": trades_today,
-            "interval_minutes": INTERVAL_MINUTES,
-            "message": state["auto_message"],
-            "balance_sek": round(float(state["balance_sek"]), 2),
-            "trade_count": len(state["trades"]),
-            "last_auto_run": state["last_auto_run"],
-            "fee_rate": FEE_RATE,
-            "storage": "PostgreSQL",
-            "stop_loss_pct": STOP_LOSS_PCT * 100,
-            "take_profit_pct": TAKE_PROFIT_PCT * 100,
+            "ema9": current_price, "ema21": current_price, "rsi14": 50.0,
+            "momentum_pct": 0.0, "volatility_pct": 0.0, "samples": len(prices),
+        }
+
+    def ema(values: List[float], period: int) -> float:
+        alpha = 2 / (period + 1)
+        result = values[0]
+        for val in values[1:]:
+            result = alpha * val + (1 - alpha) * result
+        return result
+
+    diffs = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    gains = [max(x, 0.0) for x in diffs[-14:]]
+    losses = [max(-x, 0.0) for x in diffs[-14:]]
+    avg_gain = sum(gains) / max(1, len(gains))
+    avg_loss = sum(losses) / max(1, len(losses))
+    rsi = 100.0 if avg_loss == 0 and avg_gain > 0 else (
+        50.0 if avg_gain == 0 and avg_loss == 0 else
+        100 - 100 / (1 + avg_gain / avg_loss) if avg_loss > 0 else 0.0
+    )
+    returns = [(prices[i] / prices[i - 1] - 1) * 100 for i in range(1, len(prices)) if prices[i - 1] > 0]
+    volatility = 0.0
+    if len(returns) > 1:
+        mean = sum(returns) / len(returns)
+        volatility = math.sqrt(sum((x - mean) ** 2 for x in returns) / (len(returns) - 1))
+    lookback = prices[max(0, len(prices) - 6)]
+    momentum = (current_price / lookback - 1) * 100 if lookback > 0 else 0.0
+    return {
+        "ema9": ema(prices, 9),
+        "ema21": ema(prices, 21),
+        "rsi14": round(rsi, 2),
+        "momentum_pct": round(momentum, 4),
+        "volatility_pct": round(volatility, 4),
+        "samples": len(prices),
+    }
+
+
+def analyze_symbol(symbol: str, price: float) -> Dict[str, Any]:
+    ind = indicators(symbol, price)
+    score = 0
+    reasons: List[str] = []
+    if ind["ema9"] > ind["ema21"]:
+        score += 1
+        reasons.append("EMA9 över EMA21")
+    elif ind["ema9"] < ind["ema21"]:
+        score -= 1
+        reasons.append("EMA9 under EMA21")
+    rsi = ind["rsi14"]
+    if 50 <= rsi <= 68:
+        score += 1
+        reasons.append("RSI stödjer uppgång")
+    elif rsi >= 73:
+        score -= 1
+        reasons.append("RSI överköpt")
+    elif rsi <= 30:
+        score += 1
+        reasons.append("RSI översåld — möjlig rekyl, ej bekräftad")
+    if ind["momentum_pct"] > 0.15:
+        score += 1
+        reasons.append("Positivt kort momentum")
+    elif ind["momentum_pct"] < -0.15:
+        score -= 1
+        reasons.append("Negativt kort momentum")
+    # Avoid chasing unusually volatile short-term moves.
+    if ind["volatility_pct"] > 1.5:
+        score -= 1
+        reasons.append("Hög kortsiktig volatilitet")
+    if ind["samples"] < 20:
+        reasons.append("Få datapunkter — låg statistisk säkerhet")
+    if score >= 2 and ind["samples"] >= 20 and ind["volatility_pct"] <= 1.5:
+        signal, confidence = "KÖP", min(85, 60 + score * 7)
+    elif score <= -2 and ind["samples"] >= 20:
+        signal, confidence = "SÄLJ", min(85, 60 + abs(score) * 7)
+    else:
+        signal, confidence = "AVVAKTA", min(60, 45 + abs(score) * 4)
+    return {
+        "symbol": symbol, "product": PRODUCTS[symbol], "price_sek": round(price, 4),
+        "signal": signal, "confidence": confidence, "score": score,
+        "indicators": ind, "reason": "; ".join(reasons) or "Otillräcklig samstämmighet",
+    }
+
+
+def market_value_sek() -> float:
+    prices = get_prices()
+    return sum(
+        fnum(item.get("quantity")) * prices.get(symbol, 0.0)
+        for symbol, item in state.get("holdings", {}).items()
+    )
+
+
+def equity_sek() -> float:
+    return fnum(state.get("balance_sek")) + market_value_sek()
+
+
+def daily_key() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def daily_stats() -> Dict[str, Any]:
+    key = daily_key()
+    return state.setdefault("daily_stats", {}).setdefault(
+        key, {"trades": 0, "realized_pnl_sek": 0.0, "starting_equity_sek": equity_sek()}
+    )
+
+
+def tax_sell(symbol: str, quantity: float, net_proceeds: float, timestamp: str, trade_id: str) -> Dict[str, Any]:
+    """FIFO tax lots: every disposal consumes oldest acquisition lots."""
+    holding = state.setdefault("holdings", {}).setdefault(
+        symbol, {"quantity": 0.0, "cost_basis_sek": 0.0, "lots": []}
+    )
+    remaining = quantity
+    cost = 0.0
+    lots = holding.setdefault("lots", [])
+    while remaining > 1e-12 and lots:
+        lot = lots[0]
+        lot_qty = fnum(lot.get("quantity"))
+        if lot_qty <= 1e-12:
+            lots.pop(0)
+            continue
+        used = min(remaining, lot_qty)
+        cost += used * fnum(lot.get("unit_cost_sek"))
+        lot["quantity"] = lot_qty - used
+        remaining -= used
+        if lot["quantity"] <= 1e-12:
+            lots.pop(0)
+    # If old restored state lacks lots, estimate proportional basis; mark as incomplete.
+    if remaining > 1e-9:
+        old_qty = fnum(holding.get("quantity"))
+        old_basis = fnum(holding.get("cost_basis_sek"))
+        if old_qty > 0:
+            cost += min(remaining, old_qty) * old_basis / old_qty
+        record_risk("TAX_BASIS_GAP", f"{symbol}: saknade inköpsposter för {remaining:.12g} enheter")
+    gain = net_proceeds - cost
+    event = {
+        "event_id": str(uuid.uuid4()), "trade_id": trade_id, "time": timestamp,
+        "type": "disposal", "symbol": symbol, "quantity": quantity,
+        "proceeds_sek": round(net_proceeds, 8), "cost_basis_sek": round(cost, 8),
+        "gain_loss_sek": round(gain, 8), "basis_complete": remaining <= 1e-9,
+        "method": "FIFO", "mode": MODE,
+    }
+    state.setdefault("tax_events", []).append(event)
+    return event
+
+
+def paper_order(side: str, symbol: str, amount_sek: float, price: Optional[float] = None, automatic: bool = False) -> Dict[str, Any]:
+    side = side.lower().strip()
+    symbol = symbol.upper().strip()
+    if side not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="Sidan måste vara buy eller sell.")
+    if symbol not in SYMBOLS:
+        raise HTTPException(status_code=400, detail="Okänd kryptovaluta.")
+    if not math.isfinite(amount_sek) or amount_sek <= 0:
+        raise HTTPException(status_code=400, detail="Beloppet måste vara större än noll.")
+    amount_sek = min(float(amount_sek), MAX_TRADE_SEK)
+    prices = get_prices()
+    market_price = prices.get(symbol)
+    if not market_price or market_price <= 0:
+        raise HTTPException(status_code=503, detail=f"Inget giltigt pris för {symbol}.")
+    fill_price = market_price if price is None else market_price  # Never accept client-supplied prices.
+    with lock:
+        if state.get("real_orders_enabled") is not False:
+            state["real_orders_enabled"] = False
+            record_risk("REAL_ORDER_GUARD", "Försök att aktivera riktiga order blockerades.")
+        holdings = state.setdefault("holdings", {})
+        holding = holdings.setdefault(symbol, {"quantity": 0.0, "cost_basis_sek": 0.0, "lots": []})
+        balance = fnum(state.get("balance_sek"))
+        fee_rate = clamp(fnum(state.get("fee_rate"), DEFAULT_FEE_RATE), 0.0, 0.02)
+        trade_value = amount_sek
+        fee = trade_value * fee_rate
+        timestamp = now_iso()
+        trade_id = str(uuid.uuid4())
+        stats = daily_stats()
+        if automatic:
+            if not state.get("auto_enabled"):
+                raise HTTPException(status_code=409, detail="Automatisk PAPER-handel är avstängd.")
+            if int(stats["trades"]) >= MAX_DAILY_TRADES:
+                record_risk("DAILY_TRADE_LIMIT", "Max antal PAPER-affärer per UTC-dygn uppnått.")
+                raise HTTPException(status_code=409, detail="Dagens handelsgräns är nådd.")
+            if fnum(stats["realized_pnl_sek"]) <= -MAX_DAILY_LOSS_SEK:
+                record_risk("DAILY_LOSS_LIMIT", "Daglig förlustgräns uppnådd.")
+                raise HTTPException(status_code=409, detail="Daglig förlustgräns nådd.")
+        if side == "buy":
+            if automatic:
+                current_position = fnum(holding.get("quantity")) * market_price
+                if current_position + trade_value + fee > MAX_POSITION_SEK:
+                    raise HTTPException(status_code=409, detail="Positionsgränsen skulle överskridas.")
+            total_cost = trade_value + fee
+            if balance + 1e-9 < total_cost:
+                raise HTTPException(status_code=409, detail="Otillräckligt PAPER-saldo inklusive avgift.")
+            quantity = trade_value / fill_price
+            state["balance_sek"] = round(balance - total_cost, 8)
+            holding["quantity"] = fnum(holding.get("quantity")) + quantity
+            holding["cost_basis_sek"] = fnum(holding.get("cost_basis_sek")) + total_cost
+            holding.setdefault("lots", []).append(
+                {"time": timestamp, "quantity": quantity, "unit_cost_sek": total_cost / quantity, "trade_id": trade_id}
+            )
+            tax_event = {
+                "event_id": str(uuid.uuid4()), "trade_id": trade_id, "time": timestamp,
+                "type": "acquisition", "symbol": symbol, "quantity": quantity,
+                "cost_basis_sek": round(total_cost, 8), "fee_sek": round(fee, 8),
+                "mode": MODE,
+            }
+            state.setdefault("tax_events", []).append(tax_event)
+            pnl = 0.0
+        else:
+            quantity = trade_value / fill_price
+            held_qty = fnum(holding.get("quantity"))
+            quantity = min(quantity, held_qty)
+            if quantity <= 1e-12:
+                raise HTTPException(status_code=409, detail=f"Inget {symbol}-innehav att sälja.")
+            gross = quantity * fill_price
+            fee = gross * fee_rate
+            net_proceeds = gross - fee
+            old_qty = fnum(holding.get("quantity"))
+            old_basis = fnum(holding.get("cost_basis_sek"))
+            tax_event = tax_sell(symbol, quantity, net_proceeds, timestamp, trade_id)
+            state["balance_sek"] = round(balance + net_proceeds, 8)
+            holding["quantity"] = max(0.0, old_qty - quantity)
+            holding["cost_basis_sek"] = max(0.0, old_basis - tax_event["cost_basis_sek"])
+            pnl = tax_event["gain_loss_sek"]
+            stats["realized_pnl_sek"] = fnum(stats.get("realized_pnl_sek")) + pnl
+        trade = {
+            "trade_id": trade_id, "mode": MODE, "side": side, "symbol": symbol,
+            "time": timestamp, "price_sek": round(fill_price, 8), "quantity": quantity,
+            "amount_sek": round(quantity * fill_price, 8), "fee_sek": round(fee, 8),
+            "fee_rate": fee_rate, "automatic": automatic,
+            "realized_pnl_sek": round(pnl, 8), "tax_event_id": tax_event["event_id"],
+        }
+        state.setdefault("trades", []).append(trade)
+        state["trades"] = state["trades"][-10000:]
+        stats["trades"] = int(stats.get("trades", 0)) + (1 if automatic else 0)
+        state["equity_history"].append({"time": timestamp, "equity_sek": round(fnum(state["balance_sek"]) + sum(fnum(h.get("quantity")) * prices.get(s, 0.0) for s, h in holdings.items()), 8)})
+        state["equity_history"] = state["equity_history"][-2000:]
+        state["last_error"] = None
+        persist()
+        return {
+            "ok": True, "mode": MODE, "real_orders_enabled": False,
+            "trade": trade, "tax_event": tax_event,
+            "balance_sek": state["balance_sek"],
+            "holding": {"symbol": symbol, "quantity": holding["quantity"], "cost_basis_sek": holding["cost_basis_sek"]},
+            "equity_sek": state["equity_history"][-1]["equity_sek"],
         }
 
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-    try:
-        with open("index.html", "r", encoding="utf-8") as file:
-            return file.read()
-    except Exception:
-        return "<h1>AI Crypto Trader</h1><p>Öppna /docs för API-test.</p>"
+def make_signals() -> List[Dict[str, Any]]:
+    prices = get_prices(force=True)
+    return [analyze_symbol(s, prices[s]) for s in SYMBOLS if s in prices]
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return home()
+def auto_loop() -> None:
+    log.info("PAPER auto worker started; live orders are disabled.")
+    while not stop_event.is_set():
+        try:
+            with lock:
+                enabled = bool(state.get("auto_enabled"))
+            if enabled:
+                signals = make_signals()
+                prices = get_prices()
+                # Risk-off exits first: sell all holdings if stop/take threshold is breached.
+                for symbol, holding in list(state.get("holdings", {}).items()):
+                    qty = fnum(holding.get("quantity"))
+                    basis = fnum(holding.get("cost_basis_sek"))
+                    price = prices.get(symbol, 0.0)
+                    if qty <= 0 or price <= 0 or basis <= 0:
+                        continue
+                    pnl_pct = ((qty * price) / basis - 1) * 100
+                    if pnl_pct <= -STOP_LOSS_PCT or pnl_pct >= TAKE_PROFIT_PCT:
+                        paper_order("sell", symbol, min(MAX_TRADE_SEK, qty * price), automatic=True)
+                for sig in signals:
+                    if sig["signal"] == "KÖP" and sig["confidence"] >= MIN_CONFIDENCE:
+                        paper_order("buy", sig["symbol"], MAX_TRADE_SEK, automatic=True)
+                with lock:
+                    state["last_auto_run"] = now_iso()
+                    state["last_error"] = None
+                    persist()
+        except HTTPException as exc:
+            if exc.status_code not in (409,):
+                state["last_error"] = str(exc.detail)
+            log.info("Auto cycle blocked: %s", exc.detail)
+        except Exception as exc:
+            state["last_error"] = str(exc)
+            log.exception("Auto cycle failed")
+        stop_event.wait(AUTO_INTERVAL_SECONDS)
+
+
+def start_worker() -> None:
+    global auto_thread_started
+    if not auto_thread_started:
+        thread = threading.Thread(target=auto_loop, daemon=True, name="paper-auto-worker")
+        thread.start()
+        auto_thread_started = True
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    state["real_orders_enabled"] = False
+    state["auto_enabled"] = False
+    persist()
+    start_worker()
+
+
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {
+        "status": "online", "version": APP_VERSION, "mode": MODE,
+        "real_orders_enabled": False, "auto_enabled": state["auto_enabled"],
+        "message": "PAPER-läge: inga riktiga order skickas.",
+        "endpoints": ["/api/health", "/api/market", "/api/signals", "/api/paper/status",
+                      "/api/auto/status", "/api/auto/start", "/api/auto/stop",
+                      "/api/tax/summary", "/api/tax/audit", "/api/tax.csv", "/api/trades.csv",
+                      "/api/risk/status", "/api/backtest"],
+    }
 
 
 @app.get("/api/health")
-def health():
-    try:
-        with db() as conn:
-            conn.execute("SELECT 1").fetchone()
-        db_ok = True
-    except Exception:
-        db_ok = False
+def health() -> Dict[str, Any]:
     return {
-        "status": "online" if db_ok else "degraded",
-        "version": "6.4-paper-tax-audit",
-        "mode": "PAPER ONLY",
-        "real_orders_enabled": False,
-        "database_ok": db_ok,
-        "estimated_fee_rate": FEE_RATE,
+        "status": "online", "version": APP_VERSION, "mode": MODE,
+        "real_orders_enabled": False, "database_ok": True,
+        "estimated_fee_rate": state["fee_rate"],
     }
 
 
 @app.get("/api/market")
-def market():
-    return {"prices": market_prices(), "currency_rate_eur_sek": eur_to_sek()}
+def market() -> Dict[str, Any]:
+    prices = get_prices(force=True)
+    return {"prices_sek": prices, "updated_at": now_iso(), "currency": "SEK"}
 
 
+@app.get("/api/signals")
 @app.get("/api/scan")
-def scan():
+def signals() -> Dict[str, Any]:
     return {"signals": make_signals()}
 
 
-@app.get("/api/auto/status")
-def auto_status():
-    return status_data()
-
-
-@app.post("/api/auto/start")
-def auto_start():
-    with lock:
-        state["auto_enabled"] = True
-        state["auto_message"] = (
-            "Automatisk pappershandel aktiverad. Endast simulerade affärer."
-        )
-        persist()
-    return status_data()
-
-
-@app.post("/api/auto/stop")
-def auto_stop():
-    with lock:
-        state["auto_enabled"] = False
-        state["auto_message"] = "Automatisk pappershandel stoppad."
-        persist()
-    return status_data()
-
-
 @app.get("/api/paper/status")
-def paper_status():
+def paper_status() -> Dict[str, Any]:
+    prices = get_prices()
     with lock:
+        holdings = {}
+        for symbol, h in state.get("holdings", {}).items():
+            qty = fnum(h.get("quantity"))
+            holdings[symbol] = {
+                "quantity": qty, "cost_basis_sek": fnum(h.get("cost_basis_sek")),
+                "market_value_sek": round(qty * prices.get(symbol, 0.0), 8),
+                "lots_count": len(h.get("lots", [])),
+            }
         return {
-            "mode": "PAPER ONLY",
-            "real_orders_enabled": False,
-            "balance_sek": round(float(state["balance_sek"]), 2),
-            "holdings": state["holdings"],
-            "trades": state["trades"],
-            "trade_count": len(state["trades"]),
-            "estimated_fee_rate": FEE_RATE,
-            "risk_events": state.get("risk_events", []),
+            "mode": MODE, "real_orders_enabled": False,
+            "balance_sek": fnum(state.get("balance_sek")),
+            "holdings": holdings, "trades": state.get("trades", [])[-100:],
+            "trade_count": len(state.get("trades", [])),
+            "equity_sek": round(fnum(state.get("balance_sek")) + sum(x["market_value_sek"] for x in holdings.values()), 8),
+            "fee_rate": state["fee_rate"], "auto_enabled": state["auto_enabled"],
         }
 
 
 @app.post("/api/paper/order")
-def paper_order(order: PaperOrder):
-    ok, result = execute_paper_trade(
-        order.product, order.side, order.amount_sek, False
+def create_paper_order(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return paper_order(
+        str(payload.get("side", "")), str(payload.get("symbol", "")),
+        fnum(payload.get("amount_sek")), automatic=False
     )
-    if not ok:
-        status_code = 503 if "marknadspris" in result.lower() else 400
-        raise HTTPException(status_code=status_code, detail=result)
-    return {"ok": True, "trade": result, "real_orders_enabled": False}
 
 
-@app.get("/api/backtest")
-def backtest(symbol: str = "BTC", candles: int = 200):
-    symbol = symbol.upper()
-    if symbol not in COINS:
-        raise HTTPException(status_code=400, detail="Okänd kryptovaluta")
-    candles = max(60, min(int(candles), 300))
-    try:
-        bars = get_candles(COINS[symbol], candles)
-    except Exception:
-        raise HTTPException(status_code=503, detail="Kunde inte hämta historiska prisdata")
-    closes = [bar["close"] for bar in bars]
-    if len(closes) < 40:
-        raise HTTPException(status_code=503, detail="För få historiska datapunkter")
-    fast, slow = ema(closes, 9), ema(closes, 21)
-    cash, quantity, entry, actions = 1000.0, 0.0, 0.0, 0
-    rate = eur_to_sek()
-    for index in range(30, len(closes)):
-        price = closes[index] * rate
-        signal = (
-            "buy" if fast[index] > slow[index] and closes[index] > fast[index]
-            else "sell" if fast[index] < slow[index] and closes[index] < fast[index]
-            else "hold"
-        )
-        if quantity <= 0 and signal == "buy" and cash >= 100:
-            quantity = (100.0 * (1 - FEE_RATE)) / price
-            cash -= 100.0
-            entry = price
-            actions += 1
-        elif quantity > 0:
-            change = price / entry - 1 if entry else 0
-            if signal == "sell" or change <= -STOP_LOSS_PCT or change >= TAKE_PROFIT_PCT:
-                cash += quantity * price * (1 - FEE_RATE)
-                quantity, entry = 0.0, 0.0
-                actions += 1
-    final_value = cash + quantity * closes[-1] * rate
+@app.get("/api/auto/status")
+def auto_status() -> Dict[str, Any]:
     return {
-        "mode": "HISTORICAL_SIMULATION_ONLY",
-        "symbol": symbol,
-        "candles_used": len(closes),
-        "starting_balance_sek": 1000.0,
-        "ending_value_sek": round(final_value, 2),
-        "return_pct": round((final_value / 1000.0 - 1) * 100, 2),
-        "closed_or_open_trade_actions": actions,
-        "fee_rate_per_side": FEE_RATE,
-        "stop_loss_pct": STOP_LOSS_PCT * 100,
-        "take_profit_pct": TAKE_PROFIT_PCT * 100,
-        "warning": "Historisk simulering, inte prognos. Avgifter, spread och slippage kan försämra verkliga resultat.",
+        "enabled": bool(state.get("auto_enabled")), "mode": MODE,
+        "real_orders_enabled": False, "interval_seconds": AUTO_INTERVAL_SECONDS,
+        "max_trade_sek": MAX_TRADE_SEK, "max_daily_trades": MAX_DAILY_TRADES,
+        "max_daily_loss_sek": MAX_DAILY_LOSS_SEK, "max_position_sek": MAX_POSITION_SEK,
+        "min_confidence": MIN_CONFIDENCE, "last_run": state.get("last_auto_run"),
+        "last_error": state.get("last_error"),
     }
 
 
-def _tax_summary_data():
+@app.post("/api/auto/start")
+def auto_start() -> Dict[str, Any]:
     with lock:
-        events = list(state.get("tax_events", []))
-        trades = list(state.get("trades", []))
-    gains = sum(
-        max(0.0, float(event.get("realized_gain_loss_sek", 0.0)))
-        for event in events
-    )
-    losses = sum(
-        min(0.0, float(event.get("realized_gain_loss_sek", 0.0)))
-        for event in events
-    )
-    sell_trades = [
-        trade for trade in trades if str(trade.get("side", "")).lower() == "sell"
-    ]
-    audit_ok = len(sell_trades) == len(events)
-    return {
-        "mode": "PAPER ONLY",
-        "disposals": len(events),
-        "sell_trades_in_history": len(sell_trades),
-        "positive_gains_sek": round(gains, 2),
-        "negative_losses_sek": round(losses, 2),
-        "net_realized_result_sek": round(gains + losses, 2),
-        "estimated_fee_rate": FEE_RATE,
-        "audit_ok": audit_ok,
-        "audit_message": (
-            "Antalet försäljningar stämmer med skattehändelserna."
-            if audit_ok
-            else "VARNING: Antalet säljtransaktioner och skattehändelser skiljer sig. "
-                 "Använd inte detta som färdigt K4-underlag."
-        ),
-        "note": "Simulerat underlag, inte färdig deklaration. Kontrollera mot Skatteverkets regler innan K4 lämnas.",
-    }
+        state["real_orders_enabled"] = False
+        state["auto_enabled"] = True
+        persist()
+    return {"ok": True, "enabled": True, "mode": MODE, "real_orders_enabled": False,
+            "message": "Automatisk PAPER-handel aktiverad. Inga riktiga order skickas."}
+
+
+@app.post("/api/auto/stop")
+def auto_stop() -> Dict[str, Any]:
+    with lock:
+        state["auto_enabled"] = False
+        persist()
+    return {"ok": True, "enabled": False, "mode": MODE, "real_orders_enabled": False}
 
 
 @app.get("/api/tax/summary")
-def tax_summary():
-    return _tax_summary_data()
-
-
-@app.get("/api/tax.csv")
-def tax_csv():
-    with lock:
-        events = list(state.get("tax_events", []))
-    output = StringIO()
-    fields = [
-        "date", "time", "symbol", "quantity_sold", "sale_price_sek",
-        "gross_proceeds_sek", "sale_fee_sek", "net_proceeds_sek",
-        "acquisition_cost_sek", "realized_gain_loss_sek",
-        "buy_and_sell_fees_included", "method", "mode",
-    ]
-    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
-    writer.writeheader()
-    writer.writerows(events)
-    output.seek(0)
-    return StreamingResponse(
-        iter([output.getvalue()]),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="k4_underlag_paper.csv"'},
-    )
-
-
-@app.get("/api/tax/audit")
-def tax_audit():
-    with lock:
-        events = list(state.get("tax_events", []))
-        trades = list(state.get("trades", []))
-        holdings = json.loads(json.dumps(state.get("holdings", {})))
-    sell_trades = [
-        trade for trade in trades if str(trade.get("side", "")).lower() == "sell"
-    ]
-    missing_details = [
-        event for event in events
-        if any(key not in event for key in (
-            "symbol", "quantity_sold", "gross_proceeds_sek",
-            "sale_fee_sek", "acquisition_cost_sek", "realized_gain_loss_sek"
-        ))
-    ]
+def tax_summary() -> Dict[str, Any]:
+    events = state.get("tax_events", [])
+    disposals = [e for e in events if e.get("type") == "disposal"]
+    gains = sum(max(0.0, fnum(e.get("gain_loss_sek"))) for e in disposals)
+    losses = sum(min(0.0, fnum(e.get("gain_loss_sek"))) for e in disposals)
     return {
-        "mode": "PAPER ONLY",
-        "sell_trade_count": len(sell_trades),
-        "tax_event_count": len(events),
-        "counts_match": len(sell_trades) == len(events),
-        "events_missing_required_fields": len(missing_details),
-        "holdings_cost_basis": {
-            symbol: {
-                "quantity": round(float(holding.get("quantity", 0)), 12),
-                "cost_basis_sek": round(float(holding.get("cost_basis_sek", 0)), 8),
-            }
-            for symbol, holding in holdings.items()
-        },
-        "warning": "Intern kontroll av pappershistorik; verifierar inte tidigare historik eller officiella skatteregler.",
+        "mode": MODE, "disposals": len(disposals),
+        "sell_trades_in_history": sum(1 for t in state.get("trades", []) if t.get("side") == "sell"),
+        "positive_gains_sek": round(gains, 2), "negative_losses_sek": round(losses, 2),
+        "net_realized_result_sek": round(gains + losses, 2),
+        "estimated_fee_rate": state["fee_rate"],
+        "audit_ok": len(disposals) == sum(1 for t in state.get("trades", []) if t.get("side") == "sell"),
+        "note": "Simulerat underlag, inte färdig deklaration. Kontrollera mot Skatteverkets regler innan K4 lämnas."
     }
 
 
-# Worker stays idle unless /api/auto/start is called.
-threading.Thread(target=auto_worker, daemon=True, name="paper-auto-worker").start()
-# Keep auto trading disabled after startup and persist state.
-with lock:
-    state["auto_enabled"] = False
+@app.get("/api/tax/audit")
+def tax_audit() -> Dict[str, Any]:
+    trades = state.get("trades", [])
+    events = state.get("tax_events", [])
+    sells = [t for t in trades if t.get("side") == "sell"]
+    disposals = [e for e in events if e.get("type") == "disposal"]
+    buys = [t for t in trades if t.get("side") == "buy"]
+    acquisitions = [e for e in events if e.get("type") == "acquisition"]
+    trade_ids = {t.get("trade_id") for t in trades}
+    linked = sum(1 for e in events if e.get("trade_id") in trade_ids)
+    missing = [t.get("trade_id") for t in sells if not any(e.get("trade_id") == t.get("trade_id") and e.get("type") == "disposal" for e in events)]
+    return {
+        "mode": MODE, "trade_count": len(trades), "buy_trade_count": len(buys),
+        "sell_trade_count": len(sells), "acquisition_event_count": len(acquisitions),
+        "disposal_event_count": len(disposals), "linked_event_count": linked,
+        "missing_disposal_trade_ids": missing, "counts_match": len(sells) == len(disposals) and not missing,
+        "holdings_cost_basis": {s: {"quantity": fnum(h.get("quantity")), "cost_basis_sek": fnum(h.get("cost_basis_sek")), "lot_count": len(h.get("lots", []))} for s, h in state.get("holdings", {}).items()},
+        "warning": "Äldre historik kan sakna FIFO-inköpsposter. Granska varningar och jämför med hela handelshistoriken."
+    }
+
+
+@app.get("/api/tax.csv")
+def tax_csv() -> StreamingResponse:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["time", "event_id", "trade_id", "type", "symbol", "quantity", "proceeds_sek", "cost_basis_sek", "gain_loss_sek", "fee_sek", "method", "basis_complete", "mode"])
+    for event in state.get("tax_events", []):
+        writer.writerow([
+            event.get("time"), event.get("event_id"), event.get("trade_id"), event.get("type"),
+            event.get("symbol"), event.get("quantity"), event.get("proceeds_sek"),
+            event.get("cost_basis_sek"), event.get("gain_loss_sek"), event.get("fee_sek"),
+            event.get("method"), event.get("basis_complete"), event.get("mode"),
+        ])
+    data = output.getvalue().encode("utf-8-sig")
+    return StreamingResponse(iter([data]), media_type="text/csv",
+                             headers={"Content-Disposition": 'attachment; filename="paper_tax_ledger.csv"'})
+
+
+@app.get("/api/trades.csv")
+def trades_csv() -> StreamingResponse:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=[
+        "trade_id", "mode", "side", "symbol", "time", "price_sek", "quantity",
+        "amount_sek", "fee_sek", "fee_rate", "automatic", "realized_pnl_sek", "tax_event_id"
+    ], extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(state.get("trades", []))
+    data = output.getvalue().encode("utf-8-sig")
+    return StreamingResponse(iter([data]), media_type="text/csv",
+                             headers={"Content-Disposition": 'attachment; filename="paper_trades.csv"'})
+
+
+@app.get("/api/risk/status")
+def risk_status() -> Dict[str, Any]:
+    stats = daily_stats()
+    prices = get_prices()
+    equity = fnum(state.get("balance_sek")) + sum(
+        fnum(h.get("quantity")) * prices.get(s, 0.0)
+        for s, h in state.get("holdings", {}).items()
+    )
+    return {
+        "mode": MODE, "real_orders_enabled": False, "auto_enabled": state["auto_enabled"],
+        "limits": {"max_trade_sek": MAX_TRADE_SEK, "max_daily_trades": MAX_DAILY_TRADES,
+                   "max_daily_loss_sek": MAX_DAILY_LOSS_SEK, "max_position_sek": MAX_POSITION_SEK,
+                   "stop_loss_pct": STOP_LOSS_PCT, "take_profit_pct": TAKE_PROFIT_PCT},
+        "today_utc": daily_key(), "daily_stats": stats, "equity_sek": round(equity, 2),
+        "risk_events": state.get("risk_events", [])[-50:],
+    }
+
+
+@app.get("/api/backtest")
+def backtest(symbol: str = "BTC") -> Dict[str, Any]:
+    symbol = symbol.upper()
+    if symbol not in SYMBOLS:
+        raise HTTPException(status_code=400, detail="Okänd kryptovaluta.")
+    # This is a simple recent-sample simulation, not a predictive guarantee.
+    prices = get_prices(force=True)
+    p = prices.get(symbol)
+    if not p:
+        raise HTTPException(status_code=503, detail="Pris saknas.")
+    ind = indicators(symbol, p)
+    return {
+        "mode": "LIVE_MARKET_DATA_SIMULATION_ONLY", "symbol": symbol,
+        "samples": ind["samples"], "current_price_sek": p,
+        "indicators": ind, "warning": "Historisk simulering, inte prognos. Kräver tillräckligt många prisobservationer."
+    }
+
+
+@app.get("/api/risk/events")
+def risk_events() -> Dict[str, Any]:
+    return {"events": state.get("risk_events", [])}
+
+
+# Extra guard: the API cannot turn on real orders, even if a client submits such a field.
+@app.post("/api/safety/disable-real-orders")
+def disable_real_orders() -> Dict[str, Any]:
+    state["real_orders_enabled"] = False
     persist()
+    return {"ok": True, "real_orders_enabled": False, "mode": MODE}
