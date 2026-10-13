@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "9.0.0-paper-ohlcv-postgres-fifo"
+APP_VERSION = "10.0.0-paper-fifo-repair-auto-sell"
 MODE = "PAPER ONLY"
 SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SHIB"]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
@@ -24,7 +24,8 @@ MAX_POSITION_SEK = float(os.getenv("MAX_POSITION_SEK", "300"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "6"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
-AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "900")))
+AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
+AUTO_PAPER_ON_START = os.getenv("AUTO_PAPER_ON_START", "true").strip().lower() in ("1", "true", "yes", "on")
 HTTP_TIMEOUT = 10
 CACHE_TTL = 20
 CANDLE_GRANULARITY = 300  # 5-minute candles
@@ -88,7 +89,7 @@ def _clean_state(saved: dict[str, Any]) -> None:
             state[key] = saved[key]
     state["mode"] = MODE
     state["real_orders_enabled"] = False
-    state["auto_enabled"] = False  # fail safe: never restart auto-trading without user action
+    state["auto_enabled"] = AUTO_PAPER_ON_START  # PAPER only; configurable in Render environment
     for key in ("holdings", "daily_stats"):
         if not isinstance(state.get(key), dict):
             state[key] = {}
@@ -186,6 +187,7 @@ def restore() -> None:
                     saved = json.loads(saved)
                 if isinstance(saved, dict):
                     _clean_state(saved)
+                    rebuild_tax_ledger_from_trades()
                     db_info.update(available=True, error=None, backend="postgresql")
                     log.info("Restored state from PostgreSQL (%s trades)", len(state["trades"]))
                     return
@@ -198,6 +200,7 @@ def restore() -> None:
             saved = json.load(f)
         if isinstance(saved, dict):
             _clean_state(saved)
+            rebuild_tax_ledger_from_trades()
             log.info("Restored local PAPER state (%s trades)", len(state["trades"]))
     except FileNotFoundError:
         log.info("No saved state; starting with default PAPER balance")
@@ -490,6 +493,126 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
                 "balance_sek":state["balance_sek"],"equity_sek":state["equity_history"][-1]["equity_sek"]}
 
 
+
+def rebuild_tax_ledger_from_trades() -> dict[str, Any]:
+    """ Repair missing tax events for historical PAPER trades. Does not change balances or trade history. Reconstructs FIFO lots from recorded trades, marks sales with insufficient prior acquisition history as incomplete, and links each reconstructed event back to its trade. """
+    with lock:
+        trades = sorted(
+            [t for t in state.get("trades", []) if isinstance(t, dict)],
+            key=lambda t: str(t.get("time", ""))
+        )
+        # Older versions may have stored trades without trade_id. Assign stable IDs
+        # in-place so tax events can be linked instead of leaving null references.
+        for index, trade in enumerate(trades, start=1):
+            if not trade.get("trade_id") and str(trade.get("side", "")).lower() in ("buy", "sell"):
+                seed = "|".join(str(trade.get(k, "")) for k in ("time", "symbol", "side", "quantity", "amount_sek"))
+                safe_seed = "".join(ch if ch.isalnum() else "-" for ch in seed)[:48].strip("-")
+                trade["trade_id"] = f"legacy-{index}-{safe_seed or uuid.uuid4().hex[:8]}"
+        existing_events = state.get("tax_events", [])
+        linked = {
+            (e.get("trade_id"), e.get("type"))
+            for e in existing_events if isinstance(e, dict)
+        }
+        expected = {
+            (t.get("trade_id"), "acquisition" if t.get("side") == "buy" else "disposal")
+            for t in trades if t.get("trade_id") and t.get("side") in ("buy", "sell")
+        }
+        missing = expected - linked
+        # Only reconstruct when the ledger is absent/incomplete; don't duplicate events.
+        if not missing:
+            return {"rebuilt": False, "reason": "ledger_already_linked", "events": len(existing_events)}
+
+        rebuilt_events: list[dict[str, Any]] = []
+        lots_by_symbol: dict[str, list[dict[str, Any]]] = {s: [] for s in SYMBOLS}
+        for trade in trades:
+            tid = trade.get("trade_id")
+            side = str(trade.get("side", "")).lower()
+            symbol = str(trade.get("symbol", "")).upper()
+            if not tid or side not in ("buy", "sell") or symbol not in SYMBOLS:
+                continue
+            qty = max(0.0, num(trade.get("quantity")))
+            if qty <= 0:
+                continue
+            fee = max(0.0, num(trade.get("fee_sek")))
+            amount = max(0.0, num(trade.get("amount_sek")))
+            timestamp = trade.get("time") or now_iso()
+            if side == "buy":
+                basis = amount + fee
+                lots_by_symbol[symbol].append({
+                    "time": timestamp, "quantity": qty,
+                    "unit_cost_sek": basis / qty, "trade_id": tid
+                })
+                rebuilt_events.append({
+                    "event_id": str(uuid.uuid4()), "trade_id": tid, "time": timestamp,
+                    "type": "acquisition", "symbol": symbol, "quantity": qty,
+                    "cost_basis_sek": round(basis, 8), "fee_sek": round(fee, 8),
+                    "method": "FIFO", "basis_complete": True, "mode": MODE,
+                    "reconstructed": True
+                })
+                trade["tax_event_id"] = rebuilt_events[-1]["event_id"]
+            else:
+                remaining = qty
+                basis = 0.0
+                lots = lots_by_symbol[symbol]
+                while remaining > 1e-12 and lots:
+                    lot = lots[0]
+                    lot_qty = max(0.0, num(lot.get("quantity")))
+                    if lot_qty <= 1e-12:
+                        lots.pop(0)
+                        continue
+                    used = min(remaining, lot_qty)
+                    basis += used * max(0.0, num(lot.get("unit_cost_sek")))
+                    lot["quantity"] = max(0.0, lot_qty - used)
+                    remaining -= used
+                    if lot["quantity"] <= 1e-12:
+                        lots.pop(0)
+                complete = remaining <= max(1e-9, qty * 1e-9)
+                proceeds = max(0.0, amount - fee)
+                ev = {
+                    "event_id": str(uuid.uuid4()), "trade_id": tid, "time": timestamp,
+                    "type": "disposal", "symbol": symbol, "quantity": qty,
+                    "proceeds_sek": round(proceeds, 8), "cost_basis_sek": round(basis, 8),
+                    "gain_loss_sek": round(proceeds - basis, 8), "fee_sek": round(fee, 8),
+                    "basis_complete": complete, "method": "FIFO", "mode": MODE,
+                    "reconstructed": True
+                }
+                rebuilt_events.append(ev)
+                trade["tax_event_id"] = ev["event_id"]
+
+        # Prefer a fully reconstructed ledger, preserving old events only if they belong
+        # to trades that cannot be reconstructed from the stored trade rows.
+        rebuilt_ids = {e.get("trade_id") for e in rebuilt_events}
+        other_events = [
+            e for e in existing_events if isinstance(e, dict)
+            and e.get("trade_id") not in rebuilt_ids
+        ]
+        state["tax_events"] = other_events + rebuilt_events
+
+        # Replace lots only when trade-derived remaining quantities match the stored
+        # holdings. Never alter quantity, balance, or cost basis during a tax repair.
+        for symbol, holding in state.get("holdings", {}).items():
+            if not isinstance(holding, dict):
+                continue
+            derived = [lot for lot in lots_by_symbol.get(symbol, [])
+                       if num(lot.get("quantity")) > 1e-12]
+            derived_qty = sum(num(lot.get("quantity")) for lot in derived)
+            held_qty = max(0.0, num(holding.get("quantity")))
+            tolerance = max(1e-8, held_qty * 1e-6)
+            if abs(derived_qty - held_qty) <= tolerance:
+                holding["lots"] = derived
+            elif held_qty <= 1e-12:
+                holding["lots"] = []
+            else:
+                # Preserve any existing lots if trade history cannot explain the holding.
+                risk_event("TAX_HISTORY_MISMATCH",
+                           f"{symbol}: trades imply {derived_qty:.12g}, holding has {held_qty:.12g}; verify complete exchange history.")
+        risk_event("TAX_LEDGER_REBUILT",
+                   f"Tax ledger reconstructed from {len(rebuilt_events)} recorded PAPER trades; verify completeness before tax filing.")
+        persist()
+        return {"rebuilt": True, "events": len(rebuilt_events), "missing_links_repaired": len(missing)}
+
+
+
 def auto_loop():
     log.info("PAPER worker started; real orders disabled")
     while not stop_event.is_set():
@@ -507,9 +630,25 @@ def auto_loop():
                             try: paper_order("sell",symbol,min(MAX_TRADE_SEK,qty*price),automatic=True)
                             except HTTPException as exc:
                                 if exc.status_code not in (409,): raise
+                # Use sell signals for existing holdings as well as stop-loss/take-profit.
+                # This remains PAPER-only and respects the same risk limits.
+                for sig in signals:
+                    if sig["signal"] == "SÄLJ" and sig["confidence"] >= MIN_CONFIDENCE:
+                        held = num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity"))
+                        px = num(prices.get(sig["symbol"]))
+                        if held > 0 and px > 0:
+                            try:
+                                paper_order("sell", sig["symbol"], min(MAX_TRADE_SEK, held * px), automatic=True)
+                            except HTTPException as exc:
+                                if exc.status_code not in (409,): raise
                 for sig in signals:
                     if sig["signal"]=="KÖP" and sig["confidence"]>=MIN_CONFIDENCE:
-                        try: paper_order("buy",sig["symbol"],MAX_TRADE_SEK,automatic=True)
+                        # Avoid buying again when the existing position is already near the cap.
+                        holding = state.get("holdings", {}).get(sig["symbol"], {})
+                        current_value = num(holding.get("quantity")) * num(prices.get(sig["symbol"]))
+                        if current_value >= MAX_POSITION_SEK * 0.90:
+                            continue
+                        try: paper_order("buy",sig["symbol"],min(MAX_TRADE_SEK, MAX_POSITION_SEK-current_value),automatic=True)
                         except HTTPException as exc:
                             if exc.status_code not in (409,): raise
                 with lock:
@@ -524,7 +663,7 @@ def auto_loop():
 def startup():
     restore()
     state["real_orders_enabled"] = False
-    state["auto_enabled"] = False
+    state["auto_enabled"] = AUTO_PAPER_ON_START
     persist()
     global auto_thread
     if auto_thread is None or not auto_thread.is_alive():
@@ -594,7 +733,8 @@ def market():
 def signals():
     return {"signals":make_signals(),"updated_at":now_iso(),"mode":MODE,
             "strategy":"5m OHLCV EMA9/21/50 + RSI14 + MACD + momentum + volume",
-            "note":"Signaler är heuristiska, inte garanterade prognoser."}
+            "auto_paper_on_start":AUTO_PAPER_ON_START,
+            "note":"Signaler är heuristiska, inte garanterade prognoser. Inga riktiga order skickas."}
 
 
 @app.get("/api/paper/status")
@@ -644,6 +784,15 @@ def auto_stop():
     return {"ok":True,"enabled":False,"mode":MODE,"real_orders_enabled":False}
 
 
+@app.post("/api/tax/repair")
+def tax_repair():
+    result = rebuild_tax_ledger_from_trades()
+    audit = tax_audit()
+    return {"mode": MODE, "repair": result, "audit": audit,
+            "tax_filing_ready": False,
+            "warning": "Kontrollera mot fullständig börshistorik innan deklaration."}
+
+
 @app.get("/api/tax/summary")
 def tax_summary():
     disposals=[e for e in state["tax_events"] if e.get("type")=="disposal"]
@@ -676,7 +825,9 @@ def tax_audit():
         "counts_match":len(sells)==len(disposals) and not missing_sells and not missing_buys and not incomplete,
         "holdings_cost_basis":{s:{"quantity":num(h.get("quantity")),"cost_basis_sek":num(h.get("cost_basis_sek")),
             "lot_count":len(h.get("lots",[]))} for s,h in state["holdings"].items()},
-        "warning":"Jämför med komplett börshistorik; äldre affärer kan saknas."}
+        "warning":"Jämför med komplett börshistorik; äldre affärer kan saknas. Återskapade händelser från PAPER-loggen är inte automatiskt verifierade mot börsen.",
+        "reconstructed_events":sum(bool(e.get("reconstructed")) for e in events if isinstance(e,dict)),
+        "tax_filing_ready":False}
 
 
 def csv_response(rows,filename):
