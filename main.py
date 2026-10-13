@@ -1,4 +1,4 @@
-"""AI Crypto Trader - PAPER ONLY backend. Live market data, OHLCV indicators, PostgreSQL persistence (with local fallback), risk-limited simulated orders, FIFO tax ledger, CSV exports. No live exchange order functionality is implemented. """
+"""AI Crypto Trader - PAPER ONLY backend. Live market data, OHLCV indicators, PostgreSQL persistence (with local fallback), risk-limited simulated orders, Swedish average-cost tax ledger, K4-oriented CSV exports. No live exchange order functionality is implemented. """
 from __future__ import annotations
 
 import csv, io, json, logging, math, os, threading, time, uuid
@@ -11,16 +11,21 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "10.0.0-paper-fifo-repair-auto-sell"
+APP_VERSION = "11.0.0-paper-average-cost-loss-guard"
 MODE = "PAPER ONLY"
-SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SHIB"]
+# Coinbase EUR spot pairs. Unsupported/unavailable pairs are skipped and reported in source_errors.
+SYMBOLS = [
+    "BTC", "ETH", "SOL", "XRP", "SHIB", "ADA", "DOGE", "LINK", "AVAX",
+    "DOT", "LTC", "BCH", "ATOM", "UNI", "AAVE", "NEAR", "OP", "ARB", "SUI", "PEPE"
+]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
 START_BALANCE_SEK = float(os.getenv("PAPER_START_BALANCE_SEK", "1000"))
 FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.005"))
-MAX_TRADE_SEK = float(os.getenv("MAX_TRADE_SEK", "100"))
+# No fixed per-order or per-position SEK cap. Orders are limited by available PAPER cash
+# and the portfolio-wide maximum drawdown guard below.
+MAX_TOTAL_LOSS_SEK = max(0.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "500")))
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "4"))
 MAX_DAILY_LOSS_SEK = float(os.getenv("MAX_DAILY_LOSS_SEK", "100"))
-MAX_POSITION_SEK = float(os.getenv("MAX_POSITION_SEK", "300"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "6"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
@@ -46,6 +51,7 @@ http.headers.update({"User-Agent": f"ai-crypto-paper/{APP_VERSION}"})
 state: dict[str, Any] = {
     "mode": MODE, "real_orders_enabled": False, "auto_enabled": False,
     "balance_sek": START_BALANCE_SEK, "fee_rate": FEE_RATE, "holdings": {},
+    "risk_baseline_equity_sek": START_BALANCE_SEK, "risk_halt": False,
     "trades": [], "tax_events": [], "risk_events": [], "daily_stats": {},
     "equity_history": [], "last_auto_run": None, "last_error": None,
     "created_at": datetime.now(timezone.utc).isoformat()
@@ -58,7 +64,7 @@ db_info = {"configured": bool(DATABASE_URL), "available": False, "error": None, 
 class OrderRequest(BaseModel):
     side: str
     symbol: str
-    amount_sek: float = Field(gt=0, le=MAX_TRADE_SEK)
+    amount_sek: float = Field(gt=0)
 
 
 def now_iso() -> str:
@@ -97,6 +103,8 @@ def _clean_state(saved: dict[str, Any]) -> None:
         if not isinstance(state.get(key), list):
             state[key] = []
     state["balance_sek"] = max(0.0, num(state.get("balance_sek"), START_BALANCE_SEK))
+    state["risk_baseline_equity_sek"] = max(0.0, num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK))
+    state["risk_halt"] = bool(state.get("risk_halt", False))
     state["fee_rate"] = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
     for sym, h in list(state["holdings"].items()):
         if not isinstance(h, dict):
@@ -351,14 +359,18 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     samples = len(candles)
     quality = "HIGH" if samples >= 100 else ("MEDIUM" if samples >= 50 else "LOW")
     # Require enough real candles, trend alignment and multi-indicator confirmation.
-    if samples >= 50 and score >= 4 and rsi_v < 73 and vol <= 2.5:
+    # Avoid false confidence when the current candle volume is tiny versus its recent baseline.
+    low_volume = samples >= 20 and vol_ratio < 0.20
+    if samples >= 50 and score >= 4 and rsi_v < 73 and vol <= 2.5 and not low_volume:
         signal = "KÖP"
-    elif samples >= 50 and score <= -3:
+    elif samples >= 50 and score <= -3 and not low_volume:
         signal = "SÄLJ"
     else:
         signal = "AVVAKTA"
+    if low_volume:
+        reasons.append("Volymen är för låg jämfört med snittet; signal blockerad")
     confidence = int(clamp(50 + abs(score)*6 + (8 if quality == "HIGH" else 3 if quality == "MEDIUM" else -8), 35, 88))
-    if signal == "AVVAKTA": confidence = min(confidence, 64)
+    if signal == "AVVAKTA": confidence = min(confidence, 60 if low_volume else 64)
     return {"symbol": symbol, "product": PRODUCTS[symbol], "price_sek": round(price_sek, 6),
             "signal": signal, "confidence": confidence, "score": score,
             "indicators": {"ema9_sek": round(e9[-1],6), "ema21_sek": round(e21[-1],6),
@@ -397,29 +409,21 @@ def get_daily_stats(prices=None):
     return stats
 
 
-def fifo_sell(symbol, qty, proceeds, timestamp, trade_id):
-    holding = state["holdings"][symbol]
-    lots = holding.setdefault("lots", [])
-    remaining, cost = qty, 0.0
-    while remaining > 1e-12 and lots:
-        lot = lots[0]
-        lot_qty = max(0, num(lot.get("quantity")))
-        if lot_qty <= 1e-12:
-            lots.pop(0); continue
-        used = min(remaining, lot_qty)
-        cost += used * max(0, num(lot.get("unit_cost_sek")))
-        lot["quantity"] = max(0, lot_qty-used)
-        remaining -= used
-        if lot["quantity"] <= 1e-12:
-            lots.pop(0)
-    complete = remaining <= max(1e-9, qty*1e-9)
+def average_cost_sell(symbol: str, qty: float, proceeds: float, timestamp: str, trade_id: str):
+    """Calculate disposal basis using Sweden's average-cost method, not FIFO."""
+    holding = state["holdings"].setdefault(symbol, {"quantity": 0.0, "cost_basis_sek": 0.0, "lots": []})
+    held_qty = max(0.0, num(holding.get("quantity")))
+    held_basis = max(0.0, num(holding.get("cost_basis_sek")))
+    complete = held_qty + max(1e-9, qty * 1e-9) >= qty and held_qty > 0
+    avg_unit_cost = held_basis / held_qty if held_qty > 1e-12 else 0.0
+    basis = min(held_basis, qty * avg_unit_cost) if complete else held_basis
     if not complete:
-        risk_event("TAX_BASIS_GAP", f"{symbol}: FIFO-underlag saknas för {remaining:.12g} enheter")
+        risk_event("TAX_BASIS_GAP", f"{symbol}: genomsnittligt omkostnadsunderlag saknas för hela försäljningen")
     ev = {"event_id": str(uuid.uuid4()), "trade_id": trade_id, "time": timestamp,
           "type": "disposal", "symbol": symbol, "quantity": qty,
-          "proceeds_sek": round(proceeds,8), "cost_basis_sek": round(cost,8),
-          "gain_loss_sek": round(proceeds-cost,8), "basis_complete": complete,
-          "method": "FIFO", "mode": MODE}
+          "proceeds_sek": round(proceeds, 8), "cost_basis_sek": round(basis, 8),
+          "gain_loss_sek": round(proceeds - basis, 8), "basis_complete": complete,
+          "method": "AVERAGE_COST", "mode": MODE}
     state["tax_events"].append(ev)
     return ev
 
@@ -428,8 +432,8 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
     side, symbol = str(side).lower().strip(), str(symbol).upper().strip()
     if side not in ("buy","sell"): raise HTTPException(400,"Sidan måste vara buy eller sell.")
     if symbol not in SYMBOLS: raise HTTPException(400,"Okänd kryptovaluta.")
-    if not math.isfinite(amount_sek) or amount_sek <= 0 or amount_sek > MAX_TRADE_SEK:
-        raise HTTPException(400,f"Belopp måste vara över 0 och högst {MAX_TRADE_SEK:.0f} kr.")
+    if not math.isfinite(amount_sek) or amount_sek <= 0:
+        raise HTTPException(400,"Belopp måste vara större än 0 kr.")
     prices = get_prices()
     price = prices.get(symbol,0)
     if price <= 0: raise HTTPException(503,"Pris saknas.")
@@ -440,21 +444,34 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
         fee_rate = clamp(num(state.get("fee_rate"),FEE_RATE),0,0.02)
         ts, tid = now_iso(), str(uuid.uuid4())
         stats = get_daily_stats(prices)
+        current_equity = equity_from_prices(prices)
+        baseline = max(0.0, num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK))
+        total_drawdown = max(0.0, baseline - current_equity)
+        if total_drawdown >= MAX_TOTAL_LOSS_SEK:
+            state["risk_halt"] = True
+            state["auto_enabled"] = False
+            risk_event("MAX_TOTAL_LOSS", f"Total förlustgräns på {MAX_TOTAL_LOSS_SEK:.2f} SEK uppnådd; automatiken stoppad och nya köp spärrade.")
+            persist()
+            if side == "buy":
+                raise HTTPException(409, "Total förlustgräns på 500 kr är uppnådd. Nya köp är spärrade; säljning är fortfarande tillåten.")
+        if state.get("risk_halt") and side == "buy":
+            raise HTTPException(409, "Riskspärr aktiv efter att maximal total förlust uppnåtts. Köp är spärrade.")
         if automatic:
-            if not state["auto_enabled"]: raise HTTPException(409,"Automatisk PAPER-handel är avstängd.")
-            if int(stats.get("trades",0)) >= MAX_DAILY_TRADES:
-                risk_event("DAILY_TRADE_LIMIT","Max affärer per UTC-dygn uppnått."); persist()
-                raise HTTPException(409,"Dagens handelsgräns är nådd.")
-            if num(stats.get("realized_pnl_sek")) <= -MAX_DAILY_LOSS_SEK:
-                risk_event("DAILY_LOSS_LIMIT","Daglig förlustgräns uppnådd."); persist()
-                raise HTTPException(409,"Daglig förlustgräns nådd.")
+            # Once the total-loss guard trips, no more automatic buys are allowed.
+            # A sell already in progress may still finish; future cycles stop when auto is disabled.
+            if not state["auto_enabled"] and side == "buy":
+                raise HTTPException(409,"Automatisk PAPER-handel är avstängd eller riskspärrad.")
+            if side == "buy" and int(stats.get("trades",0)) >= MAX_DAILY_TRADES:
+                risk_event("DAILY_TRADE_LIMIT","Max automatiska köp per UTC-dygn uppnått; säljorder för riskreducering tillåts."); persist()
+                raise HTTPException(409,"Dagens köpgräns är nådd.")
+            if side == "buy" and num(stats.get("realized_pnl_sek")) <= -MAX_DAILY_LOSS_SEK:
+                risk_event("DAILY_LOSS_LIMIT","Daglig förlustgräns uppnådd; nya köp spärrade."); persist()
+                raise HTTPException(409,"Daglig förlustgräns nådd; köp spärrade.")
         fee = amount_sek*fee_rate
         pnl, tax_event = 0.0, None
         if side == "buy":
-            if num(h["quantity"])*price + amount_sek + fee > MAX_POSITION_SEK:
-                raise HTTPException(409,"Positionsgränsen skulle överskridas.")
             total = amount_sek+fee
-            if balance < total: raise HTTPException(409,"Otillräckligt PAPER-saldo inklusive avgift.")
+            if balance + 1e-8 < total: raise HTTPException(409,"Otillräckligt PAPER-saldo inklusive avgift.")
             qty = amount_sek/price
             state["balance_sek"] = round(balance-total,8)
             h["quantity"] += qty
@@ -462,7 +479,7 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
             h["lots"].append({"time":ts,"quantity":qty,"unit_cost_sek":total/qty,"trade_id":tid})
             tax_event = {"event_id":str(uuid.uuid4()),"trade_id":tid,"time":ts,"type":"acquisition",
                          "symbol":symbol,"quantity":qty,"cost_basis_sek":round(total,8),
-                         "fee_sek":round(fee,8),"method":"FIFO","basis_complete":True,"mode":MODE}
+                         "fee_sek":round(fee,8),"method":"AVERAGE_COST","basis_complete":True,"mode":MODE}
             state["tax_events"].append(tax_event)
         else:
             held = num(h["quantity"])
@@ -472,7 +489,7 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
             fee = gross*fee_rate
             net = gross-fee
             old_qty, old_basis = num(h["quantity"]), num(h["cost_basis_sek"])
-            tax_event = fifo_sell(symbol,qty,net,ts,tid)
+            tax_event = average_cost_sell(symbol,qty,net,ts,tid)
             state["balance_sek"] = round(balance+net,8)
             h["quantity"] = max(0,old_qty-qty)
             h["cost_basis_sek"] = max(0,old_basis-num(tax_event["cost_basis_sek"]))
@@ -495,35 +512,19 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
 
 
 def rebuild_tax_ledger_from_trades() -> dict[str, Any]:
-    """ Repair missing tax events for historical PAPER trades. Does not change balances or trade history. Reconstructs FIFO lots from recorded trades, marks sales with insufficient prior acquisition history as incomplete, and links each reconstructed event back to its trade. """
+    """Rebuild the simulated tax ledger from recorded PAPER trades using average cost. This cannot reconstruct exchange activity that was never recorded by this bot. Such completeness must be checked against the user's full exchange exports. """
     with lock:
-        trades = sorted(
-            [t for t in state.get("trades", []) if isinstance(t, dict)],
-            key=lambda t: str(t.get("time", ""))
-        )
-        # Older versions may have stored trades without trade_id. Assign stable IDs
-        # in-place so tax events can be linked instead of leaving null references.
+        trades = sorted([t for t in state.get("trades", []) if isinstance(t, dict)],
+                        key=lambda t: str(t.get("time", "")))
         for index, trade in enumerate(trades, start=1):
             if not trade.get("trade_id") and str(trade.get("side", "")).lower() in ("buy", "sell"):
                 seed = "|".join(str(trade.get(k, "")) for k in ("time", "symbol", "side", "quantity", "amount_sek"))
                 safe_seed = "".join(ch if ch.isalnum() else "-" for ch in seed)[:48].strip("-")
                 trade["trade_id"] = f"legacy-{index}-{safe_seed or uuid.uuid4().hex[:8]}"
-        existing_events = state.get("tax_events", [])
-        linked = {
-            (e.get("trade_id"), e.get("type"))
-            for e in existing_events if isinstance(e, dict)
-        }
-        expected = {
-            (t.get("trade_id"), "acquisition" if t.get("side") == "buy" else "disposal")
-            for t in trades if t.get("trade_id") and t.get("side") in ("buy", "sell")
-        }
-        missing = expected - linked
-        # Only reconstruct when the ledger is absent/incomplete; don't duplicate events.
-        if not missing:
-            return {"rebuilt": False, "reason": "ledger_already_linked", "events": len(existing_events)}
-
+        qty_by_symbol = {sym: 0.0 for sym in SYMBOLS}
+        basis_by_symbol = {sym: 0.0 for sym in SYMBOLS}
         rebuilt_events: list[dict[str, Any]] = []
-        lots_by_symbol: dict[str, list[dict[str, Any]]] = {s: [] for s in SYMBOLS}
+        incomplete_ids: list[str] = []
         for trade in trades:
             tid = trade.get("trade_id")
             side = str(trade.get("side", "")).lower()
@@ -537,80 +538,58 @@ def rebuild_tax_ledger_from_trades() -> dict[str, Any]:
             amount = max(0.0, num(trade.get("amount_sek")))
             timestamp = trade.get("time") or now_iso()
             if side == "buy":
-                basis = amount + fee
-                lots_by_symbol[symbol].append({
-                    "time": timestamp, "quantity": qty,
-                    "unit_cost_sek": basis / qty, "trade_id": tid
-                })
-                rebuilt_events.append({
-                    "event_id": str(uuid.uuid4()), "trade_id": tid, "time": timestamp,
-                    "type": "acquisition", "symbol": symbol, "quantity": qty,
-                    "cost_basis_sek": round(basis, 8), "fee_sek": round(fee, 8),
-                    "method": "FIFO", "basis_complete": True, "mode": MODE,
-                    "reconstructed": True
-                })
-                trade["tax_event_id"] = rebuilt_events[-1]["event_id"]
+                # amount_sek is trade notional; fees form part of acquisition cost.
+                cost = amount + fee
+                qty_by_symbol[symbol] += qty
+                basis_by_symbol[symbol] += cost
+                ev = {"event_id": str(uuid.uuid4()), "trade_id": tid, "time": timestamp,
+                      "type": "acquisition", "symbol": symbol, "quantity": qty,
+                      "cost_basis_sek": round(cost, 8), "fee_sek": round(fee, 8),
+                      "method": "AVERAGE_COST", "basis_complete": True, "mode": MODE,
+                      "reconstructed": True}
             else:
-                remaining = qty
-                basis = 0.0
-                lots = lots_by_symbol[symbol]
-                while remaining > 1e-12 and lots:
-                    lot = lots[0]
-                    lot_qty = max(0.0, num(lot.get("quantity")))
-                    if lot_qty <= 1e-12:
-                        lots.pop(0)
-                        continue
-                    used = min(remaining, lot_qty)
-                    basis += used * max(0.0, num(lot.get("unit_cost_sek")))
-                    lot["quantity"] = max(0.0, lot_qty - used)
-                    remaining -= used
-                    if lot["quantity"] <= 1e-12:
-                        lots.pop(0)
-                complete = remaining <= max(1e-9, qty * 1e-9)
+                held_qty = qty_by_symbol[symbol]
+                held_basis = basis_by_symbol[symbol]
+                complete = held_qty + max(1e-9, qty * 1e-9) >= qty and held_qty > 1e-12
+                avg_cost = held_basis / held_qty if held_qty > 1e-12 else 0.0
+                cost = min(held_basis, qty * avg_cost) if complete else held_basis
+                if not complete:
+                    incomplete_ids.append(tid)
                 proceeds = max(0.0, amount - fee)
-                ev = {
-                    "event_id": str(uuid.uuid4()), "trade_id": tid, "time": timestamp,
-                    "type": "disposal", "symbol": symbol, "quantity": qty,
-                    "proceeds_sek": round(proceeds, 8), "cost_basis_sek": round(basis, 8),
-                    "gain_loss_sek": round(proceeds - basis, 8), "fee_sek": round(fee, 8),
-                    "basis_complete": complete, "method": "FIFO", "mode": MODE,
-                    "reconstructed": True
-                }
-                rebuilt_events.append(ev)
-                trade["tax_event_id"] = ev["event_id"]
-
-        # Prefer a fully reconstructed ledger, preserving old events only if they belong
-        # to trades that cannot be reconstructed from the stored trade rows.
-        rebuilt_ids = {e.get("trade_id") for e in rebuilt_events}
-        other_events = [
-            e for e in existing_events if isinstance(e, dict)
-            and e.get("trade_id") not in rebuilt_ids
-        ]
-        state["tax_events"] = other_events + rebuilt_events
-
-        # Replace lots only when trade-derived remaining quantities match the stored
-        # holdings. Never alter quantity, balance, or cost basis during a tax repair.
+                ev = {"event_id": str(uuid.uuid4()), "trade_id": tid, "time": timestamp,
+                      "type": "disposal", "symbol": symbol, "quantity": qty,
+                      "proceeds_sek": round(proceeds, 8), "cost_basis_sek": round(cost, 8),
+                      "gain_loss_sek": round(proceeds - cost, 8), "fee_sek": round(fee, 8),
+                      "basis_complete": complete, "method": "AVERAGE_COST", "mode": MODE,
+                      "reconstructed": True}
+                if complete:
+                    qty_by_symbol[symbol] = max(0.0, held_qty - qty)
+                    basis_by_symbol[symbol] = max(0.0, held_basis - cost)
+                else:
+                    qty_by_symbol[symbol] = 0.0
+                    basis_by_symbol[symbol] = 0.0
+            trade["tax_event_id"] = ev["event_id"]
+            rebuilt_events.append(ev)
+        state["tax_events"] = rebuilt_events
+        # Update remaining average-cost balances only when trade-derived quantities match
+        # current holdings; never rewrite holdings or cash based solely on tax reconstruction.
         for symbol, holding in state.get("holdings", {}).items():
             if not isinstance(holding, dict):
                 continue
-            derived = [lot for lot in lots_by_symbol.get(symbol, [])
-                       if num(lot.get("quantity")) > 1e-12]
-            derived_qty = sum(num(lot.get("quantity")) for lot in derived)
+            derived_qty = qty_by_symbol.get(symbol, 0.0)
             held_qty = max(0.0, num(holding.get("quantity")))
-            tolerance = max(1e-8, held_qty * 1e-6)
-            if abs(derived_qty - held_qty) <= tolerance:
-                holding["lots"] = derived
-            elif held_qty <= 1e-12:
-                holding["lots"] = []
-            else:
-                # Preserve any existing lots if trade history cannot explain the holding.
+            if abs(derived_qty - held_qty) <= max(1e-8, held_qty * 1e-6):
+                holding["cost_basis_sek"] = round(basis_by_symbol.get(symbol, 0.0), 8)
+                holding["lots"] = ([{"time": "average-cost-ledger", "quantity": derived_qty,
+                                     "unit_cost_sek": basis_by_symbol.get(symbol, 0.0) / derived_qty,
+                                     "trade_id": "average-cost-ledger"}] if derived_qty > 1e-12 else [])
+            elif held_qty > 1e-12:
                 risk_event("TAX_HISTORY_MISMATCH",
-                           f"{symbol}: trades imply {derived_qty:.12g}, holding has {held_qty:.12g}; verify complete exchange history.")
-        risk_event("TAX_LEDGER_REBUILT",
-                   f"Tax ledger reconstructed from {len(rebuilt_events)} recorded PAPER trades; verify completeness before tax filing.")
+                           f"{symbol}: trade ledger implies {derived_qty:.12g}, current holdings have {held_qty:.12g}; verify complete history.")
         persist()
-        return {"rebuilt": True, "events": len(rebuilt_events), "missing_links_repaired": len(missing)}
-
+        return {"rebuilt": True, "events": len(rebuilt_events),
+                "incomplete_disposals": len(incomplete_ids), "incomplete_trade_ids": incomplete_ids,
+                "method": "AVERAGE_COST", "source": "recorded PAPER trades only"}
 
 
 def auto_loop():
@@ -621,13 +600,13 @@ def auto_loop():
             if enabled:
                 signals = make_signals()
                 prices = get_prices()
-                # Stop-loss / take-profit exits use a per-order capped sell, repeated in later cycles if needed.
+                # Stop-loss / take-profit exits close the full simulated position; no arbitrary per-order cap.
                 for symbol,h in list(state["holdings"].items()):
                     qty,basis,price = num(h.get("quantity")),num(h.get("cost_basis_sek")),prices.get(symbol,0)
                     if qty>0 and basis>0 and price>0:
                         change = ((qty*price)/basis-1)*100
                         if change <= -STOP_LOSS_PCT or change >= TAKE_PROFIT_PCT:
-                            try: paper_order("sell",symbol,min(MAX_TRADE_SEK,qty*price),automatic=True)
+                            try: paper_order("sell",symbol,qty*price,automatic=True)
                             except HTTPException as exc:
                                 if exc.status_code not in (409,): raise
                 # Use sell signals for existing holdings as well as stop-loss/take-profit.
@@ -638,17 +617,22 @@ def auto_loop():
                         px = num(prices.get(sig["symbol"]))
                         if held > 0 and px > 0:
                             try:
-                                paper_order("sell", sig["symbol"], min(MAX_TRADE_SEK, held * px), automatic=True)
+                                paper_order("sell", sig["symbol"], held * px, automatic=True)
                             except HTTPException as exc:
                                 if exc.status_code not in (409,): raise
-                for sig in signals:
-                    if sig["signal"]=="KÖP" and sig["confidence"]>=MIN_CONFIDENCE:
-                        # Avoid buying again when the existing position is already near the cap.
-                        holding = state.get("holdings", {}).get(sig["symbol"], {})
-                        current_value = num(holding.get("quantity")) * num(prices.get(sig["symbol"]))
-                        if current_value >= MAX_POSITION_SEK * 0.90:
-                            continue
-                        try: paper_order("buy",sig["symbol"],min(MAX_TRADE_SEK, MAX_POSITION_SEK-current_value),automatic=True)
+                # Do not repeatedly pyramid into the same coin every scan. Divide available
+                # PAPER cash among eligible new positions; order size has no fixed SEK cap.
+                buy_candidates = [sig for sig in signals
+                                  if sig["signal"] == "KÖP" and sig["confidence"] >= MIN_CONFIDENCE
+                                  and num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) <= 1e-12]
+                available = max(0.0, num(state.get("balance_sek")))
+                if buy_candidates and not state.get("risk_halt"):
+                    per_coin_budget = available / len(buy_candidates) / (1.0 + FEE_RATE)
+                    for sig in buy_candidates:
+                        if per_coin_budget <= 0:
+                            break
+                        try:
+                            paper_order("buy", sig["symbol"], per_coin_budget, automatic=True)
                         except HTTPException as exc:
                             if exc.status_code not in (409,): raise
                 with lock:
@@ -663,7 +647,7 @@ def auto_loop():
 def startup():
     restore()
     state["real_orders_enabled"] = False
-    state["auto_enabled"] = AUTO_PAPER_ON_START
+    state["auto_enabled"] = bool(AUTO_PAPER_ON_START and not state.get("risk_halt", False))
     persist()
     global auto_thread
     if auto_thread is None or not auto_thread.is_alive():
@@ -680,10 +664,10 @@ def shutdown():
 @app.get("/")
 def root():
     return {"status":"online","version":APP_VERSION,"mode":MODE,"real_orders_enabled":False,
-            "auto_enabled":bool(state["auto_enabled"]),"message":"PAPER-läge: inga riktiga order skickas.",
+            "auto_enabled":bool(state["auto_enabled"]),"message":"PAPER-läge: inga riktiga order skickas. Inget fast köpbeloppstak; total förlustgräns 500 SEK.",
             "endpoints":["/api/health","/api/market","/api/signals","/api/scan","/api/paper/status",
             "/api/paper/history","/api/auto/status","/api/auto/start","/api/auto/stop",
-            "/api/tax/summary","/api/tax/audit","/api/tax.csv","/api/trades.csv",
+            "/api/tax/summary","/api/tax/audit","/api/tax.csv","/api/tax/k4.csv","/api/trades.csv",
             "/api/risk/status","/api/risk/events","/api/backtest","/api/database/status","/docs"]}
 
 
@@ -732,7 +716,8 @@ def market():
 @app.get("/api/scan")
 def signals():
     return {"signals":make_signals(),"updated_at":now_iso(),"mode":MODE,
-            "strategy":"5m OHLCV EMA9/21/50 + RSI14 + MACD + momentum + volume",
+            "strategy":"5m OHLCV EMA9/21/50 + RSI14 + MACD + momentum + volume gate",
+            "symbols_configured":SYMBOLS,
             "auto_paper_on_start":AUTO_PAPER_ON_START,
             "note":"Signaler är heuristiska, inte garanterade prognoser. Inga riktiga order skickas."}
 
@@ -748,7 +733,9 @@ def paper_status():
         return {"mode":MODE,"real_orders_enabled":False,"balance_sek":num(state["balance_sek"]),
             "holdings":holdings,"trades":state["trades"][-100:],"trade_count":len(state["trades"]),
             "equity_sek":round(num(state["balance_sek"])+sum(h["market_value_sek"] for h in holdings.values()),8),
-            "fee_rate":state["fee_rate"],"auto_enabled":bool(state["auto_enabled"])}
+            "fee_rate":state["fee_rate"],"auto_enabled":bool(state["auto_enabled"]),
+            "risk_halt":bool(state.get("risk_halt")),"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
+            "risk_baseline_equity_sek":num(state.get("risk_baseline_equity_sek"),START_BALANCE_SEK)}
 
 
 @app.post("/api/paper/order")
@@ -764,15 +751,18 @@ def paper_history(limit:int=Query(default=100,ge=1,le=1000)):
 @app.get("/api/auto/status")
 def auto_status():
     return {"enabled":bool(state["auto_enabled"]),"mode":MODE,"real_orders_enabled":False,
-            "interval_seconds":AUTO_INTERVAL_SECONDS,"max_trade_sek":MAX_TRADE_SEK,
+            "interval_seconds":AUTO_INTERVAL_SECONDS,"max_trade_sek":None,
             "max_daily_trades":MAX_DAILY_TRADES,"max_daily_loss_sek":MAX_DAILY_LOSS_SEK,
-            "max_position_sek":MAX_POSITION_SEK,"min_confidence":MIN_CONFIDENCE,
-            "last_run":state.get("last_auto_run"),"last_error":state.get("last_error")}
+            "max_total_loss_sek":MAX_TOTAL_LOSS_SEK,"risk_halt":bool(state.get("risk_halt")),
+            "min_confidence":MIN_CONFIDENCE,"last_run":state.get("last_auto_run"),
+            "last_error":state.get("last_error")}
 
 
 @app.post("/api/auto/start")
 def auto_start():
     with lock:
+        if state.get("risk_halt"):
+            raise HTTPException(409, "Riskspärren är aktiv efter total förlustgräns. Starta inte om utan att granska riskhistoriken.")
         state["real_orders_enabled"]=False; state["auto_enabled"]=True; persist()
     return {"ok":True,"enabled":True,"mode":MODE,"real_orders_enabled":False,
             "message":"Automatisk PAPER-handel aktiverad. Inga riktiga order skickas."}
@@ -804,7 +794,8 @@ def tax_summary():
             "positive_gains_sek":round(gains,2),"negative_losses_sek":round(losses,2),
             "net_realized_result_sek":round(gains+losses,2),"tax_basis_complete":complete,
             "audit_ok":len(disposals)==sells and complete,
-            "note":"Simulerat underlag, inte färdig K4. Verifiera fullständig historik och Skatteverkets regler."}
+            "method":"AVERAGE_COST","tax_filing_ready":False,
+            "note":"Beräknat från PAPER-loggen med genomsnittsmetoden. Inte färdig deklaration förrän komplett historik har jämförts."}
 
 
 @app.get("/api/tax/audit")
@@ -844,6 +835,38 @@ def tax_csv():
     return csv_response([cols]+[[e.get(c,"") for c in cols] for e in state["tax_events"]],"paper_tax_ledger.csv")
 
 
+@app.get("/api/tax/k4.csv")
+def tax_k4_csv(year: int | None = Query(default=None, ge=2009, le=2100)):
+    """Annual K4 section-D helper: separate profitable and loss disposals per coin."""
+    grouped: dict[tuple[int, str, str], dict[str, float]] = {}
+    for ev in state.get("tax_events", []):
+        if not isinstance(ev, dict) or ev.get("type") != "disposal":
+            continue
+        try:
+            event_year = datetime.fromisoformat(str(ev.get("time", "")).replace("Z", "+00:00")).year
+        except Exception:
+            continue
+        if year is not None and event_year != year:
+            continue
+        if not ev.get("basis_complete", False):
+            continue
+        gain = num(ev.get("gain_loss_sek"))
+        bucket = "vinst" if gain >= 0 else "förlust"
+        key = (event_year, str(ev.get("symbol", "UNKNOWN")), bucket)
+        row = grouped.setdefault(key, {"quantity": 0.0, "proceeds_sek": 0.0, "cost_basis_sek": 0.0, "gain_loss_sek": 0.0})
+        row["quantity"] += num(ev.get("quantity"))
+        row["proceeds_sek"] += num(ev.get("proceeds_sek"))
+        row["cost_basis_sek"] += num(ev.get("cost_basis_sek"))
+        row["gain_loss_sek"] += gain
+    cols = ["income_year", "asset", "profit_or_loss", "quantity_disposed", "sales_proceeds_sek", "cost_basis_sek", "gain_or_loss_sek", "method", "source", "verified"]
+    rows = [cols]
+    for (event_year, symbol, bucket), vals in sorted(grouped.items()):
+        rows.append([event_year, symbol, bucket, round(vals["quantity"], 8), round(vals["proceeds_sek"], 2),
+                     round(vals["cost_basis_sek"], 2), round(vals["gain_loss_sek"], 2), "Genomsnittsmetoden",
+                     "PAPER-logg", "NEJ - jämför med fullständig börshistorik"])
+    return csv_response(rows, f"k4_hjalp_{year or 'alla_ar'}.csv")
+
+
 @app.get("/api/trades.csv")
 def trades_csv():
     cols=["trade_id","mode","side","symbol","time","price_sek","quantity","amount_sek","fee_sek",
@@ -858,10 +881,13 @@ def risk_status():
     with lock:
         stats=get_daily_stats(prices)
         return {"mode":MODE,"real_orders_enabled":False,"auto_enabled":bool(state["auto_enabled"]),
-            "limits":{"max_trade_sek":MAX_TRADE_SEK,"max_daily_trades":MAX_DAILY_TRADES,
-            "max_daily_loss_sek":MAX_DAILY_LOSS_SEK,"max_position_sek":MAX_POSITION_SEK,
+            "limits":{"max_trade_sek":None,"max_position_sek":None,"max_daily_trades":MAX_DAILY_TRADES,
+            "max_daily_loss_sek":MAX_DAILY_LOSS_SEK,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
             "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT},
-            "today_utc":daily_key(),"daily_stats":stats,"equity_sek":round(equity_from_prices(prices),2),
+            "risk_baseline_equity_sek":num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK),
+            "risk_halt":bool(state.get("risk_halt")),"today_utc":daily_key(),"daily_stats":stats,
+            "equity_sek":round(equity_from_prices(prices),2),
+            "estimated_total_drawdown_sek":round(max(0.0,num(state.get("risk_baseline_equity_sek"),START_BALANCE_SEK)-equity_from_prices(prices)),2),
             "risk_events":state["risk_events"][-50:]}
 
 
