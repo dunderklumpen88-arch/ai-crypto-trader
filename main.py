@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "8.4.1-paper-candle-sek-fix"
+APP_VERSION = "8.4.2-paper-sell-signal-fix"
 MODE = "PAPER ONLY"
 SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SHIB"]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
@@ -516,7 +516,10 @@ def run_auto_cycle() -> None:
         signals = make_signals()
         prices = get_prices()
         actions = 0
-        # Evaluate existing positions before considering new entries.
+        # Evaluate existing positions using confirmed SELL signals as well as risk exits.
+        # Orders remain PAPER-only and each order is capped by MAX_TRADE_SEK.
+        signal_by_symbol = {str(x.get("symbol", "")).upper(): x for x in signals}
+        sold_symbols: set[str] = set()
         with lock:
             holdings_snapshot = {k: dict(v) for k, v in state["holdings"].items()}
         for symbol, holding in holdings_snapshot.items():
@@ -528,17 +531,23 @@ def run_auto_cycle() -> None:
             change = ((qty * price) / basis - 1) * 100
             buy_age = last_trade_age_seconds(symbol, "buy")
             stop_loss_allowed = buy_age is None or buy_age >= MIN_HOLD_SECONDS
-            if ((change <= -STOP_LOSS_PCT and stop_loss_allowed) or change >= TAKE_PROFIT_PCT):
+            sig = signal_by_symbol.get(symbol, {})
+            confirmed_sell = sig.get("signal") == "SÄLJ" and num(sig.get("confidence")) >= MIN_CONFIDENCE and stop_loss_allowed
+            risk_exit = ((change <= -STOP_LOSS_PCT and stop_loss_allowed) or change >= TAKE_PROFIT_PCT)
+            if confirmed_sell or risk_exit:
                 try:
                     result = paper_order("sell", symbol, min(MAX_TRADE_SEK, qty * price), automatic=True)
                     if result.get("ok"):
                         actions += 1
+                        sold_symbols.add(symbol)
                 except HTTPException as exc:
                     if exc.status_code != 409:
                         raise
                     log.info("PAPER sell skipped for %s: %s", symbol, exc.detail)
         for sig in signals:
             if sig.get("signal") == "KÖP" and num(sig.get("confidence")) >= MIN_CONFIDENCE:
+                if str(sig.get("symbol", "")).upper() in sold_symbols:
+                    continue
                 try:
                     result = paper_order("buy", sig["symbol"], MAX_TRADE_SEK, automatic=True)
                     if result.get("ok"):
