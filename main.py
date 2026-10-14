@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "11.0.0-paper-average-cost-loss-guard"
+APP_VERSION = "12.0.0-paper-safer-entry-exit"
 MODE = "PAPER ONLY"
 # Coinbase EUR spot pairs. Unsupported/unavailable pairs are skipped and reported in source_errors.
 SYMBOLS = [
@@ -21,8 +21,9 @@ SYMBOLS = [
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
 START_BALANCE_SEK = float(os.getenv("PAPER_START_BALANCE_SEK", "1000"))
 FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.005"))
-# No fixed per-order or per-position SEK cap. Orders are limited by available PAPER cash
-# and the portfolio-wide maximum drawdown guard below.
+# Conservative simulated-trading limits. These apply to manual and automatic PAPER buys.
+MAX_TRADE_SEK = max(25.0, float(os.getenv("MAX_TRADE_SEK", "100")))
+MAX_POSITION_SEK = max(MAX_TRADE_SEK, float(os.getenv("MAX_POSITION_SEK", "250")))
 MAX_TOTAL_LOSS_SEK = max(0.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "500")))
 MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "4"))
 MAX_DAILY_LOSS_SEK = float(os.getenv("MAX_DAILY_LOSS_SEK", "100"))
@@ -363,7 +364,8 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     low_volume = samples >= 20 and vol_ratio < 0.20
     if samples >= 50 and score >= 4 and rsi_v < 73 and vol <= 2.5 and not low_volume:
         signal = "KÖP"
-    elif samples >= 50 and score <= -3 and not low_volume:
+    elif (samples >= 50 and score <= -4 and e9[-1] < e21[-1] < e50[-1]
+          and macd < macd_sig and momentum < -0.25 and not low_volume):
         signal = "SÄLJ"
     else:
         signal = "AVVAKTA"
@@ -437,6 +439,9 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
     prices = get_prices()
     price = prices.get(symbol,0)
     if price <= 0: raise HTTPException(503,"Pris saknas.")
+    # Cap requested buys; sells may close a full position for protective exits.
+    if side == "buy":
+        amount_sek = min(float(amount_sek), MAX_TRADE_SEK)
     with lock:
         state["real_orders_enabled"] = False
         h = state["holdings"].setdefault(symbol, {"quantity":0.0,"cost_basis_sek":0.0,"lots":[]})
@@ -453,7 +458,7 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
             risk_event("MAX_TOTAL_LOSS", f"Total förlustgräns på {MAX_TOTAL_LOSS_SEK:.2f} SEK uppnådd; automatiken stoppad och nya köp spärrade.")
             persist()
             if side == "buy":
-                raise HTTPException(409, "Total förlustgräns på 500 kr är uppnådd. Nya köp är spärrade; säljning är fortfarande tillåten.")
+                raise HTTPException(409, f"Total förlustgräns på {MAX_TOTAL_LOSS_SEK:.0f} kr är uppnådd. Nya köp är spärrade; säljning är fortfarande tillåten.")
         if state.get("risk_halt") and side == "buy":
             raise HTTPException(409, "Riskspärr aktiv efter att maximal total förlust uppnåtts. Köp är spärrade.")
         if automatic:
@@ -470,6 +475,12 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
         fee = amount_sek*fee_rate
         pnl, tax_event = 0.0, None
         if side == "buy":
+            held_value = num(h.get("quantity")) * price
+            remaining_position_room = max(0.0, MAX_POSITION_SEK - held_value)
+            amount_sek = min(amount_sek, remaining_position_room)
+            if amount_sek <= 0.01:
+                raise HTTPException(409, f"Positionsgränsen {MAX_POSITION_SEK:.0f} kr för {symbol} är nådd.")
+            fee = amount_sek * fee_rate
             total = amount_sek+fee
             if balance + 1e-8 < total: raise HTTPException(409,"Otillräckligt PAPER-saldo inklusive avgift.")
             qty = amount_sek/price
@@ -501,7 +512,7 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
                  "realized_pnl_sek":round(pnl,8),"tax_event_id":tax_event["event_id"]}
         state["trades"].append(trade)
         state["trades"] = state["trades"][-20000:]
-        if automatic: stats["trades"] = int(stats.get("trades",0))+1
+        if automatic and side == "buy": stats["trades"] = int(stats.get("trades",0))+1
         state["equity_history"].append({"time":ts,"equity_sek":round(equity_from_prices(prices),8)})
         state["equity_history"] = state["equity_history"][-10000:]
         state["last_error"] = None
@@ -609,10 +620,10 @@ def auto_loop():
                             try: paper_order("sell",symbol,qty*price,automatic=True)
                             except HTTPException as exc:
                                 if exc.status_code not in (409,): raise
-                # Use sell signals for existing holdings as well as stop-loss/take-profit.
-                # This remains PAPER-only and respects the same risk limits.
+                # Ordinary signal-based exits require strong multi-indicator bearish confirmation.
+                # Stop-loss/take-profit exits above remain independent protective rules.
                 for sig in signals:
-                    if sig["signal"] == "SÄLJ" and sig["confidence"] >= MIN_CONFIDENCE:
+                    if sig["signal"] == "SÄLJ" and sig["score"] <= -4 and sig["confidence"] >= MIN_CONFIDENCE:
                         held = num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity"))
                         px = num(prices.get(sig["symbol"]))
                         if held > 0 and px > 0:
@@ -620,14 +631,14 @@ def auto_loop():
                                 paper_order("sell", sig["symbol"], held * px, automatic=True)
                             except HTTPException as exc:
                                 if exc.status_code not in (409,): raise
-                # Do not repeatedly pyramid into the same coin every scan. Divide available
-                # PAPER cash among eligible new positions; order size has no fixed SEK cap.
+                # Do not repeatedly pyramid into the same coin every scan. Each PAPER buy is capped
+                # at MAX_TRADE_SEK and each coin position at MAX_POSITION_SEK.
                 buy_candidates = [sig for sig in signals
                                   if sig["signal"] == "KÖP" and sig["confidence"] >= MIN_CONFIDENCE
                                   and num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) <= 1e-12]
                 available = max(0.0, num(state.get("balance_sek")))
                 if buy_candidates and not state.get("risk_halt"):
-                    per_coin_budget = available / len(buy_candidates) / (1.0 + FEE_RATE)
+                    per_coin_budget = min(MAX_TRADE_SEK, available / len(buy_candidates) / (1.0 + FEE_RATE))
                     for sig in buy_candidates:
                         if per_coin_budget <= 0:
                             break
@@ -663,28 +674,12 @@ def shutdown():
 
 @app.get("/")
 def root():
-    # Visa den svenska instrumentpanelen på startsidan.
-    from fastapi.responses import FileResponse
-
-    dashboard = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "index.html"
-    )
-
-    if os.path.isfile(dashboard):
-        return FileResponse(
-            dashboard,
-            media_type="text/html"
-        )
-
-    return {
-        "status": "online",
-        "version": APP_VERSION,
-        "mode": MODE,
-        "real_orders_enabled": False,
-        "auto_enabled": bool(state["auto_enabled"]),
-        "message": "PAPER-läge: inga riktiga order skickas."
-    }
+    return {"status":"online","version":APP_VERSION,"mode":MODE,"real_orders_enabled":False,
+            "auto_enabled":bool(state["auto_enabled"]),"message":f"PAPER-läge: inga riktiga order skickas. Köp begränsas till högst {MAX_TRADE_SEK:.0f} SEK per order och {MAX_POSITION_SEK:.0f} SEK per kryptovaluta; total förlustgräns {MAX_TOTAL_LOSS_SEK:.0f} SEK.",
+            "endpoints":["/api/health","/api/market","/api/signals","/api/scan","/api/paper/status",
+            "/api/paper/history","/api/auto/status","/api/auto/start","/api/auto/stop",
+            "/api/tax/summary","/api/tax/audit","/api/tax.csv","/api/tax/k4.csv","/api/trades.csv",
+            "/api/risk/status","/api/risk/events","/api/backtest","/api/database/status","/docs"]}
 
 
 @app.head("/")
@@ -767,7 +762,7 @@ def paper_history(limit:int=Query(default=100,ge=1,le=1000)):
 @app.get("/api/auto/status")
 def auto_status():
     return {"enabled":bool(state["auto_enabled"]),"mode":MODE,"real_orders_enabled":False,
-            "interval_seconds":AUTO_INTERVAL_SECONDS,"max_trade_sek":None,
+            "interval_seconds":AUTO_INTERVAL_SECONDS,"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,
             "max_daily_trades":MAX_DAILY_TRADES,"max_daily_loss_sek":MAX_DAILY_LOSS_SEK,
             "max_total_loss_sek":MAX_TOTAL_LOSS_SEK,"risk_halt":bool(state.get("risk_halt")),
             "min_confidence":MIN_CONFIDENCE,"last_run":state.get("last_auto_run"),
@@ -897,9 +892,9 @@ def risk_status():
     with lock:
         stats=get_daily_stats(prices)
         return {"mode":MODE,"real_orders_enabled":False,"auto_enabled":bool(state["auto_enabled"]),
-            "limits":{"max_trade_sek":None,"max_position_sek":None,"max_daily_trades":MAX_DAILY_TRADES,
+            "limits":{"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,"max_daily_trades":MAX_DAILY_TRADES,
             "max_daily_loss_sek":MAX_DAILY_LOSS_SEK,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
-            "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT},
+            "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,"min_confidence":MIN_CONFIDENCE},
             "risk_baseline_equity_sek":num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK),
             "risk_halt":bool(state.get("risk_halt")),"today_utc":daily_key(),"daily_stats":stats,
             "equity_sek":round(equity_from_prices(prices),2),
@@ -917,10 +912,22 @@ def backtest(symbol:str=Query(default="BTC")):
     symbol=symbol.upper()
     if symbol not in SYMBOLS: raise HTTPException(400,"Okänd kryptovaluta.")
     prices=get_prices(force=True)
+    if symbol not in prices or num(prices.get(symbol)) <= 0:
+        raise HTTPException(503, f"Marknadspris saknas för {symbol}; Coinbase-paret kan vara otillgängligt just nu.")
     candles=get_candles(symbol,force=True)
     sig=analyze_symbol(symbol,prices[symbol])
     return {"mode":"MARKET_DATA_SIGNAL_DIAGNOSTIC_ONLY","symbol":symbol,"candle_count":len(candles),
         "signal":sig,"warning":"Detta är inte ett historiskt portföljbacktest och garanterar inte framtida resultat."}
+
+
+@app.get("/api/trader-intelligence/status")
+def trader_intelligence_status():
+    """Read-only status: no public-trader data is used unless verified and normalized."""
+    enabled = os.getenv("TRADER_INTEL_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    return {"enabled": enabled, "mode": MODE, "real_orders_enabled": False,
+            "status": "disabled_safe_default" if not enabled else "adapter_required",
+            "influences_trades": False,
+            "message": "Offentlig traderdata påverkar inte beslut förrän en dokumenterad källa, verifierad historik och adapter har testats."}
 
 
 @app.post("/api/safety/disable-real-orders")
