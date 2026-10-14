@@ -1,4 +1,4 @@
-"""AI Crypto Trader — robust PAPER-only backend. Version 8.1.0. Simulated trades only; no live exchange-order code exists. """
+"""AI Crypto Trader — hardened PAPER-only backend. No live exchange orders are possible."""
 from __future__ import annotations
 
 import csv
@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "8.2.0-paper-churn-guard"
+APP_VERSION = "8.3.0-paper-auto-reliability"
 MODE = "PAPER ONLY"
 SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SHIB"]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
@@ -36,7 +36,8 @@ MAX_POSITION_SEK = 300.0
 STOP_LOSS_PCT = 3.0
 TAKE_PROFIT_PCT = 6.0
 MIN_CONFIDENCE = 65
-AUTO_INTERVAL_SECONDS = 900
+AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "900")))
+AUTO_START_ON_BOOT = os.getenv("AUTO_START_ON_BOOT", "true").strip().lower() in {"1", "true", "yes", "on"}
 HTTP_TIMEOUT = 6
 CACHE_TTL = 20
 HISTORY_MAX = 500
@@ -48,6 +49,7 @@ log = logging.getLogger("ai-crypto-paper")
 app = FastAPI(title="AI Crypto Trader PAPER", version=APP_VERSION)
 lock = threading.RLock()
 stop_event = threading.Event()
+wake_event = threading.Event()
 auto_thread: threading.Thread | None = None
 
 state: dict[str, Any] = {
@@ -55,7 +57,7 @@ state: dict[str, Any] = {
     "balance_sek": START_BALANCE_SEK, "fee_rate": DEFAULT_FEE_RATE,
     "holdings": {}, "trades": [], "tax_events": [], "risk_events": [],
     "daily_stats": {}, "equity_history": [], "last_auto_run": None,
-    "last_error": None, "created_at": datetime.now(timezone.utc).isoformat(),
+    "last_cycle_status": "not_started", "auto_cycle_count": 0, "last_error": None, "created_at": datetime.now(timezone.utc).isoformat(),
 }
 market_cache: dict[str, Any] = {"at": 0.0, "prices": {}, "eur_sek": 11.2, "source_errors": {}}
 price_history: dict[str, deque] = {s: deque(maxlen=HISTORY_MAX) for s in SYMBOLS}
@@ -90,7 +92,7 @@ def _clean_state(saved: dict[str, Any]) -> None:
             state[key] = saved[key]
     state["mode"] = MODE
     state["real_orders_enabled"] = False
-    state["auto_enabled"] = False
+    state["auto_enabled"] = bool(saved.get("auto_enabled", AUTO_START_ON_BOOT))
     for key in ("holdings", "daily_stats"):
         if not isinstance(state.get(key), dict):
             state[key] = {}
@@ -446,69 +448,113 @@ def make_signals() -> list[dict[str, Any]]:
     return [analyze_symbol(s, prices[s]) for s in SYMBOLS if s in prices]
 
 
+def run_auto_cycle() -> None:
+    """Run one complete simulated trading cycle and always record its outcome."""
+    started = now_iso()
+    with lock:
+        state["auto_cycle_count"] = int(state.get("auto_cycle_count", 0)) + 1
+        cycle_number = state["auto_cycle_count"]
+        state["last_cycle_status"] = "running"
+        state["last_error"] = None
+        persist()
+    log.info("PAPER auto cycle %s started", cycle_number)
+    try:
+        signals = make_signals()
+        prices = get_prices()
+        actions = 0
+        # Evaluate existing positions before considering new entries.
+        with lock:
+            holdings_snapshot = {k: dict(v) for k, v in state["holdings"].items()}
+        for symbol, holding in holdings_snapshot.items():
+            qty = num(holding.get("quantity"))
+            basis = num(holding.get("cost_basis_sek"))
+            price = num(prices.get(symbol))
+            if qty <= 0 or basis <= 0 or price <= 0:
+                continue
+            change = ((qty * price) / basis - 1) * 100
+            buy_age = last_trade_age_seconds(symbol, "buy")
+            stop_loss_allowed = buy_age is None or buy_age >= MIN_HOLD_SECONDS
+            if ((change <= -STOP_LOSS_PCT and stop_loss_allowed) or change >= TAKE_PROFIT_PCT):
+                try:
+                    result = paper_order("sell", symbol, min(MAX_TRADE_SEK, qty * price), automatic=True)
+                    if result.get("ok"):
+                        actions += 1
+                except HTTPException as exc:
+                    if exc.status_code != 409:
+                        raise
+                    log.info("PAPER sell skipped for %s: %s", symbol, exc.detail)
+        for sig in signals:
+            if sig.get("signal") == "KÖP" and num(sig.get("confidence")) >= MIN_CONFIDENCE:
+                try:
+                    result = paper_order("buy", sig["symbol"], MAX_TRADE_SEK, automatic=True)
+                    if result.get("ok"):
+                        actions += 1
+                except HTTPException as exc:
+                    if exc.status_code != 409:
+                        raise
+                    log.info("PAPER buy skipped for %s: %s", sig.get("symbol"), exc.detail)
+        with lock:
+            state["last_auto_run"] = now_iso()
+            state["last_cycle_status"] = "completed"
+            state["last_error"] = None
+            persist()
+        log.info("PAPER auto cycle %s completed: signals=%s actions=%s", cycle_number, len(signals), actions)
+    except Exception as exc:
+        with lock:
+            state["last_auto_run"] = now_iso()
+            state["last_cycle_status"] = "failed"
+            state["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            persist()
+        if isinstance(exc, HTTPException):
+            log.warning("PAPER auto cycle %s blocked: %s", cycle_number, exc.detail)
+        else:
+            log.exception("PAPER auto cycle %s failed (started %s)", cycle_number, started)
+
+
 def auto_loop() -> None:
-    log.info("PAPER worker started; real orders disabled")
+    log.info("PAPER worker started; real orders disabled; interval=%ss", AUTO_INTERVAL_SECONDS)
     while not stop_event.is_set():
-        try:
-            with lock:
-                enabled = bool(state.get("auto_enabled"))
-            if enabled:
-                signals = make_signals()
-                prices = get_prices()
-                # Evaluate all positions first; never sell more than the position or per-order cap.
-                for symbol, holding in list(state["holdings"].items()):
-                    qty, basis, price = num(holding.get("quantity")), num(holding.get("cost_basis_sek")), prices.get(symbol, 0)
-                    if qty <= 0 or basis <= 0 or price <= 0:
-                        continue
-                    change = ((qty * price) / basis - 1) * 100
-                    buy_age = last_trade_age_seconds(symbol, "buy")
-                    stop_loss_allowed = buy_age is None or buy_age >= MIN_HOLD_SECONDS
-                    if (change <= -STOP_LOSS_PCT and stop_loss_allowed) or change >= TAKE_PROFIT_PCT:
-                        try:
-                            paper_order("sell", symbol, min(MAX_TRADE_SEK, qty * price), automatic=True)
-                        except HTTPException as exc:
-                            if exc.status_code != 409:
-                                raise
-                for sig in signals:
-                    if sig["signal"] == "KÖP" and sig["confidence"] >= MIN_CONFIDENCE:
-                        try:
-                            paper_order("buy", sig["symbol"], MAX_TRADE_SEK, automatic=True)
-                        except HTTPException as exc:
-                            if exc.status_code != 409:
-                                raise
-                with lock:
-                    state["last_auto_run"] = now_iso()
-                    state["last_error"] = None
-                    persist()
-        except Exception as exc:
-            with lock:
-                state["last_error"] = str(exc)[:500]
-            if isinstance(exc, HTTPException):
-                log.warning("Auto cycle blocked: %s", exc.detail)
-            else:
-                log.exception("Auto cycle failed")
-        stop_event.wait(AUTO_INTERVAL_SECONDS)
+        # Start immediately if enabled; otherwise wait until explicitly enabled or timeout.
+        with lock:
+            enabled = bool(state.get("auto_enabled"))
+        if enabled:
+            run_auto_cycle()
+            # Wait for a manual wake-up or the next scheduled cycle.
+            wake_event.wait(AUTO_INTERVAL_SECONDS)
+            wake_event.clear()
+        else:
+            wake_event.wait(60)
+            wake_event.clear()
+        if stop_event.is_set():
+            break
 
 
 def start_worker() -> None:
     global auto_thread
     if auto_thread is None or not auto_thread.is_alive():
         stop_event.clear()
+        wake_event.clear()
         auto_thread = threading.Thread(target=auto_loop, daemon=True, name="paper-auto-worker")
         auto_thread.start()
 
 
 @app.on_event("startup")
 def startup() -> None:
-    state["real_orders_enabled"] = False
-    state["auto_enabled"] = False
-    persist()
+    # Real exchange orders are permanently disabled in this build. Auto mode is PAPER-only.
+    with lock:
+        state["real_orders_enabled"] = False
+        state["auto_enabled"] = AUTO_START_ON_BOOT
+        persist()
     start_worker()
+    if state["auto_enabled"]:
+        wake_event.set()
+    log.info("Startup complete: mode=%s auto_enabled=%s real_orders_enabled=false", MODE, state["auto_enabled"])
 
 
 @app.on_event("shutdown")
 def shutdown() -> None:
     stop_event.set()
+    wake_event.set()
 
 
 @app.get("/")
@@ -582,7 +628,11 @@ def auto_status() -> dict[str, Any]:
             "max_position_sek": MAX_POSITION_SEK, "min_confidence": MIN_CONFIDENCE,
             "min_hold_seconds": MIN_HOLD_SECONDS, "reentry_cooldown_seconds": REENTRY_COOLDOWN_SECONDS,
             "max_open_positions": MAX_OPEN_POSITIONS,
-            "last_run": state.get("last_auto_run"), "last_error": state.get("last_error")}
+            "last_run": state.get("last_auto_run"), "last_error": state.get("last_error"),
+            "last_cycle_status": state.get("last_cycle_status", "not_started"),
+            "cycle_count": int(state.get("auto_cycle_count", 0)),
+            "auto_start_on_boot": AUTO_START_ON_BOOT, "state_file": STATE_FILE,
+            "state_persistence": os.path.exists(STATE_FILE)}
 
 
 @app.post("/api/auto/start")
@@ -590,7 +640,9 @@ def auto_start() -> dict[str, Any]:
     with lock:
         state["real_orders_enabled"] = False
         state["auto_enabled"] = True
+        state["last_error"] = None
         persist()
+    wake_event.set()
     return {"ok": True, "enabled": True, "mode": MODE, "real_orders_enabled": False,
             "message": "Automatisk PAPER-handel aktiverad. Inga riktiga order skickas."}
 
@@ -600,6 +652,7 @@ def auto_stop() -> dict[str, Any]:
     with lock:
         state["auto_enabled"] = False
         persist()
+    wake_event.set()
     return {"ok": True, "enabled": False, "mode": MODE, "real_orders_enabled": False}
 
 
