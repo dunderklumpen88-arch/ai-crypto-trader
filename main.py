@@ -11,12 +11,12 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "12.0.0-paper-safer-entry-exit"
+APP_VERSION = "12.0.1-paper-market-pairs-fix"
 MODE = "PAPER ONLY"
-# Coinbase EUR spot pairs. Unsupported/unavailable pairs are skipped and reported in source_errors.
+# Coinbase EUR spot pairs. Keep this list to products that have returned valid ticker data.
 SYMBOLS = [
     "BTC", "ETH", "SOL", "XRP", "SHIB", "ADA", "DOGE", "LINK", "AVAX",
-    "DOT", "LTC", "BCH", "ATOM", "UNI", "AAVE", "NEAR", "OP", "ARB", "SUI", "PEPE"
+    "DOT", "LTC", "BCH", "ATOM", "UNI", "AAVE"
 ]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
 START_BALANCE_SEK = float(os.getenv("PAPER_START_BALANCE_SEK", "1000"))
