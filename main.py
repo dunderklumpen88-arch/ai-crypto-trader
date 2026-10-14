@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "8.3.0-paper-auto-reliability"
+APP_VERSION = "8.4.0-paper-candle-signals"
 MODE = "PAPER ONLY"
 SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SHIB"]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
@@ -35,7 +35,7 @@ MAX_DAILY_LOSS_SEK = 100.0
 MAX_POSITION_SEK = 300.0
 STOP_LOSS_PCT = 3.0
 TAKE_PROFIT_PCT = 6.0
-MIN_CONFIDENCE = 65
+MIN_CONFIDENCE = 65  # Keep a confidence floor; signal count must not be forced artificially
 AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "900")))
 AUTO_START_ON_BOOT = os.getenv("AUTO_START_ON_BOOT", "true").strip().lower() in {"1", "true", "yes", "on"}
 HTTP_TIMEOUT = 6
@@ -279,7 +279,8 @@ def analyze_symbol(symbol: str, price: float) -> dict[str, Any]:
         signal, confidence = "AVVAKTA", min(60, 45 + abs(score) * 3)
     return {"symbol": symbol, "product": PRODUCTS[symbol], "price_sek": round(price, 6),
             "signal": signal, "confidence": confidence, "score": score,
-            "indicators": ind, "reason": "; ".join(reasons) or "Otillräcklig samstämmighet"}
+            "indicators": ind, "min_confidence_for_auto_buy": MIN_CONFIDENCE,
+            "reason": "; ".join(reasons) or "Otillräcklig samstämmighet"}
 
 
 def equity_from_prices(prices: dict[str, float]) -> float:
@@ -443,9 +444,54 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic: bool = Fal
                 "equity_sek": state["equity_history"][-1]["equity_sek"]}
 
 
+def load_candle_history(symbol: str, limit: int = 40) -> bool:
+    """Load real hourly Coinbase candles so indicators do not depend on process uptime. Coinbase candle rows are [time, low, high, open, close, volume]. A failed candle request leaves the existing ticker history untouched and is logged. """
+    product = PRODUCTS[symbol]
+    try:
+        response = requests.get(
+            f"https://api.exchange.coinbase.com/products/{product}/candles",
+            params={"granularity": 3600}, timeout=HTTP_TIMEOUT,
+            headers={"User-Agent": f"ai-crypto-paper/{APP_VERSION}"},
+        )
+        response.raise_for_status()
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise ValueError("Unexpected candle response")
+        parsed = []
+        for row in rows:
+            if isinstance(row, list) and len(row) >= 5:
+                stamp, close = num(row[0]), num(row[4])
+                if stamp > 0 and close > 0:
+                    parsed.append({"time": stamp, "price": close})
+        parsed.sort(key=lambda item: item["time"])
+        if len(parsed) < 8:
+            log.warning("Insufficient hourly candles for %s: %s", symbol, len(parsed))
+            return False
+        with lock:
+            price_history[symbol].clear()
+            price_history[symbol].extend(parsed[-limit:])
+        return True
+    except Exception as exc:
+        log.warning("Hourly candle data unavailable for %s: %s", symbol, str(exc)[:200])
+        return False
+
+
 def make_signals() -> list[dict[str, Any]]:
     prices = get_prices(force=True)
-    return [analyze_symbol(s, prices[s]) for s in SYMBOLS if s in prices]
+    results = []
+    for symbol in SYMBOLS:
+        if symbol not in prices:
+            continue
+        # Historical candles make the first run useful immediately; in-memory
+        # ticker samples alone would need many hours to reach indicator warm-up.
+        load_candle_history(symbol)
+        result = analyze_symbol(symbol, prices[symbol])
+        if result["indicators"].get("samples", 0) < 8:
+            result["signal"] = "AVVAKTA"
+            result["confidence"] = min(num(result.get("confidence")), 59)
+            result["reason"] += "; för få historiska datapunkter för köp/sälj"
+        results.append(result)
+    return results
 
 
 def run_auto_cycle() -> None:
