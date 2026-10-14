@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "8.4.0-paper-candle-signals"
+APP_VERSION = "8.4.1-paper-candle-sek-fix"
 MODE = "PAPER ONLY"
 SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SHIB"]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
@@ -457,12 +457,20 @@ def load_candle_history(symbol: str, limit: int = 40) -> bool:
         rows = response.json()
         if not isinstance(rows, list):
             raise ValueError("Unexpected candle response")
+        # Coinbase product candles are denominated in EUR (products are e.g. BTC-EUR),
+        # while the live ticker/cache used by the strategy is converted to SEK.
+        # Convert historical closes to SEK before mixing them with live prices.
+        with lock:
+            eur_sek = num(market_cache.get("eur_sek"), 11.2)
+        if eur_sek <= 0:
+            raise ValueError("Invalid EUR/SEK conversion rate for candle history")
         parsed = []
         for row in rows:
             if isinstance(row, list) and len(row) >= 5:
-                stamp, close = num(row[0]), num(row[4])
-                if stamp > 0 and close > 0:
-                    parsed.append({"time": stamp, "price": close})
+                stamp, close_eur = num(row[0]), num(row[4])
+                close_sek = close_eur * eur_sek
+                if stamp > 0 and close_eur > 0 and close_sek > 0:
+                    parsed.append({"time": stamp, "price": close_sek})
         parsed.sort(key=lambda item: item["time"])
         if len(parsed) < 8:
             log.warning("Insufficient hourly candles for %s: %s", symbol, len(parsed))
