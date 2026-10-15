@@ -500,7 +500,7 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic: bool = Fal
             pnl = num(tax_event["gain_loss_sek"])
             stats["realized_pnl_sek"] = num(stats.get("realized_pnl_sek")) + pnl
 
-        trade = {"trade_id": trade_id, "mode": MODE, "side": side, "symbol": symbol, "time": timestamp,
+        trade = {"trade_id": trade_id, "mode": MODE, "trade_type": "simulator_test" if test_trade else "strategy", "side": side, "symbol": symbol, "time": timestamp,
                  "price_sek": round(price, 8), "quantity": qty, "amount_sek": round(qty * price, 8),
                  "fee_sek": round(fee, 8), "fee_rate": fee_rate, "automatic": automatic,
                  "realized_pnl_sek": round(pnl, 8), "tax_event_id": tax_event["event_id"]}
