@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "8.4.2-paper-sell-signal-fix"
+APP_VERSION = "8.4.3-paper-fx-fallback"
 MODE = "PAPER ONLY"
 SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SHIB"]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
@@ -171,17 +171,33 @@ def get_prices(force: bool = False) -> dict[str, float]:
         if not force and market_cache["prices"] and now - market_cache["at"] < CACHE_TTL:
             return dict(market_cache["prices"])
 
+    # FX is a supporting dependency, not a reason to discard otherwise valid
+    # Coinbase ticker data. Keep the last valid rate in memory and use a clearly
+    # logged conservative fallback only before the first successful FX response.
     eur_sek = num(market_cache.get("eur_sek"), 11.2)
     errors: dict[str, str] = {}
     try:
         fx = http_json("https://api.frankfurter.app/latest?from=EUR&to=SEK")
         candidate = num(fx.get("rates", {}).get("SEK"))
-        if candidate > 0:
+        if candidate >= 5.0 and candidate <= 20.0:
             eur_sek = candidate
+            with lock:
+                market_cache["eur_sek"] = candidate
+                market_cache["eur_sek_updated_at"] = time.time()
+                market_cache["eur_sek_is_fallback"] = False
         else:
-            errors["EUR_SEK"] = "Invalid FX rate"
+            log.warning("Frankfurter returned an implausible EUR/SEK rate; using last known rate")
+            if not num(market_cache.get("eur_sek_updated_at")):
+                market_cache["eur_sek_is_fallback"] = True
     except Exception as exc:
-        errors["EUR_SEK"] = str(exc)[:240]
+        # The screenshot showed a Frankfurter read timeout. Continue with the
+        # last successful rate (or 11.2 only on cold start) and expose this as
+        # a warning, not as a failed market-price fetch.
+        if not num(market_cache.get("eur_sek_updated_at")):
+            market_cache["eur_sek_is_fallback"] = True
+        log.warning("EUR/SEK provider unavailable; using %s rate: %s",
+                    "fallback" if market_cache.get("eur_sek_is_fallback") else "cached",
+                    str(exc)[:180])
 
     fresh: dict[str, float] = {}
     for symbol, product in PRODUCTS.items():
