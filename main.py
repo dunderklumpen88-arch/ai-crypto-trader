@@ -16,11 +16,19 @@ from pathlib import Path as FilePath
 from typing import Any
 
 import requests
+
+try:
+    import psycopg
+    from psycopg.types.json import Jsonb
+except Exception:  # Database support is optional; PAPER mode still works locally.
+    psycopg = None
+    Jsonb = None
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "8.4.4-paper-sim-smoke-test"
+APP_VERSION = "8.5.0-paper-postgres-persistence"
 MODE = "PAPER ONLY"
 SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SHIB"]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
@@ -116,8 +124,39 @@ def _clean_state(saved: dict[str, Any]) -> None:
         ]
 
 
+def database_dsn() -> str | None:
+    """Return Render PostgreSQL DSN, if configured."""
+    dsn = os.getenv("DATABASE_URL", "").strip()
+    if dsn.startswith("postgres://"):
+        dsn = "postgresql://" + dsn[len("postgres://"):]
+    return dsn or None
+
+
+def database_ready() -> bool:
+    return bool(database_dsn() and psycopg is not None)
+
+
+def persist_database() -> bool:
+    """Persist the complete simulator state to Render PostgreSQL when configured."""
+    dsn = database_dsn()
+    if not dsn or psycopg is None:
+        return False
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""CREATE TABLE IF NOT EXISTS paper_trader_state ( id SMALLINT PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )""")
+                cur.execute("""INSERT INTO paper_trader_state (id, payload, updated_at) VALUES (1, %s, NOW()) ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()""",
+                    (Jsonb(state),))
+        return True
+    except Exception as exc:
+        log.error("PostgreSQL PAPER state save failed: %s", str(exc)[:240])
+        return False
+
+
 def persist() -> bool:
-    """Atomic local save. Use a Render persistent disk or DB for durable history."""
+    """Save to PostgreSQL if configured, and also keep an atomic local backup."""
+    db_ok = persist_database()
+    local_ok = False
     try:
         path = FilePath(STATE_FILE)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,21 +166,40 @@ def persist() -> bool:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
-        return True
+        local_ok = True
     except Exception:
-        log.exception("PAPER state persistence failed")
-        state["last_error"] = "Kunde inte spara lokal historik; kontrollera persistent disk."
-        return False
+        log.exception("Local PAPER state backup failed")
+    if not db_ok and not local_ok:
+        state["last_error"] = "Kunde inte spara PAPER-historiken till databas eller lokal fil."
+    return db_ok or local_ok
 
 
 def restore() -> None:
+    """Prefer PostgreSQL (durable across Render restarts), then local JSON backup."""
+    dsn = database_dsn()
+    if dsn and psycopg is not None:
+        try:
+            with psycopg.connect(dsn, connect_timeout=5) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""CREATE TABLE IF NOT EXISTS paper_trader_state ( id SMALLINT PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )""")
+                    cur.execute("SELECT payload FROM paper_trader_state WHERE id = 1")
+                    row = cur.fetchone()
+            if row and isinstance(row[0], dict):
+                _clean_state(row[0])
+                log.info("Restored PAPER state from PostgreSQL (%s trades)", len(state["trades"]))
+                return
+            log.info("PostgreSQL has no saved state yet; trying local backup")
+        except Exception as exc:
+            log.error("PostgreSQL restore failed; trying local backup: %s", str(exc)[:240])
+    elif os.getenv("DATABASE_URL") and psycopg is None:
+        log.error("DATABASE_URL is set but psycopg is unavailable; trying local backup")
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             saved = json.load(f)
         if not isinstance(saved, dict):
             raise ValueError("State file is not an object")
         _clean_state(saved)
-        log.info("Restored PAPER state (%s trades)", len(state["trades"]))
+        log.info("Restored PAPER state from local file (%s trades)", len(state["trades"]))
     except FileNotFoundError:
         log.info("No saved PAPER state; starting with default balance")
     except Exception:
@@ -369,7 +427,7 @@ def last_trade_age_seconds(symbol: str, side: str) -> float | None:
     return None
 
 
-def paper_order(side: str, symbol: str, amount_sek: float, automatic: bool = False) -> dict[str, Any]:
+def paper_order(side: str, symbol: str, amount_sek: float, automatic: bool = False, test_trade: bool = False) -> dict[str, Any]:
     side, symbol = str(side).strip().lower(), str(symbol).strip().upper()
     if side not in ("buy", "sell"):
         raise HTTPException(400, "Sidan måste vara buy eller sell.")
@@ -597,7 +655,7 @@ def run_auto_cycle() -> None:
                     probe_symbol = str(probe.get("symbol", "")).upper()
                     probe_amount = min(25.0, MAX_TRADE_SEK)
                     try:
-                        result = paper_order("buy", probe_symbol, probe_amount, automatic=True)
+                        result = paper_order("buy", probe_symbol, probe_amount, automatic=True, test_trade=True)
                         if result.get("ok"):
                             actions += 1
                             log.warning(
@@ -701,6 +759,7 @@ def health() -> dict[str, Any]:
     return {"status": "online", "version": APP_VERSION, "mode": MODE,
             "real_orders_enabled": False, "auto_enabled": bool(state["auto_enabled"]),
             "state_file": STATE_FILE, "state_persistence": os.path.exists(STATE_FILE),
+            "database_configured": bool(database_dsn()), "database_driver_available": psycopg is not None,
             "market_cache_available": bool(market_cache["prices"]),
             "market_source_errors": market_cache.get("source_errors", {}),
             "trade_count": len(state["trades"]), "last_error": state.get("last_error")}
@@ -754,7 +813,8 @@ def auto_status() -> dict[str, Any]:
             "last_cycle_status": state.get("last_cycle_status", "not_started"),
             "cycle_count": int(state.get("auto_cycle_count", 0)),
             "auto_start_on_boot": AUTO_START_ON_BOOT, "state_file": STATE_FILE,
-            "state_persistence": os.path.exists(STATE_FILE)}
+            "state_persistence": os.path.exists(STATE_FILE),
+            "database_configured": bool(database_dsn()), "database_driver_available": psycopg is not None}
 
 
 @app.post("/api/auto/start")
@@ -837,7 +897,7 @@ def tax_csv() -> StreamingResponse:
 
 @app.get("/api/trades.csv")
 def trades_csv() -> StreamingResponse:
-    columns = ["trade_id", "mode", "side", "symbol", "time", "price_sek", "quantity", "amount_sek",
+    columns = ["trade_id", "mode", "trade_type", "side", "symbol", "time", "price_sek", "quantity", "amount_sek",
                "fee_sek", "fee_rate", "automatic", "realized_pnl_sek", "tax_event_id"]
     return csv_response([columns] + [[t.get(c, "") for c in columns] for t in state["trades"]], "paper_trades.csv")
 
@@ -891,9 +951,24 @@ def disable_real_orders() -> dict[str, Any]:
 
 @app.get("/api/database/status")
 def database_status() -> dict[str, Any]:
-    return {"ok": True, "backend": "local_json_file", "state_file": STATE_FILE,
-            "state_file_exists": os.path.exists(STATE_FILE),
-            "warning": "Lokal /tmp-fil kan försvinna vid Render-omstart. Konfigurera persistent disk för varaktig historik."}
+    configured = bool(database_dsn())
+    driver_available = psycopg is not None
+    connected = False
+    db_error = None
+    if configured and driver_available:
+        try:
+            with psycopg.connect(database_dsn(), connect_timeout=3) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    connected = cur.fetchone()[0] == 1
+        except Exception as exc:
+            db_error = str(exc)[:200]
+    return {"ok": (connected if configured and driver_available else os.path.exists(STATE_FILE)),
+            "backend": "postgresql+local_backup" if configured and driver_available else "local_json_file",
+            "database_configured": configured, "driver_available": driver_available,
+            "database_connected": connected, "database_error": db_error,
+            "state_file": STATE_FILE, "state_file_exists": os.path.exists(STATE_FILE),
+            "warning": None if connected else "För varaktig historik i Render behöver DATABASE_URL vara korrekt konfigurerad och databasen nåbar."}
 
 
 @app.get("/api/paper/history")
