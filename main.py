@@ -687,16 +687,19 @@ def shutdown():
     stop_event.set()
 
 
+
+
 @app.get("/")
 def root():
-    return {"status":"online","version":APP_VERSION,"mode":MODE,"real_orders_enabled":False,
-            "auto_enabled":bool(state["auto_enabled"]),"message":f"PAPER-läge: inga riktiga order skickas. Inget fast köpbeloppstak; automatiken stoppas vid total nedgång på {MAX_TOTAL_LOSS_SEK:.0f} SEK.",
-            "endpoints":["/api/health","/api/market","/api/signals","/api/scan","/api/paper/status",
-            "/api/paper/history","/api/auto/status","/api/auto/start","/api/auto/stop",
-            "/api/tax/summary","/api/tax/audit","/api/tax.csv","/api/tax/k4.csv","/api/trades.csv",
-            "/api/risk/status","/api/risk/events","/api/backtest","/api/database/status","/docs"]}
-
-
+    from fastapi.responses import FileResponse, JSONResponse
+    dashboard = Path(__file__).with_name("index.html")
+    if dashboard.is_file():
+        return FileResponse(dashboard, media_type="text/html; charset=utf-8")
+    return JSONResponse({
+        "status": "online",
+        "message": "Dashboardfilen index.html saknas.",
+        "health": "/api/health"
+    }, status_code=503)
 @app.head("/")
 def root_head():
     from fastapi.responses import Response
