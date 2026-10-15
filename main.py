@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "8.4.3-paper-fx-fallback"
+APP_VERSION = "8.4.4-paper-sim-smoke-test"
 MODE = "PAPER ONLY"
 SYMBOLS = ["BTC", "ETH", "SOL", "XRP", "SHIB"]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
@@ -560,18 +560,61 @@ def run_auto_cycle() -> None:
                     if exc.status_code != 409:
                         raise
                     log.info("PAPER sell skipped for %s: %s", symbol, exc.detail)
-        for sig in signals:
-            if sig.get("signal") == "KÖP" and num(sig.get("confidence")) >= MIN_CONFIDENCE:
-                if str(sig.get("symbol", "")).upper() in sold_symbols:
-                    continue
-                try:
-                    result = paper_order("buy", sig["symbol"], MAX_TRADE_SEK, automatic=True)
-                    if result.get("ok"):
-                        actions += 1
-                except HTTPException as exc:
-                    if exc.status_code != 409:
-                        raise
-                    log.info("PAPER buy skipped for %s: %s", sig.get("symbol"), exc.detail)
+        buy_candidates = [
+            sig for sig in signals
+            if sig.get("signal") == "KÖP"
+            and num(sig.get("confidence")) >= MIN_CONFIDENCE
+            and str(sig.get("symbol", "")).upper() not in sold_symbols
+        ]
+        for sig in buy_candidates:
+            try:
+                result = paper_order("buy", sig["symbol"], MAX_TRADE_SEK, automatic=True)
+                if result.get("ok"):
+                    actions += 1
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
+                log.info("PAPER buy skipped for %s: %s", sig.get("symbol"), exc.detail)
+
+        # PAPER-only smoke test: if there is no qualifying BUY and the portfolio
+        # is empty, make one tiny simulated entry to verify order/balance/fee logic.
+        # This is explicitly a simulator test, not a strategy BUY signal.
+        if not buy_candidates and actions == 0:
+            with lock:
+                portfolio_empty = not any(
+                    num(h.get("quantity")) > 1e-12 for h in state.get("holdings", {}).values()
+                )
+            if portfolio_empty:
+                eligible = [
+                    sig for sig in signals
+                    if num(sig.get("confidence")) >= 45
+                    and num(sig.get("indicators", {}).get("samples")) >= 20
+                    and num(prices.get(str(sig.get("symbol", "")).upper())) > 0
+                ]
+                eligible.sort(key=lambda x: (num(x.get("score")), num(x.get("confidence"))), reverse=True)
+                if eligible:
+                    probe = eligible[0]
+                    probe_symbol = str(probe.get("symbol", "")).upper()
+                    probe_amount = min(25.0, MAX_TRADE_SEK)
+                    try:
+                        result = paper_order("buy", probe_symbol, probe_amount, automatic=True)
+                        if result.get("ok"):
+                            actions += 1
+                            log.warning(
+                                "PAPER TEST ENTRY executed for %s amount=%.2f SEK; signal=%s score=%s confidence=%s. Not a strategy BUY.",
+                                probe_symbol, probe_amount, probe.get("signal"),
+                                probe.get("score"), probe.get("confidence")
+                            )
+                    except HTTPException as exc:
+                        if exc.status_code != 409:
+                            raise
+                        log.info("PAPER test entry skipped for %s: %s", probe_symbol, exc.detail)
+        if actions == 0:
+            log.info("PAPER cycle had no fills; signal summary=%s", [
+                {"symbol": x.get("symbol"), "signal": x.get("signal"),
+                 "confidence": x.get("confidence"), "score": x.get("score"),
+                 "reason": x.get("reason")} for x in signals
+            ])
         with lock:
             state["last_auto_run"] = now_iso()
             state["last_cycle_status"] = "completed"
