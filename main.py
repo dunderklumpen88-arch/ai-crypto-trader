@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv, io, json, logging, math, os, threading, time, uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "12.2.0-final-no-purchase-cap"
+APP_VERSION = "12.3.0-parallel-market-fetch"
 MODE = "PAPER ONLY"
 # Coinbase EUR spot pairs. Keep this list to products that have returned valid ticker data.
 SYMBOLS = [
@@ -240,16 +241,26 @@ def get_prices(force=False) -> dict[str, float]:
         return dict(market_cache["prices"])
     fx = get_fx(force)
     fresh, errors = {}, {}
-    for sym, product in PRODUCTS.items():
-        try:
-            ticker = http_get_json(f"https://api.exchange.coinbase.com/products/{product}/ticker")
-            eur = num(ticker.get("price"))
-            if eur > 0:
-                fresh[sym] = eur * fx
-            else:
-                errors[sym] = "Ogiltigt pris"
-        except Exception as exc:
-            errors[sym] = str(exc)[:200]
+
+    # Fetch ticker products concurrently. Sequential requests could take several
+    # minutes when several symbols time out, leaving the dashboard appearing stuck.
+    def fetch_one(item):
+        sym, product = item
+        ticker = http_get_json(f"https://api.exchange.coinbase.com/products/{product}/ticker")
+        eur = num(ticker.get("price"))
+        if eur <= 0:
+            raise ValueError("Ogiltigt pris")
+        return sym, eur * fx
+
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="market-price") as pool:
+        futures = {pool.submit(fetch_one, item): item[0] for item in PRODUCTS.items()}
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                symbol, price_sek = future.result()
+                fresh[symbol] = price_sek
+            except Exception as exc:
+                errors[sym] = str(exc)[:200]
     market_cache["source_errors"] = errors
     market_cache["valid_products"] = sorted(fresh.keys())
     if fresh:
@@ -376,7 +387,9 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         reasons.append("Volymen är för låg jämfört med snittet; signal blockerad")
     confidence = int(clamp(50 + abs(score)*6 + (8 if quality == "HIGH" else 3 if quality == "MEDIUM" else -8), 35, 88))
     if signal == "AVVAKTA": confidence = min(confidence, 60 if low_volume else 64)
-    return {"symbol": symbol, "product": PRODUCTS[symbol], "price_sek": round(price_sek, 6),
+    if samples < 50:
+        confidence = min(confidence, 45)
+    return {"symbol": symbol, "product": PRODUCTS[symbol], "price_sek": round(price_sek, 10),
             "signal": signal, "confidence": confidence, "score": score,
             "indicators": {"ema9_sek": round(e9[-1],6), "ema21_sek": round(e21[-1],6),
                 "ema50_sek": round(e50[-1],6), "rsi14": round(rsi_v,2),
