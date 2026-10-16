@@ -37,6 +37,16 @@ th{color:#a9b6ce}.tablewrap{overflow-x:auto}
 <span class="pill">PAPER MODE — INGA RIKTIGA ORDER</span>
 </header>
 <main>
+<div class="card">
+  <h2>Serveranslutning</h2>
+  <div class="muted">Om sidan öppnas direkt som en HTML-fil måste du ange adressen till din Render-server. Om sidan ligger på samma server lämnar du fältet tomt.</div>
+  <div class="row" style="margin-top:8px">
+    <div><label for="apiBase">Backend-URL (Render)</label><input id="apiBase" type="url" placeholder="https://din-tjänst.onrender.com" autocomplete="url"></div>
+    <div><button onclick="saveApiBase()">Spara och anslut</button></div>
+    <div><button class="secondary" onclick="testConnection()">Testa anslutning</button></div>
+  </div>
+  <div id="connectionstatus" class="status">Kontrollerar anslutning…</div>
+</div>
 <div class="note">Endast testhandel med låtsaspengar. Automatisk handel använder enkla prisbaserade signaler, inte garanterade prognoser. Saldo och historik kan försvinna när servern startar om. CSV-filen är inte ett färdigt K4-underlag för verklig handel.</div>
 
 <div class="grid">
@@ -90,52 +100,92 @@ th{color:#a9b6ce}.tablewrap{overflow-x:auto}
 </main>
 
 <script>
+'use strict';
 const $=id=>document.getElementById(id);
-const sek=n=>n==null?'—':Number(n).toLocaleString('sv-SE',{style:'currency',currency:'SEK',maximumFractionDigits:2});
+const sek=n=>n==null||!Number.isFinite(Number(n))?'—':Number(n).toLocaleString('sv-SE',{style:'currency',currency:'SEK',maximumFractionDigits:2});
+const storedApiBase=()=>{try{return localStorage.getItem('aiCryptoTraderApiBase')||''}catch(_){return ''}};
+function apiBase(){
+ const typed=($('apiBase')?.value||'').trim();
+ if(typed) return typed.replace(/\/+$/,'');
+ if(location.protocol==='file:') throw Error('Sidan öppnas som en lokal fil. Ange din Render-URL ovan och tryck på Spara och anslut.');
+ return location.origin;
+}
+function saveApiBase(){
+ const value=($('apiBase').value||'').trim().replace(/\/+$/,'');
+ if(value && !/^https?:\/\//i.test(value)){ $('connectionstatus').textContent='Ange en fullständig URL som börjar med https://'; return; }
+ try{if(value)localStorage.setItem('aiCryptoTraderApiBase',value);else localStorage.removeItem('aiCryptoTraderApiBase')}catch(_){}
+ $('connectionstatus').textContent='Inställningen sparad. Testar servern…';
+ testConnection().then(()=>{refresh();loadScan();loadAuto()});
+}
 async function api(url,options={}){
- const response=await fetch(url,options);
- const data=await response.json().catch(()=>({}));
- if(!response.ok)throw Error(data.detail||'Serverfel');
+ let base=apiBase();
+ const controller=new AbortController();
+ const timeout=setTimeout(()=>controller.abort(),15000);
+ let response;
+ try{
+   response=await fetch(base+url,{...options,signal:controller.signal,headers:{'Accept':'application/json',...(options.headers||{})}});
+ }catch(e){
+   if(e.name==='AbortError')throw Error('Servern svarade inte inom 15 sekunder. Kontrollera Render och backend-URL.');
+   if(location.protocol==='file:')throw Error('Kunde inte nå backend. Kontrollera Render-URL och att servern är igång. Vid CORS-fel måste backend tillåta denna frontend-origin.');
+   throw Error('Kunde inte nå servern. Kontrollera att Render-tjänsten är igång. '+e.message);
+ }finally{clearTimeout(timeout)}
+ const raw=await response.text();
+ let data={};
+ try{data=raw?JSON.parse(raw):{}}catch(_){data={detail:raw.slice(0,180)||'Servern returnerade inte JSON.'}}
+ if(!response.ok)throw Error(data.detail||data.message||('HTTP '+response.status));
  return data;
+}
+async function testConnection(){
+ $('connectionstatus').textContent='Testar /api/health…';
+ try{
+  const d=await api('/api/health');
+  $('connectionstatus').textContent='Ansluten till backend · '+(d.status||d.message||'health-kontrollen svarade OK');
+  $('connectionstatus').className='status good';
+  $('globalstatus').textContent='Backend online. Hämtar paneldata…';
+  return d;
+ }catch(e){
+  $('connectionstatus').textContent='Anslutningsfel: '+e.message;
+  $('connectionstatus').className='status bad';
+  $('globalstatus').textContent='Backend inte nåbar: '+e.message;
+  throw e;
+ }
 }
 async function refresh(){
  try{
   const d=await api('/api/paper/status');
   $('cash').textContent=sek(d.balance_sek);
-  $('count').textContent=d.trade_count;
+  $('count').textContent=d.trade_count??(d.trades||[]).length;
   const holds=d.holdings||{};
   let value=0,rows=[];
-
-const market=await api('/api/market');
-  const prices=market.prices_sek||{};
-  for(const [s,h] of Object.entries(holds)){
-   const q=Number(h.quantity||0),p=prices[s];
-
-   if(p!=null)value+=q*p;
-   rows.push('<tr><td>'+s+'</td><td>'+q.toPrecision(8)+'</td><td>'+sek(p==null?null:q*p)+'</td></tr>');
+  let prices={};
+  try{const market=await api('/api/market');prices=market.prices_sek||{}}catch(e){$('globalstatus').textContent='Kontot laddades, men marknadspriser saknas: '+e.message}
+  for(const [symbol,h] of Object.entries(holds)){
+   const q=Number(h.quantity||0),price=prices[symbol];
+   if(price!=null&&Number.isFinite(Number(price)))value+=q*Number(price);
+   rows.push('<tr><td>'+escapeHtml(symbol)+'</td><td>'+q.toPrecision(8)+'</td><td>'+sek(price==null?null:q*Number(price))+'</td></tr>');
   }
   $('positions').innerHTML=rows.join('')||'<tr><td colspan="3">Inga innehav ännu.</td></tr>';
-  const equity=Number(d.balance_sek)+value;
+  const equity=Number(d.balance_sek||0)+value;
   $('equity').textContent=sek(equity);
   $('result').textContent=sek(equity-1000);
   $('result').className='metric '+(equity>=1000?'good':'bad');
-  $('trades').innerHTML=(d.trades||[]).slice().reverse().map(t=>'<tr><td>'+new Date(t.time).toLocaleString('sv-SE')+'</td><td>'+t.side.toUpperCase()+'</td><td>'+t.symbol+'</td><td>'+sek(t.amount_sek)+'</td><td>'+((t.automatic)?'Automatisk':'Manuell')+'</td></tr>').join('')||'<tr><td colspan="5">Ingen historik.</td></tr>';
-  $('globalstatus').textContent='Backend online · endast simulerad handel.';
- }catch(e){$('globalstatus').textContent='Kunde inte läsa kontot: '+e.message}
+  $('trades').innerHTML=(d.trades||[]).slice().reverse().map(t=>'<tr><td>'+escapeHtml(t.time?new Date(t.time).toLocaleString('sv-SE'):'—')+'</td><td>'+escapeHtml(String(t.side||'').toUpperCase())+'</td><td>'+escapeHtml(t.symbol||'—')+'</td><td>'+sek(t.amount_sek)+'</td><td>'+(t.automatic?'Automatisk':'Manuell')+'</td></tr>').join('')||'<tr><td colspan="5">Ingen historik.</td></tr>';
+  if(!$('globalstatus').textContent.includes('marknadspriser saknas'))$('globalstatus').textContent='Backend online · endast simulerad handel.';
+ }catch(e){$('globalstatus').textContent='Kunde inte läsa kontot: '+e.message;$('cash').textContent='—';$('equity').textContent='—';$('result').textContent='—';$('count').textContent='—';}
 }
+function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function loadScan(){
  $('signals').innerHTML='<tr><td colspan="4">Hämtar analys…</td></tr>';
  try{
   const d=await api('/api/scan');
-  $('signals').innerHTML=(d.signals||[]).map(s=>'<tr><td>'+(s.name||s.symbol||s.product)+'</td><td>'+sek(s.price_sek)+'</td><td class="'+(s.signal==='POSITIV'?'good':s.signal==='NEGATIV'?'bad':'warn')+'">'+(s.signal||'AVVAKTA')+'</td><td>'+(s.reason||'Ingen tydlig signal')+'</td></tr>').join('')||'<tr><td colspan="4">Ingen signaldata.</td></tr>';
- }catch(e){$('signals').innerHTML='<tr><td colspan="4">Analysfel: '+e.message+'</td></tr>'}
+  $('signals').innerHTML=(d.signals||[]).map(s=>'<tr><td>'+escapeHtml(s.name||s.symbol||s.product||'—')+'</td><td>'+sek(s.price_sek)+'</td><td class="'+(s.signal==='POSITIV'?'good':s.signal==='NEGATIV'?'bad':'warn')+'">'+escapeHtml(s.signal||'AVVAKTA')+'</td><td>'+escapeHtml(s.reason||'Ingen tydlig signal')+'</td></tr>').join('')||'<tr><td colspan="4">Ingen signaldata.</td></tr>';
+ }catch(e){$('signals').innerHTML='<tr><td colspan="4">Analysfel: '+escapeHtml(e.message)+'</td></tr>'}
 }
 async function loadAuto(){
  try{
   const d=await api('/api/auto/status');
-  
-$('autostatus').textContent=(d.enabled?'AKTIV':'AVSTÄNGD')+' · '+d.mode+' · '+(d.max_daily_trades??4)+' max affärer/dygn · '+(d.risk_halt?'RISKSPÄRR AKTIV':(d.last_error||'Ingen rapporterad systemvarning'));
-
+  $('autostatus').textContent=(d.enabled?'AKTIV':'AVSTÄNGD')+' · '+(d.mode||'läge okänt')+' · '+(d.max_daily_trades??4)+' max affärer/dygn · '+(d.risk_halt?'RISKSPÄRR AKTIV':(d.last_error||'Ingen rapporterad systemvarning'));
+ }catch(e){$('autostatus').textContent='Kunde inte läsa automatisk handel: '+e.message}
 }
 async function autoAction(action){
  try{await api('/api/auto/'+action,{method:'POST'});await loadAuto()}
@@ -143,18 +193,18 @@ async function autoAction(action){
 }
 async function placeOrder(side){
  const amount=Number($('amount').value);
- if(amount<=0||amount>100){$('orderstatus').textContent='Ange ett belopp mellan 1 och 100 kr.';return}
+ if(!Number.isFinite(amount)||amount<1||amount>100){$('orderstatus').textContent='Ange ett belopp mellan 1 och 100 kr.';return}
  try{
-  const d=await api('/api/paper/order',{method:'POST',headers:{'Content-Type':'application/json'},
-body:JSON.stringify({symbol:$('product').value,side,amount_sek:amount})
-                                       });
-  $('orderstatus').textContent='Simulerad order registrerad: '+d.trade.symbol+' '+side+'.';
+  const d=await api('/api/paper/order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:$('product').value,side,amount_sek:amount})});
+  $('orderstatus').textContent='Simulerad order registrerad: '+(d.trade?.symbol||$('product').value)+' '+side+'.';
   await refresh();
  }catch(e){$('orderstatus').textContent='Orderfel: '+e.message}
 }
-refresh();loadScan();loadAuto();
-setInterval(refresh,30000);
-setInterval(loadAuto,60000);
+$('apiBase').value=storedApiBase();
+// If hosted by the backend, same-origin is used. For a downloaded HTML file, set the Render URL above.
+if(location.protocol==='file:'&&!$('apiBase').value){$('connectionstatus').textContent='Ange din Render-URL ovan för att ansluta.';$('globalstatus').textContent='Väntar på backend-URL.';$('signals').innerHTML='<tr><td colspan="4">Ange backend-URL för att hämta marknadsanalys.</td></tr>';$('autostatus').textContent='Väntar på backend-URL.'}
+else{testConnection().then(()=>{refresh();loadScan();loadAuto()}).catch(()=>{refresh();loadScan();loadAuto()})}
+setInterval(()=>{if(location.protocol!=='file:'||storedApiBase()){refresh();loadAuto()}},30000);
 </script>
 </body>
 </html>
