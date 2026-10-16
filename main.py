@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "13.0.0-advanced-paper-engine"
+APP_VERSION = "13.1.0-paper-data-safety"
 MODE = "PAPER ONLY"
 # Coinbase EUR spot pairs. Keep this list to products that have returned valid ticker data.
 SYMBOLS = [
@@ -93,10 +93,30 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 
 def http_get_json(url: str, params=None):
-    r = http.get(url, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    return data
+    """GET JSON with bounded retries for temporary rate limits and server failures."""
+    last_error = None
+    for attempt in range(3):
+        try:
+            r = http.get(url, params=params, timeout=HTTP_TIMEOUT)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                if attempt < 2:
+                    retry_after = num(r.headers.get("Retry-After"), 0.0)
+                    delay = retry_after if 0 < retry_after <= 8 else (0.5 * (2 ** attempt))
+                    time.sleep(min(delay, 8.0))
+                    continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as exc:
+            last_error = exc
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            retryable = status == 429 or (status is not None and 500 <= status < 600) or status is None
+            if attempt < 2 and retryable:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            raise
+    if last_error:
+        raise last_error
+    raise RuntimeError("API-anrop misslyckades efter återförsök")
 
 
 def _clean_state(saved: dict[str, Any]) -> None:
@@ -227,8 +247,23 @@ def restore() -> None:
 
 
 def risk_event(event: str, detail: str) -> None:
-    state.setdefault("risk_events", []).append({"time": now_iso(), "event": event, "detail": detail})
-    state["risk_events"] = state["risk_events"][-1000:]
+    """Record risk events, suppressing identical repeats for 10 minutes."""
+    events = state.setdefault("risk_events", [])
+    now = datetime.now(timezone.utc)
+    for previous in reversed(events[-100:]):
+        if previous.get("event") != event or previous.get("detail") != detail:
+            continue
+        try:
+            previous_time = datetime.fromisoformat(str(previous.get("time", "")).replace("Z", "+00:00"))
+            if previous_time.tzinfo is None:
+                previous_time = previous_time.replace(tzinfo=timezone.utc)
+            if 0 <= (now - previous_time).total_seconds() < 600:
+                return
+        except (TypeError, ValueError):
+            pass
+        break
+    events.append({"time": now.isoformat(), "event": event, "detail": detail})
+    state["risk_events"] = events[-1000:]
 
 
 def get_fx(force=False) -> float:
@@ -261,7 +296,7 @@ def get_prices(force=False) -> dict[str, float]:
             raise ValueError("Ogiltigt pris")
         return sym, eur * fx
 
-    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="market-price") as pool:
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="market-price") as pool:
         futures = {pool.submit(fetch_one, item): item[0] for item in PRODUCTS.items()}
         for future in as_completed(futures):
             sym = futures[future]
@@ -279,9 +314,9 @@ def get_prices(force=False) -> dict[str, float]:
         market_cache.setdefault("valuation_prices", {}).update(fresh)
         market_cache["at"] = time.time()
         return dict(market_cache["prices"])
-    if market_cache["prices"]:
-        return dict(market_cache["prices"])
-    raise HTTPException(503, "Kunde inte hämta marknadspriser. Försök igen senare.")
+    # Do not pass stale prices to signal generation as if they were current.
+    # Last-known values remain in valuation_prices for portfolio valuation only.
+    raise HTTPException(503, "Kunde inte hämta några aktuella marknadspriser. Försök igen senare.")
 
 
 def get_candles(symbol: str, force=False) -> list[dict[str, float]]:
@@ -309,7 +344,8 @@ def get_candles(symbol: str, force=False) -> list[dict[str, float]]:
             return candle_cache[symbol]["candles"]
     except Exception as exc:
         market_cache["source_errors"][f"{symbol}_candles"] = str(exc)[:200]
-    if cached:
+    # Brief fallback for transient outages only; stale candles must not look current forever.
+    if cached and time.time() - cached["at"] <= 300:
         return cached["candles"]
     return []
 
@@ -798,6 +834,8 @@ def health():
             "local_state_exists":os.path.exists(STATE_FILE),"database":db_info,
             "market_cache_available":bool(market_cache["prices"]),
             "market_source_errors":market_cache.get("source_errors",{}),
+            "valid_market_symbols":market_cache.get("valid_products",[]),
+            "configured_symbol_count":len(SYMBOLS),
             "trade_count":len(state["trades"]),"last_error":state.get("last_error")}
 
 
@@ -830,11 +868,16 @@ def market():
 @app.get("/api/signals")
 @app.get("/api/scan")
 def signals():
-    return {"signals":make_signals(),"updated_at":now_iso(),"mode":MODE,
+    signals = make_signals()
+    returned = {item.get("symbol") for item in signals}
+    return {"signals":signals,"updated_at":now_iso(),"mode":MODE,
             "strategy":"5m OHLCV EMA9/21/50 + RSI14 + MACD + momentum + volume gate + Bollinger + stochastic + ATR/directional confirmation + net-fee exits",
             "symbols_configured":SYMBOLS,
+            "symbols_returned":sorted(returned),
+            "symbols_missing":sorted(set(SYMBOLS) - returned),
+            "market_source_errors":dict(market_cache.get("source_errors",{})),
             "auto_paper_on_start":AUTO_PAPER_ON_START,
-            "note":"Signaler är heuristiska, inte garanterade prognoser. Inga riktiga order skickas."}
+            "note":"Signaler är heuristiska, inte garanterade prognoser. Saknade symboler har ingen användbar aktuell marknadsdata. Inga riktiga order skickas."}
 
 
 @app.get("/api/paper/status")
