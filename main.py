@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "12.5.0-hard-buy-position-duplicate-cap"
+APP_VERSION = "12.6.0-net-profit-trailing-exit"
 MODE = "PAPER ONLY"
 # Coinbase EUR spot pairs. Keep this list to products that have returned valid ticker data.
 SYMBOLS = [
@@ -33,6 +33,8 @@ MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "4")))
 MAX_DAILY_LOSS_SEK = max(0.0, float(os.getenv("MAX_DAILY_LOSS_SEK", "500")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "6"))
+TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "3"))
+TRAILING_DRAWDOWN_PCT = float(os.getenv("TRAILING_DRAWDOWN_PCT", "2"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
 AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
 # Safety: always start with automation disabled; enable manually from the dashboard.
@@ -462,7 +464,7 @@ def average_cost_sell(symbol: str, qty: float, proceeds: float, timestamp: str, 
     return ev
 
 
-def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
+def paper_order(side: str, symbol: str, amount_sek: float, automatic=False, exit_reason: str | None = None):
     side, symbol = str(side).lower().strip(), str(symbol).upper().strip()
     if side not in ("buy","sell"): raise HTTPException(400,"Sidan måste vara buy eller sell.")
     if symbol not in SYMBOLS: raise HTTPException(400,"Okänd kryptovaluta.")
@@ -566,6 +568,8 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
                  "price_sek":round(price,8),"quantity":qty,"amount_sek":round(qty*price,8),
                  "fee_sek":round(fee,8),"fee_rate":fee_rate,"automatic":automatic,
                  "realized_pnl_sek":round(pnl,8),"tax_event_id":tax_event["event_id"]}
+        if exit_reason and side == "sell":
+            trade["exit_reason"] = str(exit_reason)[:120]
         state["trades"].append(trade)
         state["trades"] = state["trades"][-20000:]
         if automatic and side == "buy": stats["trades"] = int(stats.get("trades",0))+1
@@ -670,17 +674,37 @@ def auto_loop():
                 # Track exits this cycle so the bot cannot sell and re-buy the same coin
                 # immediately based on a stale signal from the start of the cycle.
                 exited_this_cycle: set[str] = set()
-                # Stop-loss / take-profit exits close the full simulated position; no arbitrary per-order cap.
+                # Risk exits use estimated NET return after both buy and sell fees.
+                # The trailing stop records a high-water mark per holding in persistent state.
+                fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
                 for symbol,h in list(state["holdings"].items()):
-                    qty,basis,price = num(h.get("quantity")),num(h.get("cost_basis_sek")),prices.get(symbol,0)
-                    if qty>0 and basis>0 and price>0:
-                        change = ((qty*price)/basis-1)*100
-                        if change <= -STOP_LOSS_PCT or change >= TAKE_PROFIT_PCT:
-                            try:
-                                paper_order("sell",symbol,qty*price,automatic=True)
-                                exited_this_cycle.add(symbol)
-                            except HTTPException as exc:
-                                if exc.status_code not in (409,): raise
+                    qty = num(h.get("quantity"))
+                    basis = num(h.get("cost_basis_sek"))
+                    price = num(prices.get(symbol))
+                    if qty <= 0 or basis <= 0 or price <= 0:
+                        continue
+                    net_exit_value = qty * price * (1.0 - fee_rate)
+                    net_return_pct = (net_exit_value / basis - 1.0) * 100.0
+                    peak_return_pct = num(h.get("peak_net_return_pct"), net_return_pct)
+                    peak_return_pct = max(peak_return_pct, net_return_pct)
+                    h["peak_net_return_pct"] = round(peak_return_pct, 6)
+                    h["last_net_return_pct"] = round(net_return_pct, 6)
+                    exit_reason = None
+                    if net_return_pct <= -STOP_LOSS_PCT:
+                        exit_reason = f"NET_STOP_LOSS_{STOP_LOSS_PCT:.1f}%"
+                    elif net_return_pct >= TAKE_PROFIT_PCT:
+                        exit_reason = f"NET_TAKE_PROFIT_{TAKE_PROFIT_PCT:.1f}%"
+                    elif (peak_return_pct >= TRAILING_ACTIVATION_PCT
+                          and net_return_pct <= peak_return_pct - TRAILING_DRAWDOWN_PCT):
+                        exit_reason = (f"TRAILING_STOP_peak_{peak_return_pct:.2f}%"
+                                       f"_drawdown_{TRAILING_DRAWDOWN_PCT:.1f}%")
+                    if exit_reason:
+                        try:
+                            paper_order("sell", symbol, qty * price, automatic=True, exit_reason=exit_reason)
+                            exited_this_cycle.add(symbol)
+                        except HTTPException as exc:
+                            if exc.status_code not in (409,):
+                                raise
                 # Ordinary signal-based exits require strong multi-indicator bearish confirmation.
                 # Stop-loss/take-profit exits above remain independent protective rules.
                 for sig in signals:
@@ -840,6 +864,8 @@ def auto_status():
             "duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,
             "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_daily_trades":MAX_DAILY_TRADES,"max_daily_loss_sek":MAX_DAILY_LOSS_SEK,
             "max_total_loss_sek":MAX_TOTAL_LOSS_SEK,"risk_halt":bool(state.get("risk_halt")),
+            "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,
+            "trailing_activation_pct":TRAILING_ACTIVATION_PCT,"trailing_drawdown_pct":TRAILING_DRAWDOWN_PCT,
             "min_confidence":MIN_CONFIDENCE,"last_run":state.get("last_auto_run"),
             "last_error":state.get("last_error")}
 
@@ -969,7 +995,9 @@ def risk_status():
         return {"mode":MODE,"real_orders_enabled":False,"auto_enabled":bool(state["auto_enabled"]),
             "limits":{"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,"duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,"purchase_amount_cap":True,"max_daily_trades":MAX_DAILY_TRADES,
             "max_daily_loss_sek":MAX_DAILY_LOSS_SEK,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
-            "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,"min_confidence":MIN_CONFIDENCE},
+            "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,
+            "trailing_activation_pct":TRAILING_ACTIVATION_PCT,"trailing_drawdown_pct":TRAILING_DRAWDOWN_PCT,
+            "min_confidence":MIN_CONFIDENCE},
             "risk_baseline_equity_sek":num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK),
             "risk_halt":bool(state.get("risk_halt")),"today_utc":daily_key(),"daily_stats":stats,
             "equity_sek":round(equity_from_prices(prices),2),
