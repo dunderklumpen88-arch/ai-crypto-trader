@@ -8,11 +8,12 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from worker import analyze_advanced
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "12.6.0-net-profit-trailing-exit"
+APP_VERSION = "13.0.0-advanced-paper-engine"
 MODE = "PAPER ONLY"
 # Coinbase EUR spot pairs. Keep this list to products that have returned valid ticker data.
 SYMBOLS = [
@@ -361,6 +362,9 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     volumes = [c["volume"] for c in candles]
     vol_ratio = (volumes[-1] / (sum(volumes[-20:])/len(volumes[-20:]))) if len(volumes)>=20 and sum(volumes[-20:])>0 else 1.0
 
+    # Additional independent confirmation: Bollinger position, stochastic momentum,
+    # ATR-normalized movement and a simple directional-strength estimate.
+    advanced = analyze_advanced(candles, fx=fx, current_price_sek=price_sek)
     score, reasons = 0, []
     if len(closes) >= 50:
         if e9[-1] > e21[-1] > e50[-1]: score += 2; reasons.append("EMA9>EMA21>EMA50: upptrend")
@@ -379,6 +383,9 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     elif momentum < -0.25: score -= 1; reasons.append("Negativ kortsiktig momentum")
     if vol_ratio > 1.2 and momentum > 0: score += 1; reasons.append("Volym över snitt och positiv rörelse")
     if vol > 2.5: score = int(score/2); reasons.append("Mycket hög volatilitet: reducerad poäng")
+    advanced_score = int(advanced.get("score_adjustment", 0))
+    score += max(-2, min(2, advanced_score))
+    reasons.extend(advanced.get("reasons", []))
     samples = len(candles)
     quality = "HIGH" if samples >= 100 else ("MEDIUM" if samples >= 50 else "LOW")
     # Require enough real candles, trend alignment and multi-indicator confirmation.
@@ -404,6 +411,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                 "macd_sek": round(macd,6), "macd_signal_sek": round(macd_sig,6),
                 "momentum_pct": round(momentum,4), "volatility_pct": round(vol,4),
                 "volume_ratio": round(vol_ratio,3), "samples": samples,
+                "advanced": advanced.get("indicators", {}),
                 "candle_interval_minutes": 5, "data_quality": quality},
             "reason": "; ".join(reasons), "not_financial_advice": True}
 
@@ -823,7 +831,7 @@ def market():
 @app.get("/api/scan")
 def signals():
     return {"signals":make_signals(),"updated_at":now_iso(),"mode":MODE,
-            "strategy":"5m OHLCV EMA9/21/50 + RSI14 + MACD + momentum + volume gate + bearish sell confirmation",
+            "strategy":"5m OHLCV EMA9/21/50 + RSI14 + MACD + momentum + volume gate + Bollinger + stochastic + ATR/directional confirmation + net-fee exits",
             "symbols_configured":SYMBOLS,
             "auto_paper_on_start":AUTO_PAPER_ON_START,
             "note":"Signaler är heuristiska, inte garanterade prognoser. Inga riktiga order skickas."}
@@ -1030,7 +1038,7 @@ def trader_intelligence_status():
     return {"enabled": enabled, "mode": MODE, "real_orders_enabled": False,
             "status": "disabled_safe_default" if not enabled else "adapter_required",
             "influences_trades": False,
-            "message": "Offentlig traderdata påverkar inte beslut förrän en dokumenterad källa, verifierad historik och adapter har testats."}
+            "message": "Ingen offentlig traderdata används. Den lokala analysmotorn kombinerar tekniska indikatorer; externa AI-signaler kräver separat verifierad integration."}
 
 
 @app.post("/api/safety/disable-real-orders")
