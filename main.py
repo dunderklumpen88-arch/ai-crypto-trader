@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "12.4.0-hard-buy-cap-100"
+APP_VERSION = "12.5.0-hard-buy-position-duplicate-cap"
 MODE = "PAPER ONLY"
 # Coinbase EUR spot pairs. Keep this list to products that have returned valid ticker data.
 SYMBOLS = [
@@ -24,6 +24,10 @@ START_BALANCE_SEK = float(os.getenv("PAPER_START_BALANCE_SEK", "1000"))
 FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.005"))
 # Hard cap on the total cash spent per BUY, including simulated fee.
 MAX_TRADE_SEK = 100.0
+# Maximum total exposure per coin in PAPER mode, including purchase fee.
+MAX_POSITION_SEK = 100.0
+# Ignore rapid repeated automatic buys of the same coin (duplicate signal protection).
+DUPLICATE_BUY_WINDOW_SECONDS = 15.0
 MAX_TOTAL_LOSS_SEK = max(1.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "500")))
 MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "4")))
 MAX_DAILY_LOSS_SEK = max(0.0, float(os.getenv("MAX_DAILY_LOSS_SEK", "500")))
@@ -477,9 +481,33 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False):
         h = state["holdings"].setdefault(symbol, {"quantity":0.0,"cost_basis_sek":0.0,"lots":[]})
         balance = num(state["balance_sek"])
         fee_rate = clamp(num(state.get("fee_rate"),FEE_RATE),0,0.02)
-        # Keep principal + fee at or below 100 SEK. This also protects requests for exactly 100 SEK.
         if side == "buy":
-            amount_sek = min(amount_sek, MAX_TRADE_SEK / (1.0 + fee_rate))
+            # Normalize principal so principal + fee can never exceed the hard order cap.
+            amount_sek = min(float(amount_sek), MAX_TRADE_SEK / (1.0 + fee_rate))
+            # Duplicate guard: the same symbol cannot be automatically bought twice in a
+            # short interval, even if the signal worker submits it more than once.
+            if automatic:
+                now_dt = datetime.now(timezone.utc)
+                for previous in reversed(state.get("trades", [])):
+                    if (previous.get("side") != "buy" or previous.get("symbol") != symbol
+                            or not previous.get("automatic")):
+                        continue
+                    try:
+                        previous_dt = datetime.fromisoformat(str(previous.get("time", "")).replace("Z", "+00:00"))
+                        if previous_dt.tzinfo is None:
+                            previous_dt = previous_dt.replace(tzinfo=timezone.utc)
+                        age = (now_dt - previous_dt).total_seconds()
+                        if 0 <= age < DUPLICATE_BUY_WINDOW_SECONDS:
+                            raise HTTPException(409, f"Dubbelskydd: automatiskt köp av {symbol} nyligen registrerat.")
+                    except ValueError:
+                        continue
+                    # Trades are newest-last, so older entries cannot be inside the window.
+                    if age >= DUPLICATE_BUY_WINDOW_SECONDS:
+                        break
+            # Cap total per-coin exposure as well as each individual order.
+            current_value = num(h.get("quantity")) * price
+            if current_value + amount_sek * (1.0 + fee_rate) > MAX_POSITION_SEK + 1e-8:
+                raise HTTPException(409, f"Positionsgränsen för {symbol} är {MAX_POSITION_SEK:.0f} kr inklusive köpavgift.")
         ts, tid = now_iso(), str(uuid.uuid4())
         stats = get_daily_stats(prices)
         current_equity = equity_from_prices(prices)
@@ -733,7 +761,8 @@ def root_head():
 def health():
     return {"status":"online","version":APP_VERSION,"mode":MODE,"real_orders_enabled":False,
             "auto_enabled":bool(state["auto_enabled"]),"state_file":STATE_FILE,
-            "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
+            "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,
+            "duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
             "local_state_exists":os.path.exists(STATE_FILE),"database":db_info,
             "market_cache_available":bool(market_cache["prices"]),
             "market_source_errors":market_cache.get("source_errors",{}),
@@ -789,6 +818,7 @@ def paper_status():
             "equity_sek":round(num(state["balance_sek"])+sum(h["market_value_sek"] for h in holdings.values()),8),
             "fee_rate":state["fee_rate"],"auto_enabled":bool(state["auto_enabled"]),
             "risk_halt":bool(state.get("risk_halt")),"max_trade_sek":MAX_TRADE_SEK,
+            "max_position_sek":MAX_POSITION_SEK,"duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,
             "purchase_amount_cap":True,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
             "risk_baseline_equity_sek":num(state.get("risk_baseline_equity_sek"),START_BALANCE_SEK)}
 
@@ -806,7 +836,8 @@ def paper_history(limit:int=Query(default=100,ge=1,le=1000)):
 @app.get("/api/auto/status")
 def auto_status():
     return {"enabled":bool(state["auto_enabled"]),"mode":MODE,"real_orders_enabled":False,
-            "interval_seconds":AUTO_INTERVAL_SECONDS,"max_trade_sek":None,"max_position_sek":None,
+            "interval_seconds":AUTO_INTERVAL_SECONDS,"max_position_sek":MAX_POSITION_SEK,
+            "duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,
             "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_daily_trades":MAX_DAILY_TRADES,"max_daily_loss_sek":MAX_DAILY_LOSS_SEK,
             "max_total_loss_sek":MAX_TOTAL_LOSS_SEK,"risk_halt":bool(state.get("risk_halt")),
             "min_confidence":MIN_CONFIDENCE,"last_run":state.get("last_auto_run"),
@@ -936,7 +967,7 @@ def risk_status():
     with lock:
         stats=get_daily_stats(prices)
         return {"mode":MODE,"real_orders_enabled":False,"auto_enabled":bool(state["auto_enabled"]),
-            "limits":{"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":None,"purchase_amount_cap":True,"max_daily_trades":MAX_DAILY_TRADES,
+            "limits":{"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,"duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,"purchase_amount_cap":True,"max_daily_trades":MAX_DAILY_TRADES,
             "max_daily_loss_sek":MAX_DAILY_LOSS_SEK,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
             "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,"min_confidence":MIN_CONFIDENCE},
             "risk_baseline_equity_sek":num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK),
