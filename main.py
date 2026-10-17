@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "15.3.0-paper-confidence-60"
+APP_VERSION = "15.4.0-paper-more-buy-signals"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -41,7 +41,7 @@ STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "6"))
 TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "3"))
 TRAILING_DRAWDOWN_PCT = float(os.getenv("TRAILING_DRAWDOWN_PCT", "2"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "60"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "50"))
 RISK_PER_TRADE_PCT = min(2.0, max(0.1, float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))))
 BACKTEST_SLIPPAGE_BPS = max(0.0, float(os.getenv("BACKTEST_SLIPPAGE_BPS", "10")))
 NEWS_BLACKOUT_MINUTES = max(0, int(os.getenv("NEWS_BLACKOUT_MINUTES", "15")))
@@ -530,23 +530,36 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     elif vol_ratio < 0.50:
         reasons.append("Låg volym: svag bekräftelse")
 
-    # A BUY needs a trend, positive momentum, positive MACD histogram, reasonable
-    # RSI, non-thin volume, sufficient history, and no chase far above EMA21.
+    # More permissive PAPER strategy: more candidates, while retaining momentum,
+    # liquidity, volatility, and position/risk caps. Confidence is heuristic, not
+    # a probability of profit. Test this version in PAPER before any live use.
+    early_reversal = (
+        samples >= 60
+        and e21[-1] > e50[-1]
+        and e50_slope_pct > -0.15
+        and momentum > 0.0
+        and histogram_up
+    )
+    stoch_ok = stoch_trigger or (20.0 <= stoch_now <= 82.0 and momentum >= 0.0)
+    trend_ok = long_trend_up or trend_up or early_reversal
     buy_gates = {
-        "tillräcklig historik": samples >= 100,
-        "lång trend eller positiv kort trend": (long_trend_up or trend_up),
-        "stochastic-trigger": stoch_trigger,
-        "bekräftad upptrend eller positiv trendvändning": (trend_up or (long_trend_up and momentum >= 0.0 and histogram_up)),
-        "MACD-histogram positivt": histogram_up,
-        "RSI mellan 45 och 70": 45 <= rsi_v <= 70,
-        "momentum positivt": momentum >= 0.0,
-        "volym tillräcklig": vol_ratio >= 0.60,
-        "breakout har volymbekräftelse": (not breakout) or breakout_volume_confirmed,
-        "inte för långt över EMA21": price_above_ema21_pct <= 2.5,
-        "volatilitet rimlig": volatility <= 3.5,
-        "15m-trend inte bearish": trend_15m != "DOWN",
-        "1h-trend inte bearish": trend_1h != "DOWN",
-        "ingen översträckning i stochastic": stoch_now <= 92,
+        "tillräcklig historik": samples >= 60,
+        "trend eller tidig trendvändning": trend_ok,
+        "stochastic eller positiv momentum": stoch_ok,
+        "bekräftelse med MACD": histogram_up,
+        "RSI inom utökat intervall": 40 <= rsi_v <= 75,
+        "momentum inte kraftigt negativt": momentum >= -0.10,
+        "volym tillräcklig": vol_ratio >= 0.35,
+        "breakout har rimlig volym": (not breakout) or vol_ratio >= 0.50,
+        "inte för långt över EMA21": price_above_ema21_pct <= 4.0,
+        "volatilitet rimlig": volatility <= 5.0,
+        "15m-trend eller momentumvändning": (
+            trend_15m != "DOWN" or (histogram_up and momentum > 0.15)
+        ),
+        "1h-trend eller lång trend": (
+            trend_1h != "DOWN" or (long_trend_up and momentum > 0.0)
+        ),
+        "ingen extrem översträckning i stochastic": stoch_now <= 95,
     }
     buy_ok = all(buy_gates.values())
 
