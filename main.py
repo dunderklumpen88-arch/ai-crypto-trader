@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "13.1.0-paper-data-safety"
+APP_VERSION = "13.2.0-confirmed-momentum"
 MODE = "PAPER ONLY"
 # Coinbase EUR spot pairs. Keep this list to products that have returned valid ticker data.
 SYMBOLS = [
@@ -335,7 +335,9 @@ def get_candles(symbol: str, force=False) -> list[dict[str, float]]:
             if not isinstance(row, list) or len(row) < 6:
                 continue
             t, low, high, opn, close, volume = map(num, row[:6])
-            if min(opn, close, low, high) > 0 and high >= low:
+            # Only analyze fully closed 5-minute candles. Coinbase candle timestamps
+            # mark interval start; the current interval is excluded to avoid noisy signals.
+            if min(opn, close, low, high) > 0 and high >= low and t + CANDLE_GRANULARITY <= int(time.time()):
                 candles.append({"time": t, "open": opn, "high": high, "low": low,
                                 "close": close, "volume": max(0.0, volume)})
         candles.sort(key=lambda x: x["time"])
@@ -378,77 +380,138 @@ def rsi(values: list[float], period=14) -> float:
 
 
 def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
+    """Conservative signal model: confirmed trend + momentum + liquidity filters. Signals are computed from closed OHLCV candles. Confidence is a heuristic score, not a calibrated probability of profit. KÖP requires every primary gate below. """
     candles = get_candles(symbol)
-    fx = num(market_cache["eur_sek"], 11.2)
-    closes_eur = [c["close"] for c in candles]
-    closes = [x * fx for x in closes_eur]
-    if not closes or abs(closes[-1] - price_sek) > price_sek * 0.03:
-        closes.append(price_sek)
-    e9, e21, e50 = ema(closes, 9), ema(closes, 21), ema(closes, 50)
-    last = closes[-1]
-    rsi_v = rsi(closes)
-    macd_line = [a-b for a,b in zip(ema(closes,12), ema(closes,26))]
-    signal_line = ema(macd_line,9)
-    macd = macd_line[-1] if macd_line else 0
-    macd_sig = signal_line[-1] if signal_line else 0
-    momentum = ((last/closes[-4])-1)*100 if len(closes) >= 4 and closes[-4] else 0
-    returns = [(closes[i]/closes[i-1]-1)*100 for i in range(1,len(closes)) if closes[i-1] > 0]
-    recent_returns = returns[-20:]
-    vol = (sum((x-sum(recent_returns)/len(recent_returns))**2 for x in recent_returns)/max(1,len(recent_returns)-1))**0.5 if len(recent_returns)>1 else 0
-    volumes = [c["volume"] for c in candles]
-    vol_ratio = (volumes[-1] / (sum(volumes[-20:])/len(volumes[-20:]))) if len(volumes)>=20 and sum(volumes[-20:])>0 else 1.0
+    fx = num(market_cache.get("eur_sek"), 11.2)
+    valid_candles = []
+    for c in candles:
+        try:
+            close = num(c.get("close"))
+            volume = max(0.0, num(c.get("volume")))
+            if close > 0:
+                valid_candles.append({**c, "close": close, "volume": volume})
+        except Exception:
+            continue
 
-    # Additional independent confirmation: Bollinger position, stochastic momentum,
-    # ATR-normalized movement and a simple directional-strength estimate.
-    advanced = analyze_advanced(candles, fx=fx, current_price_sek=price_sek)
-    score, reasons = 0, []
-    if len(closes) >= 50:
-        if e9[-1] > e21[-1] > e50[-1]: score += 2; reasons.append("EMA9>EMA21>EMA50: upptrend")
-        elif e9[-1] < e21[-1] < e50[-1]: score -= 2; reasons.append("EMA9<EMA21<EMA50: nedtrend")
-        elif e9[-1] > e21[-1]: score += 1; reasons.append("EMA9 över EMA21")
-        elif e9[-1] < e21[-1]: score -= 1; reasons.append("EMA9 under EMA21")
+    closes = [c["close"] * fx for c in valid_candles]
+    samples = len(closes)
+    if samples < 2:
+        return {"symbol": symbol, "product": PRODUCTS[symbol], "price_sek": round(price_sek, 10),
+                "signal": "AVVAKTA", "confidence": 35, "score": 0,
+                "indicators": {"samples": samples, "data_quality": "LOW", "candle_interval_minutes": 5},
+                "reason": "Otillräcklig giltig candle-data; ingen handelssignal", "not_financial_advice": True}
+
+    # Do not append the live ticker to the candle series: that would mix an unfinished
+    # price observation into indicators based on closed 5-minute candles.
+    e9, e21, e50 = ema(closes, 9), ema(closes, 21), ema(closes, 50)
+    last_close = closes[-1]
+    rsi_v = rsi(closes)
+    macd_line = [a-b for a, b in zip(ema(closes, 12), ema(closes, 26))]
+    macd_signal = ema(macd_line, 9)
+    macd = macd_line[-1] if macd_line else 0.0
+    macd_sig = macd_signal[-1] if macd_signal else 0.0
+    macd_hist = macd - macd_sig
+    momentum = ((last_close / closes[-4]) - 1) * 100 if samples >= 4 and closes[-4] else 0.0
+    returns = [(closes[i] / closes[i-1] - 1) * 100 for i in range(1, samples) if closes[i-1] > 0]
+    recent_returns = returns[-20:]
+    avg_ret = sum(recent_returns) / len(recent_returns) if recent_returns else 0.0
+    volatility = (sum((x-avg_ret)**2 for x in recent_returns) / max(1, len(recent_returns)-1))**0.5 if len(recent_returns) > 1 else 0.0
+    volumes = [c["volume"] for c in valid_candles]
+    avg_vol = sum(volumes[-20:]) / len(volumes[-20:]) if len(volumes) >= 20 else 0.0
+    vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0.0
+
+    advanced = analyze_advanced(valid_candles, fx=fx, current_price_sek=last_close)
+    adv = advanced.get("indicators", {})
+    e50_slope_pct = ((e50[-1] / e50[-7]) - 1) * 100 if samples >= 56 and e50[-7] else 0.0
+    trend_up = samples >= 60 and e9[-1] > e21[-1] > e50[-1] and e50_slope_pct > 0
+    trend_down = samples >= 60 and e9[-1] < e21[-1] < e50[-1] and e50_slope_pct < 0
+    price_above_ema21_pct = ((last_close / e21[-1]) - 1) * 100 if e21[-1] else 0.0
+    histogram_up = macd_hist > 0
+    histogram_down = macd_hist < 0
+    data_quality = "HIGH" if samples >= 200 else ("MEDIUM" if samples >= 100 else "LOW")
+
+    # Transparent score is descriptive only. Signal generation uses explicit gates,
+    # not the score alone; correlated indicators do not count as proof of profitability.
+    score = 0
+    reasons = []
+    if trend_up:
+        score += 2; reasons.append("Trendfilter: EMA9>EMA21>EMA50 och EMA50 lutar uppåt")
+    elif trend_down:
+        score -= 2; reasons.append("Trendfilter: EMA9<EMA21<EMA50 och EMA50 lutar nedåt")
     else:
-        reasons.append("Färre än 50 stängningspriser")
-    if macd > macd_sig: score += 1; reasons.append("MACD över signallinje")
-    elif macd < macd_sig: score -= 1; reasons.append("MACD under signallinje")
-    if 52 <= rsi_v <= 68: score += 1; reasons.append("RSI positiv utan tydlig överköpthet")
-    elif 32 <= rsi_v < 45: score -= 1; reasons.append("RSI svag")
-    elif rsi_v > 75: score -= 1; reasons.append("RSI överköpt")
-    elif rsi_v < 25: reasons.append("RSI kraftigt översåld; invänta bekräftelse")
-    if momentum > 0.25: score += 1; reasons.append("Positiv kortsiktig momentum")
-    elif momentum < -0.25: score -= 1; reasons.append("Negativ kortsiktig momentum")
-    if vol_ratio > 1.2 and momentum > 0: score += 1; reasons.append("Volym över snitt och positiv rörelse")
-    if vol > 2.5: score = int(score/2); reasons.append("Mycket hög volatilitet: reducerad poäng")
-    advanced_score = int(advanced.get("score_adjustment", 0))
-    score += max(-2, min(2, advanced_score))
-    reasons.extend(advanced.get("reasons", []))
-    samples = len(candles)
-    quality = "HIGH" if samples >= 100 else ("MEDIUM" if samples >= 50 else "LOW")
-    # Require enough real candles, trend alignment and multi-indicator confirmation.
-    # Avoid false confidence when the current candle volume is tiny versus its recent baseline.
-    low_volume = samples >= 20 and vol_ratio < 0.20
-    if samples >= 50 and score >= 4 and rsi_v < 73 and vol <= 2.5 and not low_volume:
+        reasons.append("Ingen bekräftad trend i EMA-strukturen")
+    if histogram_up:
+        score += 1; reasons.append("MACD-histogram positivt")
+    elif histogram_down:
+        score -= 1; reasons.append("MACD-histogram negativt")
+    if 50 <= rsi_v <= 67:
+        score += 1; reasons.append("RSI stöder uppgång utan tydlig överköpthet")
+    elif rsi_v < 45:
+        score -= 1; reasons.append("RSI visar svagt momentum")
+    elif rsi_v > 72:
+        reasons.append("RSI högt: risk att köpa efter en utsträckt rörelse")
+    if momentum > 0.10:
+        score += 1; reasons.append("Positiv 15-minutersmomentum")
+    elif momentum < -0.20:
+        score -= 1; reasons.append("Negativ 15-minutersmomentum")
+    if vol_ratio >= 0.80 and momentum > 0:
+        score += 1; reasons.append("Volym bekräftar positiv rörelse")
+    elif vol_ratio < 0.50:
+        reasons.append("Låg volym: svag bekräftelse")
+
+    # A BUY needs a trend, positive momentum, positive MACD histogram, reasonable
+    # RSI, non-thin volume, sufficient history, and no chase far above EMA21.
+    buy_gates = {
+        "tillräcklig historik": samples >= 100,
+        "bekräftad upptrend": trend_up,
+        "MACD-histogram positivt": histogram_up,
+        "RSI mellan 50 och 67": 50 <= rsi_v <= 67,
+        "momentum positivt": momentum >= 0.10,
+        "volym tillräcklig": vol_ratio >= 0.50,
+        "inte för långt över EMA21": price_above_ema21_pct <= 1.8,
+        "volatilitet rimlig": volatility <= 2.5,
+        "ingen översträckning i stochastic": (adv.get("stochastic_k") is None or adv.get("stochastic_k") <= 92),
+    }
+    buy_ok = all(buy_gates.values())
+
+    # SELL is a confirmed bearish signal, not a prediction that price must fall.
+    sell_gates = {
+        "tillräcklig historik": samples >= 100,
+        "bekräftad nedtrend": trend_down,
+        "MACD-histogram negativt": histogram_down,
+        "RSI svagt": rsi_v < 48,
+        "momentum negativt": momentum <= -0.20,
+        "volym inte extremt låg": vol_ratio >= 0.20,
+    }
+    sell_ok = all(sell_gates.values())
+
+    if buy_ok:
         signal = "KÖP"
-    elif (samples >= 50 and score <= -4 and e9[-1] < e21[-1] < e50[-1]
-          and macd < macd_sig and momentum < -0.25 and not low_volume):
+        confirmations = sum([trend_up, histogram_up, 50 <= rsi_v <= 67, momentum >= 0.10, vol_ratio >= 0.80])
+        confidence = min(79, 68 + confirmations * 2)
+        reasons.append("KÖP godkänd: samtliga grundfilter uppfyllda; detta är ingen vinstgaranti")
+    elif sell_ok:
         signal = "SÄLJ"
+        confirmations = sum([trend_down, histogram_down, rsi_v < 48, momentum <= -0.20, vol_ratio >= 0.50])
+        confidence = min(82, 70 + confirmations * 2)
+        reasons.append("SÄLJ bekräftad av flera filter")
     else:
         signal = "AVVAKTA"
-    if low_volume:
-        reasons.append("Volymen är för låg jämfört med snittet; signal blockerad")
-    confidence = int(clamp(50 + abs(score)*6 + (8 if quality == "HIGH" else 3 if quality == "MEDIUM" else -8), 35, 88))
-    if signal == "AVVAKTA": confidence = min(confidence, 60 if low_volume else 64)
-    if samples < 50:
-        confidence = min(confidence, 45)
+        confidence = min(69, 48 + min(5, abs(score)) * 3)
+        failed = [name for name, passed in buy_gates.items() if not passed]
+        reasons.append("KÖP spärrad: " + ", ".join(failed[:5]))
+
     return {"symbol": symbol, "product": PRODUCTS[symbol], "price_sek": round(price_sek, 10),
-            "signal": signal, "confidence": confidence, "score": score,
-            "indicators": {"ema9_sek": round(e9[-1],6), "ema21_sek": round(e21[-1],6),
-                "ema50_sek": round(e50[-1],6), "rsi14": round(rsi_v,2),
-                "macd_sek": round(macd,6), "macd_signal_sek": round(macd_sig,6),
-                "momentum_pct": round(momentum,4), "volatility_pct": round(vol,4),
-                "volume_ratio": round(vol_ratio,3), "samples": samples,
-                "advanced": advanced.get("indicators", {}),
-                "candle_interval_minutes": 5, "data_quality": quality},
+            "signal": signal, "confidence": int(confidence), "score": int(score),
+            "indicators": {"ema9_sek": round(e9[-1], 8), "ema21_sek": round(e21[-1], 8),
+                "ema50_sek": round(e50[-1], 8), "ema50_slope_pct": round(e50_slope_pct, 4),
+                "price_above_ema21_pct": round(price_above_ema21_pct, 4),
+                "rsi14": round(rsi_v, 2), "macd_sek": round(macd, 8),
+                "macd_signal_sek": round(macd_sig, 8), "macd_histogram_sek": round(macd_hist, 8),
+                "momentum_pct": round(momentum, 4), "volatility_pct": round(volatility, 4),
+                "volume_ratio": round(vol_ratio, 3), "samples": samples,
+                "advanced": adv, "buy_gates": buy_gates, "sell_gates": sell_gates,
+                "candle_interval_minutes": 5, "data_quality": data_quality},
             "reason": "; ".join(reasons), "not_financial_advice": True}
 
 
@@ -871,7 +934,7 @@ def signals():
     signals = make_signals()
     returned = {item.get("symbol") for item in signals}
     return {"signals":signals,"updated_at":now_iso(),"mode":MODE,
-            "strategy":"5m OHLCV EMA9/21/50 + RSI14 + MACD + momentum + volume gate + Bollinger + stochastic + ATR/directional confirmation + net-fee exits",
+            "strategy":"13.2: closed 5m candles, EMA trend slope, MACD histogram, RSI, momentum, volume/extension gates + net-fee exits",
             "symbols_configured":SYMBOLS,
             "symbols_returned":sorted(returned),
             "symbols_missing":sorted(set(SYMBOLS) - returned),
