@@ -13,21 +13,28 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "15.1.0-paper-diagnostics-integration-ready"
+APP_VERSION = "15.2.0-paper-expanded-universe-adaptive-entry"
 MODE = "PAPER ONLY"
-# Coinbase EUR spot pairs. Keep this list to products that have returned valid ticker data.
+
+# Utökat urval av kryptovalutor med EUR-par på Coinbase.
+# Produkter som saknar tillgängliga marknadsdata hoppas över av skanningen.
 SYMBOLS = [
-    "BTC", "ETH", "SOL", "XRP", "SHIB", "ADA", "DOGE", "LINK", "AVAX",
-    "DOT", "LTC", "BCH", "ATOM", "UNI", "AAVE", "XLM", "ETC", "FIL"
+    "BTC", "ETH", "SOL", "XRP", "SHIB", "ADA", "DOGE", "LINK",
+    "AVAX", "DOT", "LTC", "BCH", "ATOM", "UNI", "AAVE", "XLM",
+    "ETC", "FIL", "HBAR", "NEAR", "ICP", "ALGO", "VET", "CRO",
+    "TRX", "QNT", "XTZ", "EOS", "MKR", "COMP", "CRV", "GRT",
+    "LDO", "POL", "OP", "ARB", "INJ", "SEI", "TIA", "EGLD",
+    "FLOW", "IMX", "AXS", "CHZ", "SAND", "MANA", "PEPE",
+    "BONK", "FLOKI", "WIF", "FET", "RENDER", "ENA", "JUP", "PYTH"
 ]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
+
 START_BALANCE_SEK = float(os.getenv("PAPER_START_BALANCE_SEK", "1000"))
 FEE_RATE = float(os.getenv("PAPER_FEE_RATE", "0.005"))
-# Hard cap on the total cash spent per BUY, including simulated fee.
+
+# Säkerhetsgränser i PAPER-läget.
 MAX_TRADE_SEK = 100.0
-# Maximum total exposure per coin in PAPER mode, including purchase fee.
 MAX_POSITION_SEK = 100.0
-# Ignore rapid repeated automatic buys of the same coin (duplicate signal protection).
 DUPLICATE_BUY_WINDOW_SECONDS = 15.0
 MAX_TOTAL_LOSS_SEK = max(1.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "500")))
 MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "4")))
@@ -36,16 +43,17 @@ STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "6"))
 TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "3"))
 TRAILING_DRAWDOWN_PCT = float(os.getenv("TRAILING_DRAWDOWN_PCT", "2"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "65"))
 RISK_PER_TRADE_PCT = min(2.0, max(0.1, float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))))
 BACKTEST_SLIPPAGE_BPS = max(0.0, float(os.getenv("BACKTEST_SLIPPAGE_BPS", "10")))
 NEWS_BLACKOUT_MINUTES = max(0, int(os.getenv("NEWS_BLACKOUT_MINUTES", "15")))
 AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
-# Safety: always start with automation disabled; enable manually from the dashboard.
+
+# Automatiken startar alltid avstängd efter omstart.
 AUTO_PAPER_ON_START = False
 HTTP_TIMEOUT = 10
 CACHE_TTL = 20
-CANDLE_GRANULARITY = 300  # 5-minute candles
+CANDLE_GRANULARITY = 300
 CANDLE_LIMIT = 300
 STATE_FILE = os.getenv("PAPER_STATE_FILE", "/tmp/ai_trader_paper_state.json")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -61,16 +69,39 @@ http = requests.Session()
 http.headers.update({"User-Agent": f"ai-crypto-paper/{APP_VERSION}"})
 
 state: dict[str, Any] = {
-    "mode": MODE, "real_orders_enabled": False, "auto_enabled": False,
-    "balance_sek": START_BALANCE_SEK, "fee_rate": FEE_RATE, "holdings": {},
-    "risk_baseline_equity_sek": START_BALANCE_SEK, "risk_halt": False,
-    "trades": [], "tax_events": [], "risk_events": [], "daily_stats": {},
-    "equity_history": [], "last_auto_run": None, "last_error": None,
+    "mode": MODE,
+    "real_orders_enabled": False,
+    "auto_enabled": False,
+    "balance_sek": START_BALANCE_SEK,
+    "fee_rate": FEE_RATE,
+    "holdings": {},
+    "risk_baseline_equity_sek": START_BALANCE_SEK,
+    "risk_halt": False,
+    "trades": [],
+    "tax_events": [],
+    "risk_events": [],
+    "daily_stats": {},
+    "equity_history": [],
+    "last_auto_run": None,
+    "last_error": None,
     "created_at": datetime.now(timezone.utc).isoformat()
 }
-market_cache: dict[str, Any] = {"at": 0.0, "prices": {}, "valuation_prices": {}, "eur_sek": 11.2, "source_errors": {}, "valid_products": []}
+
+market_cache: dict[str, Any] = {
+    "at": 0.0,
+    "prices": {},
+    "valuation_prices": {},
+    "eur_sek": 11.2,
+    "source_errors": {},
+    "valid_products": []
+}
 candle_cache: dict[str, dict[str, Any]] = {}
-db_info = {"configured": bool(DATABASE_URL), "available": False, "error": None, "backend": "local_json_file"}
+db_info = {
+    "configured": bool(DATABASE_URL),
+    "available": False,
+    "error": None,
+    "backend": "local_json_file"
+}
 
 
 class OrderRequest(BaseModel):
@@ -96,7 +127,7 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 
 def http_get_json(url: str, params=None):
-    """GET JSON with bounded retries for temporary rate limits and server failures."""
+    """GET JSON med begränsade återförsök vid tillfälliga API-fel."""
     last_error = None
     for attempt in range(3):
         try:
@@ -112,7 +143,9 @@ def http_get_json(url: str, params=None):
         except requests.RequestException as exc:
             last_error = exc
             status = getattr(getattr(exc, "response", None), "status_code", None)
-            retryable = status == 429 or (status is not None and 500 <= status < 600) or status is None
+            retryable = status == 429 or (
+                status is not None and 500 <= status < 600
+            ) or status is None
             if attempt < 2 and retryable:
                 time.sleep(0.5 * (2 ** attempt))
                 continue
@@ -126,19 +159,29 @@ def _clean_state(saved: dict[str, Any]) -> None:
     for key in list(state):
         if key in saved:
             state[key] = saved[key]
+
     state["mode"] = MODE
     state["real_orders_enabled"] = False
-    state["auto_enabled"] = False  # Never resume automated trading automatically after restore/restart.
+    state["auto_enabled"] = False
+
     for key in ("holdings", "daily_stats"):
         if not isinstance(state.get(key), dict):
             state[key] = {}
+
     for key in ("trades", "tax_events", "risk_events", "equity_history"):
         if not isinstance(state.get(key), list):
             state[key] = []
-    state["balance_sek"] = max(0.0, num(state.get("balance_sek"), START_BALANCE_SEK))
-    state["risk_baseline_equity_sek"] = max(0.0, num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK))
+
+    state["balance_sek"] = max(
+        0.0, num(state.get("balance_sek"), START_BALANCE_SEK)
+    )
+    state["risk_baseline_equity_sek"] = max(
+        0.0,
+        num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK)
+    )
     state["risk_halt"] = bool(state.get("risk_halt", False))
     state["fee_rate"] = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
+
     for sym, h in list(state["holdings"].items()):
         if not isinstance(h, dict):
             state["holdings"].pop(sym, None)
@@ -147,8 +190,12 @@ def _clean_state(saved: dict[str, Any]) -> None:
         h["cost_basis_sek"] = max(0.0, num(h.get("cost_basis_sek")))
         if not isinstance(h.get("lots"), list):
             h["lots"] = []
-        h["lots"] = [lot for lot in h["lots"] if isinstance(lot, dict)
-                     and num(lot.get("quantity")) > 0 and num(lot.get("unit_cost_sek")) >= 0]
+        h["lots"] = [
+            lot for lot in h["lots"]
+            if isinstance(lot, dict)
+            and num(lot.get("quantity")) > 0
+            and num(lot.get("unit_cost_sek")) >= 0
+        ]
 
 
 def _db_connect():
@@ -162,45 +209,80 @@ def _db_connect():
             import psycopg2
             return psycopg2.connect(DATABASE_URL, connect_timeout=5)
         except ImportError as e:
-            raise RuntimeError("Installera psycopg[binary] eller psycopg2-binary") from e
+            raise RuntimeError(
+                "Installera psycopg[binary] eller psycopg2-binary"
+            ) from e
 
 
 def _db_init():
     conn = _db_connect()
     try:
         with conn.cursor() as cur:
-            cur.execute("""CREATE TABLE IF NOT EXISTS paper_trader_state ( id INTEGER PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )""")
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS paper_trader_state (
+                    id INTEGER PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )"""
+            )
         conn.commit()
     finally:
         conn.close()
 
 
 def persist() -> bool:
-    """Persist state to PostgreSQL when configured; always keep a local recovery copy."""
+    """Spara till PostgreSQL om möjligt och behåll en lokal reservkopia."""
     global db_info
     ok = False
-    snapshot = json.dumps(state, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    snapshot = json.dumps(
+        state, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    )
+
     if DATABASE_URL:
         try:
             conn = _db_connect()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("""CREATE TABLE IF NOT EXISTS paper_trader_state ( id INTEGER PRIMARY KEY, payload JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW() )""")
-                    cur.execute("""INSERT INTO paper_trader_state (id,payload,updated_at) VALUES (1,%s::jsonb,NOW()) ON CONFLICT (id) DO UPDATE SET payload=EXCLUDED.payload, updated_at=NOW()""", (snapshot,))
+                    cur.execute(
+                        """CREATE TABLE IF NOT EXISTS paper_trader_state (
+                            id INTEGER PRIMARY KEY,
+                            payload JSONB NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )"""
+                    )
+                    cur.execute(
+                        """INSERT INTO paper_trader_state
+                           (id,payload,updated_at)
+                           VALUES (1,%s::jsonb,NOW())
+                           ON CONFLICT (id) DO UPDATE SET
+                           payload=EXCLUDED.payload, updated_at=NOW()""",
+                        (snapshot,)
+                    )
                 conn.commit()
             finally:
                 conn.close()
-            db_info.update(available=True, error=None, backend="postgresql")
+            db_info.update(
+                available=True, error=None, backend="postgresql"
+            )
             ok = True
         except Exception as exc:
-            db_info.update(available=False, error=str(exc)[:300], backend="local_json_file")
-            log.exception("PostgreSQL save failed; attempting local file fallback")
+            db_info.update(
+                available=False,
+                error=str(exc)[:300],
+                backend="local_json_file"
+            )
+            log.exception(
+                "PostgreSQL save failed; attempting local file fallback"
+            )
+
     try:
         p = Path(STATE_FILE)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(p.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
-            f.write(snapshot); f.flush(); os.fsync(f.fileno())
+            f.write(snapshot)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, p)
         ok = True
     except Exception as exc:
@@ -217,11 +299,14 @@ def restore() -> None:
             conn = _db_connect()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT payload FROM paper_trader_state WHERE id=1")
+                    cur.execute(
+                        "SELECT payload FROM paper_trader_state WHERE id=1"
+                    )
                     row = cur.fetchone()
                 conn.commit()
             finally:
                 conn.close()
+
             if row:
                 saved = row[0]
                 if isinstance(saved, str):
@@ -229,20 +314,37 @@ def restore() -> None:
                 if isinstance(saved, dict):
                     _clean_state(saved)
                     rebuild_tax_ledger_from_trades()
-                    db_info.update(available=True, error=None, backend="postgresql")
-                    log.info("Restored state from PostgreSQL (%s trades)", len(state["trades"]))
+                    db_info.update(
+                        available=True, error=None, backend="postgresql"
+                    )
+                    log.info(
+                        "Restored state from PostgreSQL (%s trades)",
+                        len(state["trades"])
+                    )
                     return
-            db_info.update(available=True, error=None, backend="postgresql")
+            db_info.update(
+                available=True, error=None, backend="postgresql"
+            )
         except Exception as exc:
-            db_info.update(available=False, error=str(exc)[:300], backend="local_json_file")
-            log.exception("PostgreSQL restore failed; trying local state file")
+            db_info.update(
+                available=False,
+                error=str(exc)[:300],
+                backend="local_json_file"
+            )
+            log.exception(
+                "PostgreSQL restore failed; trying local state file"
+            )
+
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             saved = json.load(f)
         if isinstance(saved, dict):
             _clean_state(saved)
             rebuild_tax_ledger_from_trades()
-            log.info("Restored local PAPER state (%s trades)", len(state["trades"]))
+            log.info(
+                "Restored local PAPER state (%s trades)",
+                len(state["trades"])
+            )
     except FileNotFoundError:
         log.info("No saved state; starting with default PAPER balance")
     except Exception:
@@ -250,14 +352,20 @@ def restore() -> None:
 
 
 def risk_event(event: str, detail: str) -> None:
-    """Record risk events, suppressing identical repeats for 10 minutes."""
+    """Logga riskhändelser och dämpa identiska upprepningar i 10 minuter."""
     events = state.setdefault("risk_events", [])
     now = datetime.now(timezone.utc)
+
     for previous in reversed(events[-100:]):
-        if previous.get("event") != event or previous.get("detail") != detail:
+        if (
+            previous.get("event") != event
+            or previous.get("detail") != detail
+        ):
             continue
         try:
-            previous_time = datetime.fromisoformat(str(previous.get("time", "")).replace("Z", "+00:00"))
+            previous_time = datetime.fromisoformat(
+                str(previous.get("time", "")).replace("Z", "+00:00")
+            )
             if previous_time.tzinfo is None:
                 previous_time = previous_time.replace(tzinfo=timezone.utc)
             if 0 <= (now - previous_time).total_seconds() < 600:
@@ -265,42 +373,67 @@ def risk_event(event: str, detail: str) -> None:
         except (TypeError, ValueError):
             pass
         break
-    events.append({"time": now.isoformat(), "event": event, "detail": detail})
+
+    events.append({
+        "time": now.isoformat(),
+        "event": event,
+        "detail": detail
+    })
     state["risk_events"] = events[-1000:]
 
 
 def get_fx(force=False) -> float:
-    if not force and time.time() - market_cache["at"] < CACHE_TTL and market_cache["eur_sek"] > 0:
+    if (
+        not force
+        and time.time() - market_cache["at"] < CACHE_TTL
+        and market_cache["eur_sek"] > 0
+    ):
         return num(market_cache["eur_sek"], 11.2)
+
     try:
-        data = http_get_json("https://api.frankfurter.app/latest", {"from": "EUR", "to": "SEK"})
+        data = http_get_json(
+            "https://api.frankfurter.app/latest",
+            {"from": "EUR", "to": "SEK"}
+        )
         rate = num(data.get("rates", {}).get("SEK"))
         if rate > 0:
             market_cache["eur_sek"] = rate
     except Exception as exc:
         market_cache["source_errors"]["EUR_SEK"] = str(exc)[:200]
+
     return num(market_cache["eur_sek"], 11.2)
 
 
 def get_prices(force=False) -> dict[str, float]:
     now = time.time()
-    if not force and market_cache["prices"] and now - market_cache["at"] < CACHE_TTL:
+    if (
+        not force
+        and market_cache["prices"]
+        and now - market_cache["at"] < CACHE_TTL
+    ):
         return dict(market_cache["prices"])
+
     fx = get_fx(force)
     fresh, errors = {}, {}
 
-    # Fetch ticker products concurrently. Sequential requests could take several
-    # minutes when several symbols time out, leaving the dashboard appearing stuck.
     def fetch_one(item):
         sym, product = item
-        ticker = http_get_json(f"https://api.exchange.coinbase.com/products/{product}/ticker")
+        ticker = http_get_json(
+            f"https://api.exchange.coinbase.com/products/{product}/ticker"
+        )
         eur = num(ticker.get("price"))
         if eur <= 0:
             raise ValueError("Ogiltigt pris")
         return sym, eur * fx
 
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="market-price") as pool:
-        futures = {pool.submit(fetch_one, item): item[0] for item in PRODUCTS.items()}
+    # Sex samtidiga anrop hjälper till när fler produkter skannas.
+    with ThreadPoolExecutor(
+        max_workers=6, thread_name_prefix="market-price"
+    ) as pool:
+        futures = {
+            pool.submit(fetch_one, item): item[0]
+            for item in PRODUCTS.items()
+        }
         for future in as_completed(futures):
             sym = futures[future]
             try:
@@ -308,47 +441,153 @@ def get_prices(force=False) -> dict[str, float]:
                 fresh[symbol] = price_sek
             except Exception as exc:
                 errors[sym] = str(exc)[:200]
+
     market_cache["source_errors"] = errors
     market_cache["valid_products"] = sorted(fresh.keys())
+
     if fresh:
-        # Keep only prices refreshed successfully in this scan. Do not silently use
-        # stale cached prices for products that failed the latest ticker request.
         market_cache["prices"] = dict(fresh)
         market_cache.setdefault("valuation_prices", {}).update(fresh)
         market_cache["at"] = time.time()
         return dict(market_cache["prices"])
-    # Do not pass stale prices to signal generation as if they were current.
-    # Last-known values remain in valuation_prices for portfolio valuation only.
-    raise HTTPException(503, "Kunde inte hämta några aktuella marknadspriser. Försök igen senare.")
+
+    raise HTTPException(
+        503,
+        "Kunde inte hämta några aktuella marknadspriser. Försök igen senare."
+    )
 
 
 def get_candles(symbol: str, force=False) -> list[dict[str, float]]:
-    """Fetch real Coinbase 5m OHLCV candles. Returned oldest-to-newest."""
+    """Hämta riktiga Coinbase-candles i femminutersintervall."""
     now = time.time()
     cached = candle_cache.get(symbol)
     if cached and not force and now - cached["at"] < 60:
         return cached["candles"]
+
     product = PRODUCTS[symbol]
     try:
-        raw = http_get_json(f"https://api.exchange.coinbase.com/products/{product}/candles",
-                            {"granularity": CANDLE_GRANULARITY})
-        # Coinbase row: [time, low, high, open, close, volume], newest first
+        raw = http_get_json(
+            f"https://api.exchange.coinbase.com/products/{product}/candles",
+            {"granularity": CANDLE_GRANULARITY}
+        )
         candles = []
         for row in raw:
             if not isinstance(row, list) or len(row) < 6:
                 continue
             t, low, high, opn, close, volume = map(num, row[:6])
-            # Only analyze fully closed 5-minute candles. Coinbase candle timestamps
-            # mark interval start; the current interval is excluded to avoid noisy signals.
-            if min(opn, close, low, high) > 0 and high >= low and t + CANDLE_GRANULARITY <= int(time.time()):
-                candles.append({"time": t, "open": opn, "high": high, "low": low,
-                                "close": close, "volume": max(0.0, volume)})
+            if (
+                min(opn, close, low, high) > 0
+                and high >= low
+                and t + CANDLE_GRANULARITY <= int(time.time())
+            ):
+                candles.append({
+                    "time": t,
+                    "open": opn,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": max(0.0, volume)
+                })
+
         candles.sort(key=lambda x: x["time"])
         if candles:
-            candle_cache[symbol] = {"at": now, "candles": candles[-CANDLE_LIMIT:]}
+            candle_cache[symbol] = {
+                "at": now,
+                "candles": candles[-CANDLE_LIMIT:]
+            }
             return candle_cache[symbol]["candles"]
+
     except Exception as exc:
         market_cache["source_errors"][f"{symbol}_candles"] = str(exc)[:200]
+
+    if cached and time.time() - cached["at"] <= 300:
+        return cached["candles"]
+    return []
+
+
+def ema(values: list[float], period: int) -> list[float]:
+    if not values:
+        return []
+    alpha = 2.0 / (period + 1)
+    out, val = [], values[0]
+    for x in values:
+        val = alpha * x + (1-alpha) * val
+        out.append(val)
+    return out
+
+
+def rsi(values: list[float], period=14) -> float:
+    if len(values) < period + 1:
+        return 50.0
+
+    changes = [values[i] - values[i-1] for i in range(1, len(values))]
+    gains = [max(0, x) for x in changes]
+    losses = [max(0, -x) for x in changes]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain*(period-1) + gains[i]) / period
+        avg_loss = (avg_loss*(period-1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain else 50.0
+    return 100 - 100 / (1 + avg_gain/avg_loss)
+
+
+def stochastic_k(
+    highs: list[float],
+    lows: list[float],
+    close: float,
+    period: int = 14
+) -> float:
+    if len(highs) < period or len(lows) < period:
+        return 50.0
+    hi, lo = max(highs[-period:]), min(lows[-period:])
+    return 100.0 * (close - lo) / (hi - lo) if hi > lo else 50.0
+
+
+def news_blackout_status(now: datetime | None = None) -> dict[str, Any]:
+    """Valfri spärr kring manuellt angivna händelsetider."""
+    now = now or datetime.now(timezone.utc)
+    raw = os.getenv("NEWS_BLACKOUT_TIMES_UTC", "").strip()
+    if not raw or NEWS_BLACKOUT_MINUTES <= 0:
+        return {
+            "active": False,
+            "reason": "no_configured_event_times",
+            "minutes": NEWS_BLACKOUT_MINUTES
+        }
+
+    for item in raw.split(","):
+        try:
+            stamp = datetime.fromisoformat(
+                item.strip().replace("Z", "+00:00")
+            )
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            delta = abs(
+                (now - stamp.astimezone(timezone.utc)).total_seconds()
+            ) / 60.0
+            if delta <= NEWS_BLACKOUT_MINUTES:
+                return {
+                    "active": True,
+                    "reason": "configured_economic_event_blackout",
+                    "event_time_utc": stamp.astimezone(timezone.utc).isoformat(),
+                    "minutes_until_or_since_event": round(
+                        (stamp.astimezone(timezone.utc)-now).total_seconds()/60.0,
+                        2
+                    ),
+                    "minutes": NEWS_BLACKOUT_MINUTES
+                }
+        except (ValueError, TypeError):
+            continue
+
+    return {
+        "active": False,
+        "reason": "outside_configured_event_windows",
+        "minutes": NEWS_BLACKOUT_MINUTES
+    }
+            market_cache["source_errors"][f"{symbol}_candles"] = str(exc)[:200]
     # Brief fallback for transient outages only; stale candles must not look current forever.
     if cached and time.time() - cached["at"] <= 300:
         return cached["candles"]
@@ -412,7 +651,7 @@ def news_blackout_status(now: datetime | None = None) -> dict[str, Any]:
 
 
 def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
-    """Conservative signal model: confirmed trend + momentum + liquidity filters. Signals are computed from closed OHLCV candles. Confidence is a heuristic score, not a calibrated probability of profit. KÖP requires every primary gate below. """
+    """Signal model using completed candles, trend, momentum and liquidity filters. Confidence is a heuristic score, not a calibrated probability of profit."""
     candles = get_candles(symbol)
     fx = num(market_cache.get("eur_sek"), 11.2)
     valid_candles = []
@@ -433,8 +672,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                 "indicators": {"samples": samples, "data_quality": "LOW", "candle_interval_minutes": 5},
                 "reason": "Otillräcklig giltig candle-data; ingen handelssignal", "not_financial_advice": True}
 
-    # Do not append the live ticker to the candle series: that would mix an unfinished
-    # price observation into indicators based on closed 5-minute candles.
+    # Use completed candles, not an unfinished live ticker, for indicators.
     e9, e21, e50, e200 = ema(closes, 9), ema(closes, 21), ema(closes, 50), ema(closes, 200)
     last_close = closes[-1]
     rsi_v = rsi(closes)
@@ -451,8 +689,6 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     volumes = [c["volume"] for c in valid_candles]
     highs_sek = [c["high"] * fx for c in valid_candles]
     lows_sek = [c["low"] * fx for c in valid_candles]
-    # Compare the latest completed candle against the preceding 20 candles.
-    # Including the current candle in its own baseline dampens genuine volume spikes.
     prior_volumes = volumes[-21:-1] if len(volumes) >= 21 else []
     avg_vol = sum(prior_volumes) / len(prior_volumes) if prior_volumes else 0.0
     vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0.0
@@ -468,8 +704,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     histogram_down = macd_hist < 0
     data_quality = "HIGH" if samples >= 200 else ("MEDIUM" if samples >= 100 else "LOW")
 
-    # Multi-timeframe confirmation built from the same completed 5-minute candles.
-    # 15m closes use every third candle; 1h closes use every twelfth candle.
+    # Multi-timeframe confirmation built from completed 5-minute candles.
     closes_15m = [closes[i] for i in range(2, samples, 3)]
     closes_1h = [closes[i] for i in range(11, samples, 12)]
     ema9_15m, ema21_15m = ema(closes_15m, 9), ema(closes_15m, 21)
@@ -486,59 +721,69 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     stoch_trigger = samples >= 16 and 25.0 <= stoch_now <= 85.0 and stoch_now > stoch_prev
     prior_highs = highs_sek[-21:-1] if len(highs_sek) >= 21 else []
     breakout = bool(prior_highs and last_close > max(prior_highs))
-    breakout_volume_confirmed = breakout and vol_ratio >= 1.2
+    breakout_volume_confirmed = breakout and vol_ratio >= 0.9
 
-    # Transparent score is descriptive only. Signal generation uses explicit gates,
-    # not the score alone; correlated indicators do not count as proof of profitability.
+    # Score is descriptive; it is not a standalone buy signal.
     score = 0
     reasons = []
     if trend_up:
-        score += 2; reasons.append("Trendfilter: EMA9>EMA21>EMA50 och EMA50 lutar uppåt")
+        score += 2
+        reasons.append("Trendfilter: EMA9>EMA21>EMA50 och EMA50 lutar uppåt")
     elif trend_down:
-        score -= 2; reasons.append("Trendfilter: EMA9<EMA21<EMA50 och EMA50 lutar nedåt")
+        score -= 2
+        reasons.append("Trendfilter: EMA9<EMA21<EMA50 och EMA50 lutar nedåt")
     else:
         reasons.append("Ingen bekräftad trend i EMA-strukturen")
     if long_trend_up:
-        score += 2; reasons.append("Lång trend bekräftad: pris över EMA200")
+        score += 2
+        reasons.append("Lång trend bekräftad: pris över EMA200")
     else:
         reasons.append("EMA200-filter ej uppfyllt eller otillräcklig historik")
     if stoch_trigger:
-        score += 1; reasons.append("Stochastic-trigger stigande inom godkänt intervall")
+        score += 1
+        reasons.append("Stochastic-trigger stigande inom godkänt intervall")
     if breakout_volume_confirmed:
-        score += 1; reasons.append("Breakout bekräftad av volym över 1,2x baslinjen")
+        score += 1
+        reasons.append("Breakout bekräftad av volym över 0,9x baslinjen")
     if histogram_up:
-        score += 1; reasons.append("MACD-histogram positivt")
+        score += 1
+        reasons.append("MACD-histogram positivt")
     elif histogram_down:
-        score -= 1; reasons.append("MACD-histogram negativt")
-    if 50 <= rsi_v <= 67:
-        score += 1; reasons.append("RSI stöder uppgång utan tydlig överköpthet")
+        score -= 1
+        reasons.append("MACD-histogram negativt")
+    if 45 <= rsi_v <= 70:
+        score += 1
+        reasons.append("RSI stöder uppgång utan tydlig överköpthet")
     elif rsi_v < 45:
-        score -= 1; reasons.append("RSI visar svagt momentum")
+        score -= 1
+        reasons.append("RSI visar svagt momentum")
     elif rsi_v > 72:
         reasons.append("RSI högt: risk att köpa efter en utsträckt rörelse")
-    if momentum > 0.10:
-        score += 1; reasons.append("Positiv 15-minutersmomentum")
+    if momentum > 0.0:
+        score += 1
+        reasons.append("Positivt kortsiktigt momentum")
     elif momentum < -0.20:
-        score -= 1; reasons.append("Negativ 15-minutersmomentum")
-    if vol_ratio >= 0.80 and momentum > 0:
-        score += 1; reasons.append("Volym bekräftar positiv rörelse")
+        score -= 1
+        reasons.append("Negativt kortsiktigt momentum")
+    if vol_ratio >= 0.60 and momentum > 0:
+        score += 1
+        reasons.append("Volym bekräftar positiv rörelse")
     elif vol_ratio < 0.50:
         reasons.append("Låg volym: svag bekräftelse")
 
-    # A BUY needs a trend, positive momentum, positive MACD histogram, reasonable
-    # RSI, non-thin volume, sufficient history, and no chase far above EMA21.
+    # A BUY still requires several independent filters; relaxed limits do not guarantee profit.
     buy_gates = {
-        "tillräcklig historik": samples >= 220,
-        "lång trend över EMA200": long_trend_up,
+        "tillräcklig historik": samples >= 100,
+        "lång trend eller bekräftad upptrend": (long_trend_up or trend_up),
         "stochastic-trigger": stoch_trigger,
         "bekräftad upptrend": trend_up,
         "MACD-histogram positivt": histogram_up,
-        "RSI mellan 50 och 67": 50 <= rsi_v <= 67,
-        "momentum positivt": momentum >= 0.10,
-        "volym tillräcklig": vol_ratio >= 0.80,
+        "RSI mellan 45 och 70": 45 <= rsi_v <= 70,
+        "momentum positivt": momentum >= 0.0,
+        "volym tillräcklig": vol_ratio >= 0.60,
         "breakout har volymbekräftelse": (not breakout) or breakout_volume_confirmed,
-        "inte för långt över EMA21": price_above_ema21_pct <= 1.8,
-        "volatilitet rimlig": volatility <= 2.5,
+        "inte för långt över EMA21": price_above_ema21_pct <= 2.5,
+        "volatilitet rimlig": volatility <= 3.5,
         "15m-trend inte bearish": trend_15m != "DOWN",
         "1h-trend inte bearish": trend_1h != "DOWN",
         "ingen översträckning i stochastic": stoch_now <= 92,
@@ -558,7 +803,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
 
     if buy_ok:
         signal = "KÖP"
-        confirmations = sum([trend_up, histogram_up, 50 <= rsi_v <= 67, momentum >= 0.10, vol_ratio >= 0.80])
+        confirmations = sum([trend_up, histogram_up, 45 <= rsi_v <= 70, momentum >= 0.0, vol_ratio >= 0.60])
         confidence = min(79, 68 + confirmations * 2)
         reasons.append("KÖP godkänd: samtliga grundfilter uppfyllda; detta är ingen vinstgaranti")
     elif sell_ok:
@@ -606,7 +851,6 @@ def make_signals() -> list[dict[str, Any]]:
 
 def equity_from_prices(prices):
     # Never value an existing holding at zero merely because its ticker failed in this scan.
-    # Fresh prices override last-known prices; last-known values are only for risk valuation.
     valuation = dict(market_cache.get("valuation_prices", {}))
     valuation.update(prices or {})
     return num(state["balance_sek"]) + sum(
@@ -650,28 +894,32 @@ def average_cost_sell(symbol: str, qty: float, proceeds: float, timestamp: str, 
 
 def paper_order(side: str, symbol: str, amount_sek: float, automatic=False, exit_reason: str | None = None):
     side, symbol = str(side).lower().strip(), str(symbol).upper().strip()
-    if side not in ("buy","sell"): raise HTTPException(400,"Sidan måste vara buy eller sell.")
-    if symbol not in SYMBOLS: raise HTTPException(400,"Okänd kryptovaluta.")
+    if side not in ("buy", "sell"):
+        raise HTTPException(400, "Sidan måste vara buy eller sell.")
+    if symbol not in SYMBOLS:
+        raise HTTPException(400, "Okänd kryptovaluta.")
     if not math.isfinite(amount_sek) or amount_sek <= 0:
-        raise HTTPException(400,"Belopp måste vara ett ändligt tal större än 0 kr.")
+        raise HTTPException(400, "Belopp måste vara ett ändligt tal större än 0 kr.")
     prices = get_prices()
-    price = prices.get(symbol,0)
-    if price <= 0: raise HTTPException(503,"Pris saknas.")
-    # Reject oversized BUY requests at the backend, regardless of what the dashboard displays.
-    # SELL orders are deliberately exempt so protective exits can close the full position.
+    price = prices.get(symbol, 0)
+    if price <= 0:
+        raise HTTPException(503, "Pris saknas.")
+
+    # Hard backend cap for buys. Protective sells may close the full position.
     amount_sek = float(amount_sek)
     if side == "buy" and amount_sek > MAX_TRADE_SEK + 1e-9:
         raise HTTPException(400, f"Köpgränsen är {MAX_TRADE_SEK:.0f} kr per affär inklusive avgift.")
+
     with lock:
+        # This bot is PAPER ONLY. Real orders are always disabled.
         state["real_orders_enabled"] = False
-        h = state["holdings"].setdefault(symbol, {"quantity":0.0,"cost_basis_sek":0.0,"lots":[]})
+        h = state["holdings"].setdefault(symbol, {"quantity": 0.0, "cost_basis_sek": 0.0, "lots": []})
         balance = num(state["balance_sek"])
-        fee_rate = clamp(num(state.get("fee_rate"),FEE_RATE),0,0.02)
+        fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0, 0.02)
         if side == "buy":
-            # Normalize principal so principal + fee can never exceed the hard order cap.
+            # Principal plus fee must remain within the hard per-order cap.
             amount_sek = min(float(amount_sek), MAX_TRADE_SEK / (1.0 + fee_rate))
-            # Duplicate guard: the same symbol cannot be automatically bought twice in a
-            # short interval, even if the signal worker submits it more than once.
+            # Prevent repeated automatic buys of the same symbol within the guard window.
             if automatic:
                 now_dt = datetime.now(timezone.utc)
                 for previous in reversed(state.get("trades", [])):
@@ -687,17 +935,19 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False, exit
                             raise HTTPException(409, f"Dubbelskydd: automatiskt köp av {symbol} nyligen registrerat.")
                     except ValueError:
                         continue
-                    # Trades are newest-last, so older entries cannot be inside the window.
                     if age >= DUPLICATE_BUY_WINDOW_SECONDS:
                         break
-            # Cap total per-coin exposure as well as each individual order.
+
+            # Limit total exposure per coin as well as each individual order.
             current_value = num(h.get("quantity")) * price
             if current_value + amount_sek * (1.0 + fee_rate) > MAX_POSITION_SEK + 1e-8:
                 raise HTTPException(409, f"Positionsgränsen för {symbol} är {MAX_POSITION_SEK:.0f} kr inklusive köpavgift.")
+
         ts, tid = now_iso(), str(uuid.uuid4())
         stats = get_daily_stats(prices)
         current_equity = equity_from_prices(prices)
         baseline = max(0.0, num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK))
+        
         total_drawdown = max(0.0, baseline - current_equity)
         if total_drawdown >= MAX_TOTAL_LOSS_SEK:
             state["risk_halt"] = True
@@ -709,65 +959,69 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False, exit
         if state.get("risk_halt") and side == "buy":
             raise HTTPException(409, "Riskspärr aktiv efter att maximal total förlust uppnåtts. Köp är spärrade.")
         if automatic:
-            # Once the total-loss guard trips, no more automatic buys are allowed.
-            # A sell already in progress may still finish; future cycles stop when auto is disabled.
             if not state["auto_enabled"] and side == "buy":
-                raise HTTPException(409,"Automatisk PAPER-handel är avstängd eller riskspärrad.")
-            if side == "buy" and int(stats.get("trades",0)) >= MAX_DAILY_TRADES:
-                risk_event("DAILY_TRADE_LIMIT","Max automatiska köp per UTC-dygn uppnått; säljorder för riskreducering tillåts."); persist()
-                raise HTTPException(409,"Dagens köpgräns är nådd.")
+                raise HTTPException(409, "Automatisk PAPER-handel är avstängd eller riskspärrad.")
+            if side == "buy" and int(stats.get("trades", 0)) >= MAX_DAILY_TRADES:
+                risk_event("DAILY_TRADE_LIMIT", "Max automatiska köp per UTC-dygn uppnått; säljorder för riskreducering tillåts.")
+                persist()
+                raise HTTPException(409, "Dagens köpgräns är nådd.")
             if side == "buy" and num(stats.get("realized_pnl_sek")) <= -MAX_DAILY_LOSS_SEK:
-                risk_event("DAILY_LOSS_LIMIT","Daglig förlustgräns uppnådd; nya köp spärrade."); persist()
-                raise HTTPException(409,"Daglig förlustgräns nådd; köp spärrade.")
-        fee = amount_sek*fee_rate
+                risk_event("DAILY_LOSS_LIMIT", "Daglig förlustgräns uppnådd; nya köp spärrade.")
+                persist()
+                raise HTTPException(409, "Daglig förlustgräns nådd; köp spärrade.")
+
+        fee = amount_sek * fee_rate
         pnl, tax_event = 0.0, None
         if side == "buy":
             fee = amount_sek * fee_rate
-            total = amount_sek+fee
-            if balance + 1e-8 < total: raise HTTPException(409,"Otillräckligt PAPER-saldo inklusive avgift.")
-            qty = amount_sek/price
-            state["balance_sek"] = round(balance-total,8)
+            total = amount_sek + fee
+            if balance + 1e-8 < total:
+                raise HTTPException(409, "Otillräckligt PAPER-saldo inklusive avgift.")
+            qty = amount_sek / price
+            state["balance_sek"] = round(balance - total, 8)
             h["quantity"] += qty
             h["cost_basis_sek"] += total
-            h["lots"].append({"time":ts,"quantity":qty,"unit_cost_sek":total/qty,"trade_id":tid})
-            tax_event = {"event_id":str(uuid.uuid4()),"trade_id":tid,"time":ts,"type":"acquisition",
-                         "symbol":symbol,"quantity":qty,"cost_basis_sek":round(total,8),
-                         "fee_sek":round(fee,8),"method":"AVERAGE_COST","basis_complete":True,"mode":MODE}
+            h["lots"].append({"time": ts, "quantity": qty, "unit_cost_sek": total / qty, "trade_id": tid})
+            tax_event = {"event_id": str(uuid.uuid4()), "trade_id": tid, "time": ts, "type": "acquisition",
+                         "symbol": symbol, "quantity": qty, "cost_basis_sek": round(total, 8),
+                         "fee_sek": round(fee, 8), "method": "AVERAGE_COST", "basis_complete": True, "mode": MODE}
             state["tax_events"].append(tax_event)
         else:
             held = num(h["quantity"])
-            qty = min(amount_sek/price, held)
-            if qty <= 1e-12: raise HTTPException(409,f"Inget {symbol}-innehav att sälja.")
-            gross = qty*price
-            fee = gross*fee_rate
-            net = gross-fee
+            qty = min(amount_sek / price, held)
+            if qty <= 1e-12:
+                raise HTTPException(409, f"Inget {symbol}-innehav att sälja.")
+            gross = qty * price
+            fee = gross * fee_rate
+            net = gross - fee
             old_qty, old_basis = num(h["quantity"]), num(h["cost_basis_sek"])
-            tax_event = average_cost_sell(symbol,qty,net,ts,tid)
-            state["balance_sek"] = round(balance+net,8)
-            h["quantity"] = max(0,old_qty-qty)
-            h["cost_basis_sek"] = max(0,old_basis-num(tax_event["cost_basis_sek"]))
+            tax_event = average_cost_sell(symbol, qty, net, ts, tid)
+            state["balance_sek"] = round(balance + net, 8)
+            h["quantity"] = max(0, old_qty - qty)
+            h["cost_basis_sek"] = max(0, old_basis - num(tax_event["cost_basis_sek"]))
             pnl = num(tax_event["gain_loss_sek"])
-            stats["realized_pnl_sek"] = num(stats.get("realized_pnl_sek"))+pnl
-        trade = {"trade_id":tid,"mode":MODE,"side":side,"symbol":symbol,"time":ts,
-                 "price_sek":round(price,8),"quantity":qty,"amount_sek":round(qty*price,8),
-                 "fee_sek":round(fee,8),"fee_rate":fee_rate,"automatic":automatic,
-                 "realized_pnl_sek":round(pnl,8),"tax_event_id":tax_event["event_id"]}
+            stats["realized_pnl_sek"] = num(stats.get("realized_pnl_sek")) + pnl
+
+        trade = {"trade_id": tid, "mode": MODE, "side": side, "symbol": symbol, "time": ts,
+                 "price_sek": round(price, 8), "quantity": qty, "amount_sek": round(qty * price, 8),
+                 "fee_sek": round(fee, 8), "fee_rate": fee_rate, "automatic": automatic,
+                 "realized_pnl_sek": round(pnl, 8), "tax_event_id": tax_event["event_id"]}
         if exit_reason and side == "sell":
             trade["exit_reason"] = str(exit_reason)[:120]
         state["trades"].append(trade)
         state["trades"] = state["trades"][-20000:]
-        if automatic and side == "buy": stats["trades"] = int(stats.get("trades",0))+1
-        state["equity_history"].append({"time":ts,"equity_sek":round(equity_from_prices(prices),8)})
+        if automatic and side == "buy":
+            stats["trades"] = int(stats.get("trades", 0)) + 1
+        state["equity_history"].append({"time": ts, "equity_sek": round(equity_from_prices(prices), 8)})
         state["equity_history"] = state["equity_history"][-10000:]
         state["last_error"] = None
         persist()
-        return {"ok":True,"mode":MODE,"real_orders_enabled":False,"trade":trade,"tax_event":tax_event,
-                "balance_sek":state["balance_sek"],"equity_sek":state["equity_history"][-1]["equity_sek"]}
-
+        return {"ok": True, "mode": MODE, "real_orders_enabled": False, "trade": trade, "tax_event": tax_event,
+                "balance_sek": state["balance_sek"], "equity_sek": state["equity_history"][-1]["equity_sek"]}
 
 
 def rebuild_tax_ledger_from_trades() -> dict[str, Any]:
-    """Rebuild the simulated tax ledger from recorded PAPER trades using average cost. This cannot reconstruct exchange activity that was never recorded by this bot. Such completeness must be checked against the user's full exchange exports. """
+    """Rebuild the simulated tax ledger from recorded PAPER trades using average cost."""
     with lock:
         trades = sorted([t for t in state.get("trades", []) if isinstance(t, dict)],
                         key=lambda t: str(t.get("time", "")))
@@ -793,7 +1047,6 @@ def rebuild_tax_ledger_from_trades() -> dict[str, Any]:
             amount = max(0.0, num(trade.get("amount_sek")))
             timestamp = trade.get("time") or now_iso()
             if side == "buy":
-                # amount_sek is trade notional; fees form part of acquisition cost.
                 cost = amount + fee
                 qty_by_symbol[symbol] += qty
                 basis_by_symbol[symbol] += cost
@@ -826,8 +1079,6 @@ def rebuild_tax_ledger_from_trades() -> dict[str, Any]:
             trade["tax_event_id"] = ev["event_id"]
             rebuilt_events.append(ev)
         state["tax_events"] = rebuilt_events
-        # Update remaining average-cost balances only when trade-derived quantities match
-        # current holdings; never rewrite holdings or cash based solely on tax reconstruction.
         for symbol, holding in state.get("holdings", {}).items():
             if not isinstance(holding, dict):
                 continue
@@ -851,17 +1102,14 @@ def auto_loop():
     log.info("PAPER worker started; real orders disabled")
     while not stop_event.is_set():
         try:
-            with lock: enabled = bool(state.get("auto_enabled"))
+            with lock:
+                enabled = bool(state.get("auto_enabled"))
             if enabled:
                 signals = make_signals()
                 prices = get_prices()
-                # Track exits this cycle so the bot cannot sell and re-buy the same coin
-                # immediately based on a stale signal from the start of the cycle.
                 exited_this_cycle: set[str] = set()
-                # Risk exits use estimated NET return after both buy and sell fees.
-                # The trailing stop records a high-water mark per holding in persistent state.
                 fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
-                for symbol,h in list(state["holdings"].items()):
+                for symbol, h in list(state["holdings"].items()):
                     qty = num(h.get("quantity"))
                     basis = num(h.get("cost_basis_sek"))
                     price = num(prices.get(symbol))
@@ -889,8 +1137,7 @@ def auto_loop():
                         except HTTPException as exc:
                             if exc.status_code not in (409,):
                                 raise
-                # Ordinary signal-based exits require strong multi-indicator bearish confirmation.
-                # Stop-loss/take-profit exits above remain independent protective rules.
+
                 for sig in signals:
                     if (sig["symbol"] not in exited_this_cycle and sig["signal"] == "SÄLJ"
                             and sig["score"] <= -4 and sig["confidence"] >= MIN_CONFIDENCE):
@@ -901,16 +1148,17 @@ def auto_loop():
                                 paper_order("sell", sig["symbol"], held * px, automatic=True)
                                 exited_this_cycle.add(sig["symbol"])
                             except HTTPException as exc:
-                                if exc.status_code not in (409,): raise
-                # Do not repeatedly pyramid into the same coin every scan. Every BUY is hard-capped
-                # at 100 SEK including fee, with a backend check in paper_order().
+                                if exc.status_code not in (409,):
+                                    raise
+
                 news_guard = news_blackout_status()
-                buy_candidates = [] if news_guard["active"] else [sig for sig in signals
-                                  if sig["symbol"] not in exited_this_cycle
-                                  and sig["signal"] == "KÖP" and sig["confidence"] >= MIN_CONFIDENCE
-                                  and num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) <= 1e-12]
-                # Allocate scarce PAPER cash to the strongest confirmed candidates first.
-                # Score and indicators are ranking hints, not probabilities.
+                buy_candidates = [] if news_guard["active"] else [
+                    sig for sig in signals
+                    if sig["symbol"] not in exited_this_cycle
+                    and sig["signal"] == "KÖP"
+                    and sig["confidence"] >= MIN_CONFIDENCE
+                    and num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) <= 1e-12
+                ]
                 buy_candidates.sort(
                     key=lambda sig: (
                         num(sig.get("score")),
@@ -933,21 +1181,27 @@ def auto_loop():
                         risk_sized_principal = risk_budget_sek / max(stop_distance_pct / 100.0, 0.0001)
                         current_value = num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) * num(prices.get(sig["symbol"]))
                         position_room = max(0.0, MAX_POSITION_SEK - current_value)
-                        principal = min(MAX_TRADE_SEK / (1.0 + fee_rate),
-                                        risk_sized_principal / (1.0 + fee_rate),
-                                        position_room / (1.0 + fee_rate),
-                                        available / (1.0 + fee_rate))
+                        principal = min(
+                            MAX_TRADE_SEK / (1.0 + fee_rate),
+                            risk_sized_principal / (1.0 + fee_rate),
+                            position_room / (1.0 + fee_rate),
+                            available / (1.0 + fee_rate),
+                        )
                         if principal <= 0.01:
                             continue
                         try:
                             paper_order("buy", sig["symbol"], principal, automatic=True)
                             available = max(0.0, num(state.get("balance_sek")))
                         except HTTPException as exc:
-                            if exc.status_code not in (409,): raise
+                            if exc.status_code not in (409,):
+                                raise
                 with lock:
-                    state["last_auto_run"]=now_iso(); state["last_error"]=None; persist()
+                    state["last_auto_run"] = now_iso()
+                    state["last_error"] = None
+                    persist()
         except Exception as exc:
-            with lock: state["last_error"]=str(exc)[:500]
+            with lock:
+                state["last_error"] = str(exc)[:500]
             log.exception("Auto cycle failed")
         stop_event.wait(AUTO_INTERVAL_SECONDS)
 
@@ -956,20 +1210,18 @@ def auto_loop():
 def startup():
     restore()
     state["real_orders_enabled"] = False
-    state["auto_enabled"] = False  # Require a deliberate manual start after every deploy/restart.
+    state["auto_enabled"] = False
     persist()
     global auto_thread
     if auto_thread is None or not auto_thread.is_alive():
         stop_event.clear()
-        auto_thread = threading.Thread(target=auto_loop,daemon=True,name="paper-auto-worker")
+        auto_thread = threading.Thread(target=auto_loop, daemon=True, name="paper-auto-worker")
         auto_thread.start()
 
 
 @app.on_event("shutdown")
 def shutdown():
     stop_event.set()
-
-
 
 
 @app.get("/")
@@ -983,6 +1235,8 @@ def root():
         "message": "Dashboardfilen index.html saknas.",
         "health": "/api/health"
     }, status_code=503)
+
+
 @app.head("/")
 def root_head():
     from fastapi.responses import Response
@@ -991,42 +1245,45 @@ def root_head():
 
 @app.get("/api/health")
 def health():
-    return {"status":"online","version":APP_VERSION,"mode":MODE,"real_orders_enabled":False,
-            "auto_enabled":bool(state["auto_enabled"]),"state_file":STATE_FILE,
-            "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,
-            "duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
-            "local_state_exists":os.path.exists(STATE_FILE),"database":db_info,
-            "market_cache_available":bool(market_cache["prices"]),
-            "market_source_errors":market_cache.get("source_errors",{}),
-            "valid_market_symbols":market_cache.get("valid_products",[]),
-            "configured_symbol_count":len(SYMBOLS),
-            "trade_count":len(state["trades"]),"last_error":state.get("last_error")}
+    return {"status": "online", "version": APP_VERSION, "mode": MODE, "real_orders_enabled": False,
+            "auto_enabled": bool(state["auto_enabled"]), "state_file": STATE_FILE,
+            "purchase_amount_cap": True, "max_trade_sek": MAX_TRADE_SEK, "max_position_sek": MAX_POSITION_SEK,
+            "duplicate_buy_window_seconds": DUPLICATE_BUY_WINDOW_SECONDS, "max_total_loss_sek": MAX_TOTAL_LOSS_SEK,
+            "local_state_exists": os.path.exists(STATE_FILE), "database": db_info,
+            "market_cache_available": bool(market_cache["prices"]),
+            "market_source_errors": market_cache.get("source_errors", {}),
+            "valid_market_symbols": market_cache.get("valid_products", []),
+            "configured_symbol_count": len(SYMBOLS),
+            "trade_count": len(state["trades"]), "last_error": state.get("last_error")}
 
 
 @app.get("/api/database/status")
 def database_status():
     if DATABASE_URL:
         try:
-            conn=_db_connect()
+            conn = _db_connect()
             try:
-                with conn.cursor() as cur: cur.execute("SELECT 1"); cur.fetchone()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
                 conn.commit()
-            finally: conn.close()
-            db_info.update(available=True,error=None,backend="postgresql")
+            finally:
+                conn.close()
+            db_info.update(available=True, error=None, backend="postgresql")
         except Exception as exc:
-            db_info.update(available=False,error=str(exc)[:300],backend="local_json_file")
-    return {"configured":bool(DATABASE_URL),"available":db_info["available"],
-            "backend":db_info["backend"],"error":db_info["error"],
-            "local_fallback":os.path.exists(STATE_FILE),
-            "warning":None if db_info["available"] else "Lägg till en fungerande DATABASE_URL i Render för beständig historik."}
+            db_info.update(available=False, error=str(exc)[:300], backend="local_json_file")
+    return {"configured": bool(DATABASE_URL), "available": db_info["available"],
+            "backend": db_info["backend"], "error": db_info["error"],
+            "local_fallback": os.path.exists(STATE_FILE),
+            "warning": None if db_info["available"] else "Lägg till en fungerande DATABASE_URL i Render för beständig historik."}
 
 
 @app.get("/api/market")
 def market():
-    prices=get_prices(force=True)
-    return {"prices_sek":prices,"updated_at":now_iso(),"currency":"SEK",
-            "fx_eur_sek":market_cache["eur_sek"],"valid_symbols":market_cache.get("valid_products",[]),
-            "source_errors":market_cache.get("source_errors",{})}
+    prices = get_prices(force=True)
+    return {"prices_sek": prices, "updated_at": now_iso(), "currency": "SEK",
+            "fx_eur_sek": market_cache["eur_sek"], "valid_symbols": market_cache.get("valid_products", []),
+            "source_errors": market_cache.get("source_errors", {})}
 
 
 @app.get("/api/signals")
@@ -1034,20 +1291,21 @@ def market():
 def signals():
     signals = make_signals()
     returned = {item.get("symbol") for item in signals}
-    return {"signals":signals,"updated_at":now_iso(),"mode":MODE,
-            "strategy":"14.0: closed 5m candles, 15m/1h trend confirmation, EMA slope, MACD, RSI, momentum, prior-candle volume baseline, ranked candidates + net-fee exits",
-            "symbols_configured":SYMBOLS,
-            "symbols_returned":sorted(returned),
-            "symbols_missing":sorted(set(SYMBOLS) - returned),
-            "market_source_errors":dict(market_cache.get("source_errors",{})),
-            "auto_paper_on_start":AUTO_PAPER_ON_START,
-            "note":"Signaler är heuristiska, inte garanterade prognoser. Saknade symboler har ingen användbar aktuell marknadsdata. Inga riktiga order skickas."}
+    return {"signals": signals, "updated_at": now_iso(), "mode": MODE,
+            "strategy": "15.2: expanded universe, relaxed signal thresholds, closed 5m candles and ranked candidates",
+            "symbols_configured": SYMBOLS,
+            "symbols_returned": sorted(returned),
+            "symbols_missing": sorted(set(SYMBOLS) - returned),
+            "market_source_errors": dict(market_cache.get("source_errors", {})),
+            "auto_paper_on_start": AUTO_PAPER_ON_START,
+            "note": "Signaler är heuristiska, inte garanterade prognoser. Saknade symboler har ingen användbar aktuell marknadsdata. Inga riktiga order skickas."}
 
 
 @app.get("/api/auto/diagnostics")
 def auto_diagnostics():
     """Explain why the PAPER bot may not have bought; this endpoint never places orders."""
     try:
+
         scanned = make_signals()
         scan_error = None
     except Exception as exc:
@@ -1098,45 +1356,47 @@ def auto_diagnostics():
 
 @app.get("/api/paper/status")
 def paper_status():
-    try: prices=get_prices()
-    except HTTPException: prices={}
+    try:
+        prices = get_prices()
+    except HTTPException:
+        prices = {}
     with lock:
-        holdings={s:{"quantity":num(h.get("quantity")),"cost_basis_sek":num(h.get("cost_basis_sek")),
-            "market_value_sek":round(num(h.get("quantity"))*prices.get(s,0),8),
-            "lots_count":len(h.get("lots",[]))} for s,h in state["holdings"].items()}
-        return {"mode":MODE,"real_orders_enabled":False,"balance_sek":num(state["balance_sek"]),
-            "holdings":holdings,"trades":state["trades"][-100:],"trade_count":len(state["trades"]),
-            "equity_sek":round(num(state["balance_sek"])+sum(h["market_value_sek"] for h in holdings.values()),8),
-            "fee_rate":state["fee_rate"],"auto_enabled":bool(state["auto_enabled"]),
-            "risk_halt":bool(state.get("risk_halt")),"max_trade_sek":MAX_TRADE_SEK,
-            "max_position_sek":MAX_POSITION_SEK,"duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,
-            "purchase_amount_cap":True,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
-            "risk_baseline_equity_sek":num(state.get("risk_baseline_equity_sek"),START_BALANCE_SEK)}
+        holdings = {s: {"quantity": num(h.get("quantity")), "cost_basis_sek": num(h.get("cost_basis_sek")),
+            "market_value_sek": round(num(h.get("quantity")) * prices.get(s, 0), 8),
+            "lots_count": len(h.get("lots", []))} for s, h in state["holdings"].items()}
+        return {"mode": MODE, "real_orders_enabled": False, "balance_sek": num(state["balance_sek"]),
+            "holdings": holdings, "trades": state["trades"][-100:], "trade_count": len(state["trades"]),
+            "equity_sek": round(num(state["balance_sek"]) + sum(h["market_value_sek"] for h in holdings.values()), 8),
+            "fee_rate": state["fee_rate"], "auto_enabled": bool(state["auto_enabled"]),
+            "risk_halt": bool(state.get("risk_halt")), "max_trade_sek": MAX_TRADE_SEK,
+            "max_position_sek": MAX_POSITION_SEK, "duplicate_buy_window_seconds": DUPLICATE_BUY_WINDOW_SECONDS,
+            "purchase_amount_cap": True, "max_total_loss_sek": MAX_TOTAL_LOSS_SEK,
+            "risk_baseline_equity_sek": num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK)}
 
 
 @app.post("/api/paper/order")
-def create_paper_order(payload:OrderRequest):
-    return paper_order(payload.side,payload.symbol,payload.amount_sek)
+def create_paper_order(payload: OrderRequest):
+    return paper_order(payload.side, payload.symbol, payload.amount_sek)
 
 
 @app.get("/api/paper/history")
-def paper_history(limit:int=Query(default=100,ge=1,le=1000)):
-    return {"trades":state["trades"][-limit:],"count":len(state["trades"]),"mode":MODE}
+def paper_history(limit: int = Query(default=100, ge=1, le=1000)):
+    return {"trades": state["trades"][-limit:], "count": len(state["trades"]), "mode": MODE}
 
 
 @app.get("/api/auto/status")
 def auto_status():
-    return {"enabled":bool(state["auto_enabled"]),"mode":MODE,"real_orders_enabled":False,
-            "interval_seconds":AUTO_INTERVAL_SECONDS,"max_position_sek":MAX_POSITION_SEK,
-            "duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,
-            "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_daily_trades":MAX_DAILY_TRADES,"max_daily_loss_sek":MAX_DAILY_LOSS_SEK,
-            "max_total_loss_sek":MAX_TOTAL_LOSS_SEK,"risk_halt":bool(state.get("risk_halt")),
-            "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,
-            "trailing_activation_pct":TRAILING_ACTIVATION_PCT,"trailing_drawdown_pct":TRAILING_DRAWDOWN_PCT,
-            "min_confidence":MIN_CONFIDENCE,"risk_per_trade_pct":RISK_PER_TRADE_PCT,
-            "news_blackout":news_blackout_status(),"news_blackout_minutes":NEWS_BLACKOUT_MINUTES,
-            "last_run":state.get("last_auto_run"),
-            "last_error":state.get("last_error")}
+    return {"enabled": bool(state["auto_enabled"]), "mode": MODE, "real_orders_enabled": False,
+            "interval_seconds": AUTO_INTERVAL_SECONDS, "max_position_sek": MAX_POSITION_SEK,
+            "duplicate_buy_window_seconds": DUPLICATE_BUY_WINDOW_SECONDS,
+            "purchase_amount_cap": True, "max_trade_sek": MAX_TRADE_SEK,
+            "max_daily_trades": MAX_DAILY_TRADES, "max_daily_loss_sek": MAX_DAILY_LOSS_SEK,
+            "max_total_loss_sek": MAX_TOTAL_LOSS_SEK, "risk_halt": bool(state.get("risk_halt")),
+            "stop_loss_pct": STOP_LOSS_PCT, "take_profit_pct": TAKE_PROFIT_PCT,
+            "trailing_activation_pct": TRAILING_ACTIVATION_PCT, "trailing_drawdown_pct": TRAILING_DRAWDOWN_PCT,
+            "min_confidence": MIN_CONFIDENCE, "risk_per_trade_pct": RISK_PER_TRADE_PCT,
+            "news_blackout": news_blackout_status(), "news_blackout_minutes": NEWS_BLACKOUT_MINUTES,
+            "last_run": state.get("last_auto_run"), "last_error": state.get("last_error")}
 
 
 @app.post("/api/auto/start")
@@ -1144,15 +1404,19 @@ def auto_start():
     with lock:
         if state.get("risk_halt"):
             raise HTTPException(409, "Riskspärren är aktiv efter total förlustgräns. Starta inte om utan att granska riskhistoriken.")
-        state["real_orders_enabled"]=False; state["auto_enabled"]=True; persist()
-    return {"ok":True,"enabled":True,"mode":MODE,"real_orders_enabled":False,
-            "message":"Automatisk PAPER-handel aktiverad. Inga riktiga order skickas."}
+        state["real_orders_enabled"] = False
+        state["auto_enabled"] = True
+        persist()
+    return {"ok": True, "enabled": True, "mode": MODE, "real_orders_enabled": False,
+            "message": "Automatisk PAPER-handel aktiverad. Inga riktiga order skickas."}
 
 
 @app.post("/api/auto/stop")
 def auto_stop():
-    with lock: state["auto_enabled"]=False; persist()
-    return {"ok":True,"enabled":False,"mode":MODE,"real_orders_enabled":False}
+    with lock:
+        state["auto_enabled"] = False
+        persist()
+    return {"ok": True, "enabled": False, "mode": MODE, "real_orders_enabled": False}
 
 
 @app.post("/api/tax/repair")
@@ -1166,54 +1430,55 @@ def tax_repair():
 
 @app.get("/api/tax/summary")
 def tax_summary():
-    disposals=[e for e in state["tax_events"] if e.get("type")=="disposal"]
-    gains=sum(max(0,num(e.get("gain_loss_sek"))) for e in disposals)
-    losses=sum(min(0,num(e.get("gain_loss_sek"))) for e in disposals)
-    sells=sum(t.get("side")=="sell" for t in state["trades"])
-    complete=all(e.get("basis_complete",False) for e in disposals)
-    return {"mode":MODE,"disposals":len(disposals),"sell_trades_in_history":sells,
-            "positive_gains_sek":round(gains,2),"negative_losses_sek":round(losses,2),
-            "net_realized_result_sek":round(gains+losses,2),"tax_basis_complete":complete,
-            "audit_ok":len(disposals)==sells and complete,
-            "method":"AVERAGE_COST","tax_filing_ready":False,
-            "note":"Beräknat från PAPER-loggen med genomsnittsmetoden. Inte färdig deklaration förrän komplett historik har jämförts."}
+    disposals = [e for e in state["tax_events"] if e.get("type") == "disposal"]
+    gains = sum(max(0, num(e.get("gain_loss_sek"))) for e in disposals)
+    losses = sum(min(0, num(e.get("gain_loss_sek"))) for e in disposals)
+    sells = sum(t.get("side") == "sell" for t in state["trades"])
+    complete = all(e.get("basis_complete", False) for e in disposals)
+    return {"mode": MODE, "disposals": len(disposals), "sell_trades_in_history": sells,
+            "positive_gains_sek": round(gains, 2), "negative_losses_sek": round(losses, 2),
+            "net_realized_result_sek": round(gains + losses, 2), "tax_basis_complete": complete,
+            "audit_ok": len(disposals) == sells and complete,
+            "method": "AVERAGE_COST", "tax_filing_ready": False,
+            "note": "Beräknat från PAPER-loggen med genomsnittsmetoden. Inte färdig deklaration förrän komplett historik har jämförts."}
 
 
 @app.get("/api/tax/audit")
 def tax_audit():
-    trades,events=state["trades"],state["tax_events"]
-    sells=[t for t in trades if t.get("side")=="sell"]
-    buys=[t for t in trades if t.get("side")=="buy"]
-    disposals=[e for e in events if e.get("type")=="disposal"]
-    acquisitions=[e for e in events if e.get("type")=="acquisition"]
-    links={(e.get("trade_id"),e.get("type")) for e in events}
-    missing_sells=[t.get("trade_id") for t in sells if (t.get("trade_id"),"disposal") not in links]
-    missing_buys=[t.get("trade_id") for t in buys if (t.get("trade_id"),"acquisition") not in links]
-    incomplete=[e.get("trade_id") for e in disposals if not e.get("basis_complete",False)]
-    return {"mode":MODE,"trade_count":len(trades),"buy_trade_count":len(buys),"sell_trade_count":len(sells),
-        "acquisition_event_count":len(acquisitions),"disposal_event_count":len(disposals),
-        "missing_disposal_trade_ids":missing_sells,"missing_acquisition_trade_ids":missing_buys,
-        "incomplete_basis_trade_ids":incomplete,
-        "counts_match":len(sells)==len(disposals) and not missing_sells and not missing_buys and not incomplete,
-        "holdings_cost_basis":{s:{"quantity":num(h.get("quantity")),"cost_basis_sek":num(h.get("cost_basis_sek")),
-            "lot_count":len(h.get("lots",[]))} for s,h in state["holdings"].items()},
-        "warning":"Jämför med komplett börshistorik; äldre affärer kan saknas. Återskapade händelser från PAPER-loggen är inte automatiskt verifierade mot börsen.",
-        "reconstructed_events":sum(bool(e.get("reconstructed")) for e in events if isinstance(e,dict)),
-        "tax_filing_ready":False}
+    trades, events = state["trades"], state["tax_events"]
+    sells = [t for t in trades if t.get("side") == "sell"]
+    buys = [t for t in trades if t.get("side") == "buy"]
+    disposals = [e for e in events if e.get("type") == "disposal"]
+    acquisitions = [e for e in events if e.get("type") == "acquisition"]
+    links = {(e.get("trade_id"), e.get("type")) for e in events}
+    missing_sells = [t.get("trade_id") for t in sells if (t.get("trade_id"), "disposal") not in links]
+    missing_buys = [t.get("trade_id") for t in buys if (t.get("trade_id"), "acquisition") not in links]
+    incomplete = [e.get("trade_id") for e in disposals if not e.get("basis_complete", False)]
+    return {"mode": MODE, "trade_count": len(trades), "buy_trade_count": len(buys), "sell_trade_count": len(sells),
+        "acquisition_event_count": len(acquisitions), "disposal_event_count": len(disposals),
+        "missing_disposal_trade_ids": missing_sells, "missing_acquisition_trade_ids": missing_buys,
+        "incomplete_basis_trade_ids": incomplete,
+        "counts_match": len(sells) == len(disposals) and not missing_sells and not missing_buys and not incomplete,
+        "holdings_cost_basis": {s: {"quantity": num(h.get("quantity")), "cost_basis_sek": num(h.get("cost_basis_sek")),
+            "lot_count": len(h.get("lots", []))} for s, h in state["holdings"].items()},
+        "warning": "Jämför med komplett börshistorik; äldre affärer kan saknas. Återskapade händelser från PAPER-loggen är inte automatiskt verifierade mot börsen.",
+        "reconstructed_events": sum(bool(e.get("reconstructed")) for e in events if isinstance(e, dict)),
+        "tax_filing_ready": False}
 
 
-def csv_response(rows,filename):
-    out=io.StringIO(newline="")
-    w=csv.writer(out); w.writerows(rows)
-    return StreamingResponse(iter([out.getvalue().encode("utf-8-sig")]),media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition":f'attachment; filename="{filename}"'})
+def csv_response(rows, filename):
+    out = io.StringIO(newline="")
+    w = csv.writer(out)
+    w.writerows(rows)
+    return StreamingResponse(iter([out.getvalue().encode("utf-8-sig")]), media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.get("/api/tax.csv")
 def tax_csv():
-    cols=["time","event_id","trade_id","type","symbol","quantity","proceeds_sek","cost_basis_sek",
-          "gain_loss_sek","fee_sek","method","basis_complete","mode"]
-    return csv_response([cols]+[[e.get(c,"") for c in cols] for e in state["tax_events"]],"paper_tax_ledger.csv")
+    cols = ["time", "event_id", "trade_id", "type", "symbol", "quantity", "proceeds_sek", "cost_basis_sek",
+            "gain_loss_sek", "fee_sek", "method", "basis_complete", "mode"]
+    return csv_response([cols] + [[e.get(c, "") for c in cols] for e in state["tax_events"]], "paper_tax_ledger.csv")
 
 
 @app.get("/api/tax/k4.csv")
@@ -1250,33 +1515,36 @@ def tax_k4_csv(year: int | None = Query(default=None, ge=2009, le=2100)):
 
 @app.get("/api/trades.csv")
 def trades_csv():
-    cols=["trade_id","mode","side","symbol","time","price_sek","quantity","amount_sek","fee_sek",
-          "fee_rate","automatic","realized_pnl_sek","tax_event_id"]
-    return csv_response([cols]+[[t.get(c,"") for c in cols] for t in state["trades"]],"paper_trades.csv")
+    cols = ["trade_id", "mode", "side", "symbol", "time", "price_sek", "quantity", "amount_sek", "fee_sek",
+            "fee_rate", "automatic", "realized_pnl_sek", "tax_event_id"]
+    return csv_response([cols] + [[t.get(c, "") for c in cols] for t in state["trades"]], "paper_trades.csv")
 
 
 @app.get("/api/risk/status")
 def risk_status():
-    try: prices=get_prices()
-    except HTTPException: prices={}
+    try:
+        prices = get_prices()
+    except HTTPException:
+        prices = {}
     with lock:
-        stats=get_daily_stats(prices)
-        return {"mode":MODE,"real_orders_enabled":False,"auto_enabled":bool(state["auto_enabled"]),
-            "limits":{"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,"duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,"purchase_amount_cap":True,"max_daily_trades":MAX_DAILY_TRADES,
-            "max_daily_loss_sek":MAX_DAILY_LOSS_SEK,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
-            "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,
-            "trailing_activation_pct":TRAILING_ACTIVATION_PCT,"trailing_drawdown_pct":TRAILING_DRAWDOWN_PCT,
-            "min_confidence":MIN_CONFIDENCE},
-            "risk_baseline_equity_sek":num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK),
-            "risk_halt":bool(state.get("risk_halt")),"today_utc":daily_key(),"daily_stats":stats,
-            "equity_sek":round(equity_from_prices(prices),2),
-            "estimated_total_drawdown_sek":round(max(0.0,num(state.get("risk_baseline_equity_sek"),START_BALANCE_SEK)-equity_from_prices(prices)),2),
-            "risk_events":state["risk_events"][-50:]}
+        stats = get_daily_stats(prices)
+        return {"mode": MODE, "real_orders_enabled": False, "auto_enabled": bool(state["auto_enabled"]),
+            "limits": {"max_trade_sek": MAX_TRADE_SEK, "max_position_sek": MAX_POSITION_SEK,
+            "duplicate_buy_window_seconds": DUPLICATE_BUY_WINDOW_SECONDS, "purchase_amount_cap": True,
+            "max_daily_trades": MAX_DAILY_TRADES, "max_daily_loss_sek": MAX_DAILY_LOSS_SEK,
+            "max_total_loss_sek": MAX_TOTAL_LOSS_SEK, "stop_loss_pct": STOP_LOSS_PCT,
+            "take_profit_pct": TAKE_PROFIT_PCT, "trailing_activation_pct": TRAILING_ACTIVATION_PCT,
+            "trailing_drawdown_pct": TRAILING_DRAWDOWN_PCT, "min_confidence": MIN_CONFIDENCE},
+            "risk_baseline_equity_sek": num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK),
+            "risk_halt": bool(state.get("risk_halt")), "today_utc": daily_key(), "daily_stats": stats,
+            "equity_sek": round(equity_from_prices(prices), 2),
+            "estimated_total_drawdown_sek": round(max(0.0, num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK) - equity_from_prices(prices)), 2),
+            "risk_events": state["risk_events"][-50:]}
 
 
 @app.get("/api/risk/events")
 def risk_events():
-    return {"events":state["risk_events"][-500:]}
+    return {"events": state["risk_events"][-500:]}
 
 
 def run_historical_backtest(candles: list[dict[str, float]], fx: float, fee_rate: float, slippage_bps: float, max_trade_sek: float, stop_loss_pct: float, take_profit_pct: float) -> dict[str, Any]:
@@ -1307,7 +1575,6 @@ def run_historical_backtest(candles: list[dict[str, float]], fx: float, fee_rate
     fee_rate = clamp(fee_rate, 0.0, 0.02)
     slip = max(0.0, slippage_bps) / 10000.0
     for i in range(220, len(rows)):
-        # Only use information available at the previous candle close; execute at this candle's open.
         j = i - 1
         signal_close = closes[j]
         trend = e9[j] > e21[j] > e50[j] and e50[j] > e200[j] and signal_close > e200[j]
@@ -1326,10 +1593,14 @@ def run_historical_backtest(candles: list[dict[str, float]], fx: float, fee_rate
             net_value = qty * mark * (1-fee_rate)
             net_return = (net_value / entry_cost - 1) * 100 if entry_cost > 0 else 0.0
             reason = None
-            if net_return <= -stop_loss_pct: reason = "stop_loss"
-            elif net_return >= take_profit_pct: reason = "take_profit"
-            elif peak_price >= entry_price * (1 + 0.03) and mark <= peak_price * (1 - 0.02): reason = "trailing_stop"
-            elif not trend and not hist: reason = "trend_exit"
+            if net_return <= -stop_loss_pct:
+                reason = "stop_loss"
+            elif net_return >= take_profit_pct:
+                reason = "take_profit"
+            elif peak_price >= entry_price * (1 + 0.03) and mark <= peak_price * (1 - 0.02):
+                reason = "trailing_stop"
+            elif not trend and not hist:
+                reason = "trend_exit"
             if reason:
                 fill = mark * (1-slip)
                 gross = qty * fill
@@ -1337,10 +1608,14 @@ def run_historical_backtest(candles: list[dict[str, float]], fx: float, fee_rate
                 net = gross - fee
                 pnl = net - entry_cost
                 cash += net
-                trades.append({"side":"sell", "time":rows[i]["time"], "price_sek":round(fill,8),
-                               "net_pnl_sek":round(pnl,4), "return_pct":round(100*pnl/entry_cost,4) if entry_cost else 0,
-                               "reason":reason, "fees_sek":round(fee,4)})
-                qty = 0.0; entry_cost = 0.0; entry_price = 0.0; entry_time = None; peak_price = 0.0
+                trades.append({"side": "sell", "time": rows[i]["time"], "price_sek": round(fill, 8),
+                               "net_pnl_sek": round(pnl, 4), "return_pct": round(100*pnl/entry_cost, 4) if entry_cost else 0,
+                               "reason": reason, "fees_sek": round(fee, 4)})
+                qty = 0.0
+                entry_cost = 0.0
+                entry_price = 0.0
+                entry_time = None
+                peak_price = 0.0
                 continue
         if qty <= 0 and buy_signal:
             principal = min(max_trade_sek/(1+fee_rate), cash/(1+fee_rate))
@@ -1354,24 +1629,24 @@ def run_historical_backtest(candles: list[dict[str, float]], fx: float, fee_rate
                 peak_price = fill
                 entry_time = rows[i]["time"]
                 cash -= total
-                trades.append({"side":"buy", "time":rows[i]["time"], "price_sek":round(fill,8),
-                               "net_pnl_sek":0.0, "return_pct":0.0, "reason":"entry_signal", "fees_sek":round(fee,4)})
+                trades.append({"side": "buy", "time": rows[i]["time"], "price_sek": round(fill, 8),
+                               "net_pnl_sek": 0.0, "return_pct": 0.0, "reason": "entry_signal", "fees_sek": round(fee, 4)})
     last_price = closes[-1]
     open_value = qty * last_price * (1-fee_rate) if qty > 0 else 0.0
     equity = cash + open_value
     sells = [t for t in trades if t["side"] == "sell"]
     wins = [t for t in sells if t["net_pnl_sek"] > 0]
-    return {"starting_equity_sek":round(start_equity,2), "ending_equity_sek":round(equity,2),
-            "net_pnl_sek":round(equity-start_equity,2), "return_pct":round((equity/start_equity-1)*100,3),
-            "closed_trades":len(sells), "entries":sum(1 for t in trades if t["side"]=="buy"),
-            "win_rate_pct":round(100*len(wins)/len(sells),2) if sells else None,
-            "fees_and_slippage_included":True, "open_position_at_end":qty>0,
-            "open_position_value_sek":round(open_value,2), "trades":trades[-100:]}
+    return {"starting_equity_sek": round(start_equity, 2), "ending_equity_sek": round(equity, 2),
+            "net_pnl_sek": round(equity-start_equity, 2), "return_pct": round((equity/start_equity-1)*100, 3),
+            "closed_trades": len(sells), "entries": sum(1 for t in trades if t["side"] == "buy"),
+            "win_rate_pct": round(100*len(wins)/len(sells), 2) if sells else None,
+            "fees_and_slippage_included": True, "open_position_at_end": qty > 0,
+            "open_position_value_sek": round(open_value, 2), "trades": trades[-100:]}
 
 
 @app.get("/api/backtest")
 def backtest(symbol: str = Query(default="BTC"), slippage_bps: float = Query(default=BACKTEST_SLIPPAGE_BPS, ge=0, le=200)):
-    """Small long-only historical simulation on the candles currently fetched from Coinbase. It is a diagnostic, not an out-of-sample validation; only 5m candles returned by the API are used."""
+    """Small long-only historical simulation on recent Coinbase candles; diagnostic only."""
     symbol = symbol.upper()
     if symbol not in SYMBOLS:
         raise HTTPException(400, "Okänd kryptovaluta.")
@@ -1387,12 +1662,11 @@ def backtest(symbol: str = Query(default="BTC"), slippage_bps: float = Query(def
             "fee_rate_each_side": clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02),
             "strategy": "EMA200 + EMA9/21/50 trend + rising stochastic + volume filter + ATR-aware stop distance",
             "results": result,
-            "warning": "In-sample simulation of the available recent candles only; not a full-market backtest, not out-of-sample validation, and no guarantee of future profit."}
+            "warning": "In-sample simulation of recent candles only; not out-of-sample validation and no guarantee of future profit."}
 
 
 @app.get("/api/trader-intelligence/status")
 def trader_intelligence_status():
-    """Read-only status: no public-trader data is used unless verified and normalized."""
     enabled = os.getenv("TRADER_INTEL_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
     return {"enabled": enabled, "mode": MODE, "real_orders_enabled": False,
             "status": "disabled_safe_default" if not enabled else "adapter_required",
@@ -1402,19 +1676,23 @@ def trader_intelligence_status():
 
 @app.post("/api/safety/disable-real-orders")
 def disable_real_orders():
-    with lock: state["real_orders_enabled"]=False; persist()
-    return {"ok":True,"real_orders_enabled":False,"mode":MODE}
+    with lock:
+        state["real_orders_enabled"] = False
+        persist()
+    return {"ok": True, "real_orders_enabled": False, "mode": MODE}
 
 
 @app.get("/api/auto/enable")
 def auto_enable_compat():
-    return {"enabled":bool(state["auto_enabled"]),"message":"Använd POST /api/auto/start för att aktivera PAPER-handel."}
+    return {"enabled": bool(state["auto_enabled"]), "message": "Använd POST /api/auto/start för att aktivera PAPER-handel."}
 
 
 @app.get("/api/auto/disable")
 def auto_disable_compat():
-    with lock: state["auto_enabled"]=False; persist()
-    return {"enabled":False,"message":"PAPER-handel stoppad."}
+    with lock:
+        state["auto_enabled"] = False
+        persist()
+    return {"enabled": False, "message": "PAPER-handel stoppad."}
 
 
 restore()
