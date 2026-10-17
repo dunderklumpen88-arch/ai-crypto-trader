@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "15.5.0-paper-adaptive-signals"
+APP_VERSION = "15.6.0-paper-8-trades-daily"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -35,7 +35,7 @@ MAX_POSITION_SEK = 100.0
 # Ignore rapid repeated automatic buys of the same coin (duplicate signal protection).
 DUPLICATE_BUY_WINDOW_SECONDS = 15.0
 MAX_TOTAL_LOSS_SEK = max(1.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "500")))
-MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "4")))
+MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "8")))
 MAX_DAILY_LOSS_SEK = max(0.0, float(os.getenv("MAX_DAILY_LOSS_SEK", "500")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "6"))
