@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "13.2.0-confirmed-momentum"
+APP_VERSION = "14.0.0-multitimeframe-paper"
 MODE = "PAPER ONLY"
 # Coinbase EUR spot pairs. Keep this list to products that have returned valid ticker data.
 SYMBOLS = [
@@ -417,7 +417,10 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     avg_ret = sum(recent_returns) / len(recent_returns) if recent_returns else 0.0
     volatility = (sum((x-avg_ret)**2 for x in recent_returns) / max(1, len(recent_returns)-1))**0.5 if len(recent_returns) > 1 else 0.0
     volumes = [c["volume"] for c in valid_candles]
-    avg_vol = sum(volumes[-20:]) / len(volumes[-20:]) if len(volumes) >= 20 else 0.0
+    # Compare the latest completed candle against the preceding 20 candles.
+    # Including the current candle in its own baseline dampens genuine volume spikes.
+    prior_volumes = volumes[-21:-1] if len(volumes) >= 21 else []
+    avg_vol = sum(prior_volumes) / len(prior_volumes) if prior_volumes else 0.0
     vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0.0
 
     advanced = analyze_advanced(valid_candles, fx=fx, current_price_sek=last_close)
@@ -429,6 +432,19 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     histogram_up = macd_hist > 0
     histogram_down = macd_hist < 0
     data_quality = "HIGH" if samples >= 200 else ("MEDIUM" if samples >= 100 else "LOW")
+
+    # Multi-timeframe confirmation built from the same completed 5-minute candles.
+    # 15m closes use every third candle; 1h closes use every twelfth candle.
+    closes_15m = [closes[i] for i in range(2, samples, 3)]
+    closes_1h = [closes[i] for i in range(11, samples, 12)]
+    ema9_15m, ema21_15m = ema(closes_15m, 9), ema(closes_15m, 21)
+    ema9_1h, ema21_1h = ema(closes_1h, 9), ema(closes_1h, 21)
+    trend_15m = ("UP" if len(closes_15m) >= 25 and ema9_15m[-1] > ema21_15m[-1]
+                 else "DOWN" if len(closes_15m) >= 25 and ema9_15m[-1] < ema21_15m[-1]
+                 else "NEUTRAL")
+    trend_1h = ("UP" if len(closes_1h) >= 22 and ema9_1h[-1] > ema21_1h[-1]
+                else "DOWN" if len(closes_1h) >= 22 and ema9_1h[-1] < ema21_1h[-1]
+                else "NEUTRAL")
 
     # Transparent score is descriptive only. Signal generation uses explicit gates,
     # not the score alone; correlated indicators do not count as proof of profitability.
@@ -470,6 +486,8 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         "volym tillräcklig": vol_ratio >= 0.50,
         "inte för långt över EMA21": price_above_ema21_pct <= 1.8,
         "volatilitet rimlig": volatility <= 2.5,
+        "15m-trend inte bearish": trend_15m != "DOWN",
+        "1h-trend inte bearish": trend_1h != "DOWN",
         "ingen översträckning i stochastic": (adv.get("stochastic_k") is None or adv.get("stochastic_k") <= 92),
     }
     buy_ok = all(buy_gates.values())
@@ -510,6 +528,8 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                 "macd_signal_sek": round(macd_sig, 8), "macd_histogram_sek": round(macd_hist, 8),
                 "momentum_pct": round(momentum, 4), "volatility_pct": round(volatility, 4),
                 "volume_ratio": round(vol_ratio, 3), "samples": samples,
+                "multi_timeframe": {"15m_trend": trend_15m, "1h_trend": trend_1h,
+                    "15m_samples": len(closes_15m), "1h_samples": len(closes_1h)},
                 "advanced": adv, "buy_gates": buy_gates, "sell_gates": sell_gates,
                 "candle_interval_minutes": 5, "data_quality": data_quality},
             "reason": "; ".join(reasons), "not_financial_advice": True}
@@ -831,6 +851,17 @@ def auto_loop():
                                   if sig["symbol"] not in exited_this_cycle
                                   and sig["signal"] == "KÖP" and sig["confidence"] >= MIN_CONFIDENCE
                                   and num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) <= 1e-12]
+                # Allocate scarce PAPER cash to the strongest confirmed candidates first.
+                # Score and indicators are ranking hints, not probabilities.
+                buy_candidates.sort(
+                    key=lambda sig: (
+                        num(sig.get("score")),
+                        num(sig.get("confidence")),
+                        num(sig.get("indicators", {}).get("momentum_pct")),
+                        num(sig.get("indicators", {}).get("volume_ratio")),
+                    ),
+                    reverse=True,
+                )
                 available = max(0.0, num(state.get("balance_sek")))
                 if buy_candidates and not state.get("risk_halt"):
                     fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
@@ -934,7 +965,7 @@ def signals():
     signals = make_signals()
     returned = {item.get("symbol") for item in signals}
     return {"signals":signals,"updated_at":now_iso(),"mode":MODE,
-            "strategy":"13.2: closed 5m candles, EMA trend slope, MACD histogram, RSI, momentum, volume/extension gates + net-fee exits",
+            "strategy":"14.0: closed 5m candles, 15m/1h trend confirmation, EMA slope, MACD, RSI, momentum, prior-candle volume baseline, ranked candidates + net-fee exits",
             "symbols_configured":SYMBOLS,
             "symbols_returned":sorted(returned),
             "symbols_missing":sorted(set(SYMBOLS) - returned),
