@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "15.4.0-paper-more-buy-signals"
+APP_VERSION = "15.5.0-paper-adaptive-signals"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -540,7 +540,12 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         and momentum > 0.0
         and histogram_up
     )
-    stoch_ok = stoch_trigger or (20.0 <= stoch_now <= 82.0 and momentum >= 0.0)
+    # Adaptive confirmation: low relative candle volume alone should not block every
+    # otherwise credible setup, but breakouts still need stronger volume confirmation.
+    # A weak-volume setup is only allowed when MACD and short momentum both agree.
+    volume_momentum_confirmed = histogram_up and momentum >= 0.05 and 40 <= rsi_v <= 70
+    volume_ok = vol_ratio >= 0.10 or (not breakout and volume_momentum_confirmed)
+    stoch_ok = stoch_trigger or (20.0 <= stoch_now <= 95.0 and momentum >= 0.0)
     trend_ok = long_trend_up or trend_up or early_reversal
     buy_gates = {
         "tillräcklig historik": samples >= 60,
@@ -549,15 +554,16 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         "bekräftelse med MACD": histogram_up,
         "RSI inom utökat intervall": 40 <= rsi_v <= 75,
         "momentum inte kraftigt negativt": momentum >= -0.10,
-        "volym tillräcklig": vol_ratio >= 0.35,
+        "volym tillräcklig eller bekräftad av momentum": volume_ok,
         "breakout har rimlig volym": (not breakout) or vol_ratio >= 0.50,
         "inte för långt över EMA21": price_above_ema21_pct <= 4.0,
         "volatilitet rimlig": volatility <= 5.0,
         "15m-trend eller momentumvändning": (
-            trend_15m != "DOWN" or (histogram_up and momentum > 0.15)
+            trend_15m != "DOWN" or (histogram_up and momentum > 0.05)
         ),
-        "1h-trend eller lång trend": (
+        "1h-trend eller momentumvändning": (
             trend_1h != "DOWN" or (long_trend_up and momentum > 0.0)
+            or (histogram_up and momentum > 0.05)
         ),
         "ingen extrem översträckning i stochastic": stoch_now <= 95,
     }
