@@ -13,12 +13,12 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "14.0.0-multitimeframe-paper"
+APP_VERSION = "15.0.0-risk-atr-backtest-paper"
 MODE = "PAPER ONLY"
 # Coinbase EUR spot pairs. Keep this list to products that have returned valid ticker data.
 SYMBOLS = [
     "BTC", "ETH", "SOL", "XRP", "SHIB", "ADA", "DOGE", "LINK", "AVAX",
-    "DOT", "LTC", "BCH", "ATOM", "UNI", "AAVE", "XLM", "ETC", "FIL", "HBAR", "BNB"
+    "DOT", "LTC", "BCH", "ATOM", "UNI", "AAVE", "XLM", "ETC", "FIL"
 ]
 PRODUCTS = {s: f"{s}-EUR" for s in SYMBOLS}
 START_BALANCE_SEK = float(os.getenv("PAPER_START_BALANCE_SEK", "1000"))
@@ -37,6 +37,9 @@ TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "6"))
 TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "3"))
 TRAILING_DRAWDOWN_PCT = float(os.getenv("TRAILING_DRAWDOWN_PCT", "2"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "70"))
+RISK_PER_TRADE_PCT = min(2.0, max(0.1, float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))))
+BACKTEST_SLIPPAGE_BPS = max(0.0, float(os.getenv("BACKTEST_SLIPPAGE_BPS", "10")))
+NEWS_BLACKOUT_MINUTES = max(0, int(os.getenv("NEWS_BLACKOUT_MINUTES", "15")))
 AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
 # Safety: always start with automation disabled; enable manually from the dashboard.
 AUTO_PAPER_ON_START = False
@@ -379,6 +382,35 @@ def rsi(values: list[float], period=14) -> float:
     return 100 - 100 / (1 + avg_gain/avg_loss)
 
 
+def stochastic_k(highs: list[float], lows: list[float], close: float, period: int = 14) -> float:
+    if len(highs) < period or len(lows) < period:
+        return 50.0
+    hi, lo = max(highs[-period:]), min(lows[-period:])
+    return 100.0 * (close - lo) / (hi - lo) if hi > lo else 50.0
+
+
+def news_blackout_status(now: datetime | None = None) -> dict[str, Any]:
+    """Optional manual event blackout. NEWS_BLACKOUT_TIMES_UTC is comma-separated ISO timestamps. No news calendar is guessed or scraped; without configured timestamps this guard is inactive."""
+    now = now or datetime.now(timezone.utc)
+    raw = os.getenv("NEWS_BLACKOUT_TIMES_UTC", "").strip()
+    if not raw or NEWS_BLACKOUT_MINUTES <= 0:
+        return {"active": False, "reason": "no_configured_event_times", "minutes": NEWS_BLACKOUT_MINUTES}
+    for item in raw.split(","):
+        try:
+            stamp = datetime.fromisoformat(item.strip().replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            delta = abs((now - stamp.astimezone(timezone.utc)).total_seconds()) / 60.0
+            if delta <= NEWS_BLACKOUT_MINUTES:
+                return {"active": True, "reason": "configured_economic_event_blackout",
+                        "event_time_utc": stamp.astimezone(timezone.utc).isoformat(),
+                        "minutes_until_or_since_event": round((stamp.astimezone(timezone.utc)-now).total_seconds()/60.0, 2),
+                        "minutes": NEWS_BLACKOUT_MINUTES}
+        except (ValueError, TypeError):
+            continue
+    return {"active": False, "reason": "outside_configured_event_windows", "minutes": NEWS_BLACKOUT_MINUTES}
+
+
 def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     """Conservative signal model: confirmed trend + momentum + liquidity filters. Signals are computed from closed OHLCV candles. Confidence is a heuristic score, not a calibrated probability of profit. KÖP requires every primary gate below. """
     candles = get_candles(symbol)
@@ -403,7 +435,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
 
     # Do not append the live ticker to the candle series: that would mix an unfinished
     # price observation into indicators based on closed 5-minute candles.
-    e9, e21, e50 = ema(closes, 9), ema(closes, 21), ema(closes, 50)
+    e9, e21, e50, e200 = ema(closes, 9), ema(closes, 21), ema(closes, 50), ema(closes, 200)
     last_close = closes[-1]
     rsi_v = rsi(closes)
     macd_line = [a-b for a, b in zip(ema(closes, 12), ema(closes, 26))]
@@ -417,6 +449,8 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     avg_ret = sum(recent_returns) / len(recent_returns) if recent_returns else 0.0
     volatility = (sum((x-avg_ret)**2 for x in recent_returns) / max(1, len(recent_returns)-1))**0.5 if len(recent_returns) > 1 else 0.0
     volumes = [c["volume"] for c in valid_candles]
+    highs_sek = [c["high"] * fx for c in valid_candles]
+    lows_sek = [c["low"] * fx for c in valid_candles]
     # Compare the latest completed candle against the preceding 20 candles.
     # Including the current candle in its own baseline dampens genuine volume spikes.
     prior_volumes = volumes[-21:-1] if len(volumes) >= 21 else []
@@ -427,6 +461,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     adv = advanced.get("indicators", {})
     e50_slope_pct = ((e50[-1] / e50[-7]) - 1) * 100 if samples >= 56 and e50[-7] else 0.0
     trend_up = samples >= 60 and e9[-1] > e21[-1] > e50[-1] and e50_slope_pct > 0
+    long_trend_up = samples >= 220 and last_close > e200[-1]
     trend_down = samples >= 60 and e9[-1] < e21[-1] < e50[-1] and e50_slope_pct < 0
     price_above_ema21_pct = ((last_close / e21[-1]) - 1) * 100 if e21[-1] else 0.0
     histogram_up = macd_hist > 0
@@ -445,6 +480,13 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     trend_1h = ("UP" if len(closes_1h) >= 22 and ema9_1h[-1] > ema21_1h[-1]
                 else "DOWN" if len(closes_1h) >= 22 and ema9_1h[-1] < ema21_1h[-1]
                 else "NEUTRAL")
+    stoch_now = stochastic_k(highs_sek, lows_sek, last_close, 14)
+    prev_close = closes[-2] if samples >= 2 else last_close
+    stoch_prev = stochastic_k(highs_sek[:-1], lows_sek[:-1], prev_close, 14)
+    stoch_trigger = samples >= 16 and 25.0 <= stoch_now <= 85.0 and stoch_now > stoch_prev
+    prior_highs = highs_sek[-21:-1] if len(highs_sek) >= 21 else []
+    breakout = bool(prior_highs and last_close > max(prior_highs))
+    breakout_volume_confirmed = breakout and vol_ratio >= 1.2
 
     # Transparent score is descriptive only. Signal generation uses explicit gates,
     # not the score alone; correlated indicators do not count as proof of profitability.
@@ -456,6 +498,14 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         score -= 2; reasons.append("Trendfilter: EMA9<EMA21<EMA50 och EMA50 lutar nedåt")
     else:
         reasons.append("Ingen bekräftad trend i EMA-strukturen")
+    if long_trend_up:
+        score += 2; reasons.append("Lång trend bekräftad: pris över EMA200")
+    else:
+        reasons.append("EMA200-filter ej uppfyllt eller otillräcklig historik")
+    if stoch_trigger:
+        score += 1; reasons.append("Stochastic-trigger stigande inom godkänt intervall")
+    if breakout_volume_confirmed:
+        score += 1; reasons.append("Breakout bekräftad av volym över 1,2x baslinjen")
     if histogram_up:
         score += 1; reasons.append("MACD-histogram positivt")
     elif histogram_down:
@@ -478,17 +528,20 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     # A BUY needs a trend, positive momentum, positive MACD histogram, reasonable
     # RSI, non-thin volume, sufficient history, and no chase far above EMA21.
     buy_gates = {
-        "tillräcklig historik": samples >= 100,
+        "tillräcklig historik": samples >= 220,
+        "lång trend över EMA200": long_trend_up,
+        "stochastic-trigger": stoch_trigger,
         "bekräftad upptrend": trend_up,
         "MACD-histogram positivt": histogram_up,
         "RSI mellan 50 och 67": 50 <= rsi_v <= 67,
         "momentum positivt": momentum >= 0.10,
-        "volym tillräcklig": vol_ratio >= 0.50,
+        "volym tillräcklig": vol_ratio >= 0.80,
+        "breakout har volymbekräftelse": (not breakout) or breakout_volume_confirmed,
         "inte för långt över EMA21": price_above_ema21_pct <= 1.8,
         "volatilitet rimlig": volatility <= 2.5,
         "15m-trend inte bearish": trend_15m != "DOWN",
         "1h-trend inte bearish": trend_1h != "DOWN",
-        "ingen översträckning i stochastic": (adv.get("stochastic_k") is None or adv.get("stochastic_k") <= 92),
+        "ingen översträckning i stochastic": stoch_now <= 92,
     }
     buy_ok = all(buy_gates.values())
 
@@ -522,7 +575,11 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     return {"symbol": symbol, "product": PRODUCTS[symbol], "price_sek": round(price_sek, 10),
             "signal": signal, "confidence": int(confidence), "score": int(score),
             "indicators": {"ema9_sek": round(e9[-1], 8), "ema21_sek": round(e21[-1], 8),
-                "ema50_sek": round(e50[-1], 8), "ema50_slope_pct": round(e50_slope_pct, 4),
+                "ema50_sek": round(e50[-1], 8), "ema200_sek": round(e200[-1], 8),
+                "above_ema200": long_trend_up, "ema50_slope_pct": round(e50_slope_pct, 4),
+                "stochastic_k": round(stoch_now, 2), "stochastic_previous_k": round(stoch_prev, 2),
+                "stochastic_trigger": stoch_trigger, "breakout": breakout,
+                "breakout_volume_confirmed": breakout_volume_confirmed,
                 "price_above_ema21_pct": round(price_above_ema21_pct, 4),
                 "rsi14": round(rsi_v, 2), "macd_sek": round(macd, 8),
                 "macd_signal_sek": round(macd_sig, 8), "macd_histogram_sek": round(macd_hist, 8),
@@ -847,7 +904,8 @@ def auto_loop():
                                 if exc.status_code not in (409,): raise
                 # Do not repeatedly pyramid into the same coin every scan. Every BUY is hard-capped
                 # at 100 SEK including fee, with a backend check in paper_order().
-                buy_candidates = [sig for sig in signals
+                news_guard = news_blackout_status()
+                buy_candidates = [] if news_guard["active"] else [sig for sig in signals
                                   if sig["symbol"] not in exited_this_cycle
                                   and sig["signal"] == "KÖP" and sig["confidence"] >= MIN_CONFIDENCE
                                   and num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) <= 1e-12]
@@ -863,15 +921,27 @@ def auto_loop():
                     reverse=True,
                 )
                 available = max(0.0, num(state.get("balance_sek")))
-                if buy_candidates and not state.get("risk_halt"):
+                if buy_candidates and not state.get("risk_halt") and not news_guard["active"]:
                     fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
-                    per_coin_budget = min(MAX_TRADE_SEK / (1.0 + fee_rate),
-                                          available / len(buy_candidates) / (1.0 + fee_rate))
+                    equity_now = max(0.0, equity_from_prices(prices))
+                    risk_budget_sek = equity_now * (RISK_PER_TRADE_PCT / 100.0)
                     for sig in buy_candidates:
-                        if per_coin_budget <= 0:
+                        if available <= 0.01:
                             break
+                        atr_pct = num(sig.get("indicators", {}).get("advanced", {}).get("atr_pct"), 0.0)
+                        stop_distance_pct = max(STOP_LOSS_PCT, atr_pct * 1.5)
+                        risk_sized_principal = risk_budget_sek / max(stop_distance_pct / 100.0, 0.0001)
+                        current_value = num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) * num(prices.get(sig["symbol"]))
+                        position_room = max(0.0, MAX_POSITION_SEK - current_value)
+                        principal = min(MAX_TRADE_SEK / (1.0 + fee_rate),
+                                        risk_sized_principal / (1.0 + fee_rate),
+                                        position_room / (1.0 + fee_rate),
+                                        available / (1.0 + fee_rate))
+                        if principal <= 0.01:
+                            continue
                         try:
-                            paper_order("buy", sig["symbol"], per_coin_budget, automatic=True)
+                            paper_order("buy", sig["symbol"], principal, automatic=True)
+                            available = max(0.0, num(state.get("balance_sek")))
                         except HTTPException as exc:
                             if exc.status_code not in (409,): raise
                 with lock:
@@ -1011,7 +1081,9 @@ def auto_status():
             "max_total_loss_sek":MAX_TOTAL_LOSS_SEK,"risk_halt":bool(state.get("risk_halt")),
             "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,
             "trailing_activation_pct":TRAILING_ACTIVATION_PCT,"trailing_drawdown_pct":TRAILING_DRAWDOWN_PCT,
-            "min_confidence":MIN_CONFIDENCE,"last_run":state.get("last_auto_run"),
+            "min_confidence":MIN_CONFIDENCE,"risk_per_trade_pct":RISK_PER_TRADE_PCT,
+            "news_blackout":news_blackout_status(),"news_blackout_minutes":NEWS_BLACKOUT_MINUTES,
+            "last_run":state.get("last_auto_run"),
             "last_error":state.get("last_error")}
 
 
@@ -1155,17 +1227,115 @@ def risk_events():
     return {"events":state["risk_events"][-500:]}
 
 
+def run_historical_backtest(candles: list[dict[str, float]], fx: float, fee_rate: float, slippage_bps: float, max_trade_sek: float, stop_loss_pct: float, take_profit_pct: float) -> dict[str, Any]:
+    """Chronological long-only backtest with no look-ahead: signals use candle i-1, fills use candle i open."""
+    rows = []
+    for row in candles:
+        try:
+            clean = {k: num(row[k]) for k in ("time", "open", "high", "low", "close", "volume")}
+            if clean["open"] > 0 and clean["close"] > 0 and clean["high"] >= clean["low"] > 0:
+                rows.append(clean)
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(rows) < 230:
+        return {"trades": 0, "error": "insufficient_valid_candles", "valid_candles": len(rows)}
+    closes = [r["close"] * fx for r in rows]
+    highs = [r["high"] * fx for r in rows]
+    lows = [r["low"] * fx for r in rows]
+    volumes = [max(0.0, r["volume"]) for r in rows]
+    e9, e21, e50, e200 = ema(closes, 9), ema(closes, 21), ema(closes, 50), ema(closes, 200)
+    cash = 1000.0
+    start_equity = cash
+    qty = 0.0
+    entry_cost = 0.0
+    entry_price = 0.0
+    entry_time = None
+    peak_price = 0.0
+    trades = []
+    fee_rate = clamp(fee_rate, 0.0, 0.02)
+    slip = max(0.0, slippage_bps) / 10000.0
+    for i in range(220, len(rows)):
+        # Only use information available at the previous candle close; execute at this candle's open.
+        j = i - 1
+        signal_close = closes[j]
+        trend = e9[j] > e21[j] > e50[j] and e50[j] > e200[j] and signal_close > e200[j]
+        hist = (ema(closes[:j+1], 12)[-1] - ema(closes[:j+1], 26)[-1]) > 0
+        stoch_now = stochastic_k(highs[:j+1], lows[:j+1], closes[j], 14)
+        stoch_prev = stochastic_k(highs[:j], lows[:j], closes[j-1], 14) if j >= 15 else 50.0
+        stoch_trigger = 25 <= stoch_now <= 85 and stoch_now > stoch_prev
+        prior_vols = volumes[max(0, j-20):j]
+        vol_base = sum(prior_vols) / len(prior_vols) if prior_vols else 0.0
+        vol_ratio = volumes[j] / vol_base if vol_base > 0 else 0.0
+        buy_signal = trend and hist and stoch_trigger and vol_ratio >= 0.8
+        fill_open = rows[i]["open"] * fx
+        if qty > 0:
+            mark = rows[i]["close"] * fx
+            peak_price = max(peak_price, mark)
+            net_value = qty * mark * (1-fee_rate)
+            net_return = (net_value / entry_cost - 1) * 100 if entry_cost > 0 else 0.0
+            reason = None
+            if net_return <= -stop_loss_pct: reason = "stop_loss"
+            elif net_return >= take_profit_pct: reason = "take_profit"
+            elif peak_price >= entry_price * (1 + 0.03) and mark <= peak_price * (1 - 0.02): reason = "trailing_stop"
+            elif not trend and not hist: reason = "trend_exit"
+            if reason:
+                fill = mark * (1-slip)
+                gross = qty * fill
+                fee = gross * fee_rate
+                net = gross - fee
+                pnl = net - entry_cost
+                cash += net
+                trades.append({"side":"sell", "time":rows[i]["time"], "price_sek":round(fill,8),
+                               "net_pnl_sek":round(pnl,4), "return_pct":round(100*pnl/entry_cost,4) if entry_cost else 0,
+                               "reason":reason, "fees_sek":round(fee,4)})
+                qty = 0.0; entry_cost = 0.0; entry_price = 0.0; entry_time = None; peak_price = 0.0
+                continue
+        if qty <= 0 and buy_signal:
+            principal = min(max_trade_sek/(1+fee_rate), cash/(1+fee_rate))
+            fill = fill_open * (1+slip)
+            if principal > 1 and fill > 0:
+                fee = principal * fee_rate
+                total = principal + fee
+                qty = principal / fill
+                entry_cost = total
+                entry_price = fill
+                peak_price = fill
+                entry_time = rows[i]["time"]
+                cash -= total
+                trades.append({"side":"buy", "time":rows[i]["time"], "price_sek":round(fill,8),
+                               "net_pnl_sek":0.0, "return_pct":0.0, "reason":"entry_signal", "fees_sek":round(fee,4)})
+    last_price = closes[-1]
+    open_value = qty * last_price * (1-fee_rate) if qty > 0 else 0.0
+    equity = cash + open_value
+    sells = [t for t in trades if t["side"] == "sell"]
+    wins = [t for t in sells if t["net_pnl_sek"] > 0]
+    return {"starting_equity_sek":round(start_equity,2), "ending_equity_sek":round(equity,2),
+            "net_pnl_sek":round(equity-start_equity,2), "return_pct":round((equity/start_equity-1)*100,3),
+            "closed_trades":len(sells), "entries":sum(1 for t in trades if t["side"]=="buy"),
+            "win_rate_pct":round(100*len(wins)/len(sells),2) if sells else None,
+            "fees_and_slippage_included":True, "open_position_at_end":qty>0,
+            "open_position_value_sek":round(open_value,2), "trades":trades[-100:]}
+
+
 @app.get("/api/backtest")
-def backtest(symbol:str=Query(default="BTC")):
-    symbol=symbol.upper()
-    if symbol not in SYMBOLS: raise HTTPException(400,"Okänd kryptovaluta.")
-    prices=get_prices(force=True)
-    if symbol not in prices or num(prices.get(symbol)) <= 0:
-        raise HTTPException(503, f"Marknadspris saknas för {symbol}; Coinbase-paret kan vara otillgängligt just nu.")
-    candles=get_candles(symbol,force=True)
-    sig=analyze_symbol(symbol,prices[symbol])
-    return {"mode":"MARKET_DATA_SIGNAL_DIAGNOSTIC_ONLY","symbol":symbol,"candle_count":len(candles),
-        "signal":sig,"warning":"Detta är inte ett historiskt portföljbacktest och garanterar inte framtida resultat."}
+def backtest(symbol: str = Query(default="BTC"), slippage_bps: float = Query(default=BACKTEST_SLIPPAGE_BPS, ge=0, le=200)):
+    """Small long-only historical simulation on the candles currently fetched from Coinbase. It is a diagnostic, not an out-of-sample validation; only 5m candles returned by the API are used."""
+    symbol = symbol.upper()
+    if symbol not in SYMBOLS:
+        raise HTTPException(400, "Okänd kryptovaluta.")
+    candles = get_candles(symbol, force=True)
+    if len(candles) < 230:
+        raise HTTPException(503, f"För få candles för EMA200-backtest: {len(candles)}. Minst 230 krävs.")
+    result = run_historical_backtest(candles, fx=num(market_cache.get("eur_sek"), 11.2),
+                                     fee_rate=clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02),
+                                     slippage_bps=slippage_bps, max_trade_sek=MAX_TRADE_SEK,
+                                     stop_loss_pct=STOP_LOSS_PCT, take_profit_pct=TAKE_PROFIT_PCT)
+    return {"mode": "PAPER_ONLY_HISTORICAL_SIMULATION", "symbol": symbol,
+            "timeframe_minutes": 5, "candles": len(candles), "slippage_bps_each_side": slippage_bps,
+            "fee_rate_each_side": clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02),
+            "strategy": "EMA200 + EMA9/21/50 trend + rising stochastic + volume filter + ATR-aware stop distance",
+            "results": result,
+            "warning": "In-sample simulation of the available recent candles only; not a full-market backtest, not out-of-sample validation, and no guarantee of future profit."}
 
 
 @app.get("/api/trader-intelligence/status")
