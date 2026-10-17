@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "15.0.0-risk-atr-backtest-paper"
+APP_VERSION = "15.1.0-paper-diagnostics-integration-ready"
 MODE = "PAPER ONLY"
 # Coinbase EUR spot pairs. Keep this list to products that have returned valid ticker data.
 SYMBOLS = [
@@ -1042,6 +1042,58 @@ def signals():
             "market_source_errors":dict(market_cache.get("source_errors",{})),
             "auto_paper_on_start":AUTO_PAPER_ON_START,
             "note":"Signaler är heuristiska, inte garanterade prognoser. Saknade symboler har ingen användbar aktuell marknadsdata. Inga riktiga order skickas."}
+
+
+@app.get("/api/auto/diagnostics")
+def auto_diagnostics():
+    """Explain why the PAPER bot may not have bought; this endpoint never places orders."""
+    try:
+        scanned = make_signals()
+        scan_error = None
+    except Exception as exc:
+        scanned = []
+        scan_error = str(exc)[:300]
+
+    prices = get_prices()
+    news_guard = news_blackout_status()
+    reasons = []
+    candidates = []
+    for sig in scanned:
+        symbol = sig.get("symbol", "?")
+        held = num(state.get("holdings", {}).get(symbol, {}).get("quantity"))
+        why = []
+        if sig.get("signal") != "KÖP":
+            why.append(f"Signal är {sig.get('signal', 'okänd')}")
+        if num(sig.get("confidence")) < MIN_CONFIDENCE:
+            why.append(f"Konfidens {num(sig.get('confidence')):.0f}% under gränsen {MIN_CONFIDENCE}%")
+        if held > 1e-12:
+            why.append("Det finns redan en position i valutan")
+        if news_guard.get("active"):
+            why.append("Nyhetsspärren är aktiv")
+        if state.get("risk_halt"):
+            why.append("Riskspärren är aktiv")
+        if num(state.get("balance_sek")) <= 0.01:
+            why.append("Inget tillgängligt simulerat saldo")
+        if sig.get("signal") == "KÖP" and num(sig.get("confidence")) >= MIN_CONFIDENCE and held <= 1e-12 and not news_guard.get("active") and not state.get("risk_halt"):
+            candidates.append(symbol)
+        reasons.append({"symbol": symbol, "signal": sig.get("signal"), "confidence": sig.get("confidence"),
+                        "score": sig.get("score"), "reasons": why or [sig.get("reason", "Inget köpblockerande villkor identifierat")],
+                        "analysis_reason": sig.get("reason"), "price_sek": sig.get("price_sek")})
+
+    with lock:
+        return {"mode": MODE, "real_orders_enabled": False,
+                "auto_enabled": bool(state.get("auto_enabled")),
+                "last_run": state.get("last_auto_run"), "last_error": state.get("last_error"),
+                "scan_error": scan_error, "scanned_count": len(scanned),
+                "buy_candidates_count": len(candidates), "buy_candidates": candidates,
+                "paper_balance_sek": round(num(state.get("balance_sek")), 2),
+                "risk_halt": bool(state.get("risk_halt")), "min_confidence": MIN_CONFIDENCE,
+                "max_trade_sek": MAX_TRADE_SEK, "max_position_sek": MAX_POSITION_SEK,
+                "news_blackout": news_guard, "market_source_errors": market_cache.get("source_errors", {}),
+                "symbols": reasons,
+                "interpretation": ("Automatiken är avstängd; starta PAPER via POST /api/auto/start." if not state.get("auto_enabled")
+                    else "Inga köp-kandidater uppfyller samtliga villkor." if not candidates
+                    else "Kandidater finns; kontrollera saldo, positionsgräns och senaste worker-loggar om köp ändå uteblir.")}
 
 
 @app.get("/api/paper/status")
