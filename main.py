@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "16.0.0-paper-safety-diagnostics"
+APP_VERSION = "16.1.0-dynamic-coinbase-markets"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -100,12 +100,12 @@ state: dict[str, Any] = {
     "equity_history": [], "last_auto_run": None, "last_error": None,
     "created_at": datetime.now(timezone.utc).isoformat()
 }
-market_cache: dict[str, Any] = {"at": 0.0, "prices": {}, "valuation_prices": {}, "eur_sek": 11.2, "source_errors": {}, "valid_products": []}
+market_cache: dict[str, Any] = {"at": 0.0, "prices": {}, "valuation_prices": {}, "eur_sek": 11.2, "usd_sek": 0.0, "fx_rates": {"EUR": 11.2}, "source_errors": {}, "valid_products": [], "product_map": {}, "unavailable_products": []}
 # Coinbase 400/404 products are cached as unavailable for six hours, avoiding repeated
 # requests for pairs that do not exist. 429s are never cached as unavailable.
-product_unavailable_until: dict[str, float] = {}
-PRODUCT_UNAVAILABLE_TTL_SECONDS = 6 * 60 * 60
 PRODUCT_CACHE_LOCK = threading.Lock()
+PRODUCT_CATALOG_TTL_SECONDS = 15 * 60
+product_catalog_cache: dict[str, Any] = {"at": 0.0, "by_symbol": {}, "errors": {}}
 candle_cache: dict[str, dict[str, Any]] = {}
 analysis_diagnostics: dict[str, dict[str, Any]] = {}
 auto_wake_event = threading.Event()
@@ -314,6 +314,7 @@ def risk_event(event: str, detail: str) -> None:
 
 
 def get_fx(force=False) -> float:
+    """Return the current EUR/SEK rate, retaining a last-known rate on feed failure."""
     if not force and time.time() - market_cache["at"] < CACHE_TTL and market_cache["eur_sek"] > 0:
         return num(market_cache["eur_sek"], 11.2)
     try:
@@ -321,105 +322,169 @@ def get_fx(force=False) -> float:
         rate = num(data.get("rates", {}).get("SEK"))
         if rate > 0:
             market_cache["eur_sek"] = rate
+            market_cache.setdefault("fx_rates", {})["EUR"] = rate
+            market_cache["source_errors"].pop("EUR_SEK", None)
     except Exception as exc:
         market_cache["source_errors"]["EUR_SEK"] = str(exc)[:200]
     return num(market_cache["eur_sek"], 11.2)
+
+
+def get_quote_fx(quote: str, force=False) -> float:
+    """Convert a Coinbase quote currency (EUR/USD) to SEK."""
+    quote = str(quote or "EUR").upper()
+    if quote == "EUR":
+        return get_fx(force)
+    if quote != "USD":
+        return 0.0
+    cached = num(market_cache.get("usd_sek"), 0.0)
+    if not force and cached > 0 and time.time() - num(market_cache.get("fx_at"), 0) < 900:
+        return cached
+    try:
+        data = http_get_json("https://api.frankfurter.app/latest", {"from": "USD", "to": "SEK"})
+        rate = num(data.get("rates", {}).get("SEK"))
+        if rate > 0:
+            market_cache["usd_sek"] = rate
+            market_cache.setdefault("fx_rates", {})["USD"] = rate
+            market_cache["fx_at"] = time.time()
+            market_cache["source_errors"].pop("USD_SEK", None)
+            return rate
+    except Exception as exc:
+        market_cache["source_errors"]["USD_SEK"] = str(exc)[:200]
+    return cached
+
+
+def get_product_map(force=False) -> dict[str, dict[str, str]]:
+    """Discover live Coinbase EUR/USD markets once per TTL instead of assuming SYMBOL-EUR exists."""
+    now = time.time()
+    with PRODUCT_CACHE_LOCK:
+        if not force and product_catalog_cache["by_symbol"] and now - product_catalog_cache["at"] < PRODUCT_CATALOG_TTL_SECONDS:
+            return dict(product_catalog_cache["by_symbol"])
+    try:
+        rows = http_get_json("https://api.exchange.coinbase.com/products")
+        candidates: dict[str, list[dict[str, str]]] = {}
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            base = str(row.get("base_currency") or "").upper()
+            quote = str(row.get("quote_currency") or "").upper()
+            product_id = str(row.get("id") or "")
+            status = str(row.get("status") or "online").lower()
+            if base not in SYMBOLS or quote not in ("EUR", "USD") or not product_id:
+                continue
+            if status not in ("online", "active", "") or row.get("trading_disabled") is True:
+                continue
+            candidates.setdefault(base, []).append({"product": product_id, "quote": quote})
+        discovered = {}
+        for symbol, options in candidates.items():
+            # Prefer EUR to keep the existing EUR-based market where available; use USD otherwise.
+            options.sort(key=lambda item: (0 if item["quote"] == "EUR" else 1, item["product"]))
+            discovered[symbol] = options[0]
+        with PRODUCT_CACHE_LOCK:
+            product_catalog_cache.update(at=time.time(), by_symbol=discovered, errors={})
+        return dict(discovered)
+    except Exception as exc:
+        with PRODUCT_CACHE_LOCK:
+            product_catalog_cache["errors"] = {"product_catalog": str(exc)[:200]}
+            # Only use conservative static EUR fallback if discovery itself is unavailable.
+            if not product_catalog_cache["by_symbol"]:
+                product_catalog_cache["by_symbol"] = {s: {"product": f"{s}-EUR", "quote": "EUR"} for s in SYMBOLS}
+            return dict(product_catalog_cache["by_symbol"])
 
 
 def get_prices(force=False) -> dict[str, float]:
     now = time.time()
     if not force and market_cache["prices"] and now - market_cache["at"] < CACHE_TTL:
         return dict(market_cache["prices"])
-    fx = get_fx(force)
+    product_map = get_product_map(force=False)
+    fx_by_quote = {"EUR": get_quote_fx("EUR", force=False)}
+    if any(item.get("quote") == "USD" for item in product_map.values()):
+        fx_by_quote["USD"] = get_quote_fx("USD", force=False)
     fresh, errors = {}, {}
-
-    # Skip Coinbase EUR products that returned a definitive 400/404 recently.
-    # Use only three concurrent ticker requests to reduce 429 rate limiting.
-    with PRODUCT_CACHE_LOCK:
-        expired = [sym for sym, until in product_unavailable_until.items() if until <= now]
-        for sym in expired:
-            product_unavailable_until.pop(sym, None)
-        items = [(sym, product) for sym, product in PRODUCTS.items()
-                 if product_unavailable_until.get(sym, 0.0) <= now]
-        unavailable = {sym: int(max(0, until - now)) for sym, until in product_unavailable_until.items()}
-
-    for sym, seconds_left in unavailable.items():
-        errors[sym] = f"Coinbase EUR-marknad tillfälligt pausad efter 400/404; nytt försök om cirka {max(1, seconds_left // 60)} min"
+    for sym in SYMBOLS:
+        if sym not in product_map:
+            errors[sym] = "Ingen aktiv Coinbase-marknad i EUR eller USD hittades i produktkatalogen"
+    errors.update(product_catalog_cache.get("errors", {}))
+    for quote, rate in fx_by_quote.items():
+        if rate <= 0:
+            errors[f"{quote}_SEK"] = f"Kunde inte hämta giltig {quote}/SEK-kurs; marknader i {quote} hoppas över"
 
     def fetch_one(item):
-        sym, product = item
-        ticker = http_get_json(f"https://api.exchange.coinbase.com/products/{product}/ticker")
-        eur = num(ticker.get("price"))
-        if eur <= 0:
+        sym, meta = item
+        quote = meta["quote"]
+        fx = fx_by_quote.get(quote, 0.0)
+        if fx <= 0:
+            raise ValueError(f"Ingen giltig {quote}/SEK-kurs")
+        ticker = http_get_json(f"https://api.exchange.coinbase.com/products/{meta['product']}/ticker")
+        quote_price = num(ticker.get("price"))
+        if quote_price <= 0:
             raise ValueError("Ogiltigt pris")
-        return sym, eur * fx
+        return sym, quote_price * fx, meta
 
+    items = [(sym, product_map[sym]) for sym in SYMBOLS if sym in product_map and fx_by_quote.get(product_map[sym]["quote"], 0) > 0]
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="market-price") as pool:
         futures = {pool.submit(fetch_one, item): item[0] for item in items}
         for future in as_completed(futures):
             sym = futures[future]
             try:
-                symbol, price_sek = future.result()
+                symbol, price_sek, meta = future.result()
                 fresh[symbol] = price_sek
             except Exception as exc:
-                response = getattr(exc, "response", None)
-                status = getattr(response, "status_code", None)
                 errors[sym] = str(exc)[:200]
-                if status in (400, 404):
-                    with PRODUCT_CACHE_LOCK:
-                        product_unavailable_until[sym] = time.time() + PRODUCT_UNAVAILABLE_TTL_SECONDS
-                # 429 and transient errors are retried on a later scan, not marked unavailable.
 
     market_cache["source_errors"] = errors
+    market_cache["product_map"] = {s: dict(meta) for s, meta in product_map.items()}
     market_cache["valid_products"] = sorted(fresh.keys())
-    market_cache["unavailable_products"] = sorted(product_unavailable_until.keys())
+    market_cache["unavailable_products"] = sorted(s for s in SYMBOLS if s not in fresh)
     if fresh:
-        # Keep only prices refreshed successfully in this scan. Do not silently use
-        # stale cached prices for signals; last-known prices are valuation-only.
         market_cache["prices"] = dict(fresh)
         market_cache.setdefault("valuation_prices", {}).update(fresh)
         market_cache["at"] = time.time()
         return dict(market_cache["prices"])
-    raise HTTPException(503, "Kunde inte hämta några aktuella marknadspriser. Försök igen senare.")
-
+    raise HTTPException(503, "Kunde inte hämta några aktuella marknadspriser. Kontrollera Coinbase produktkatalog och valutakurser.")
 
 def get_candles(symbol: str, force=False) -> list[dict[str, float]]:
-    """Fetch real Coinbase 5m OHLCV candles. Returned oldest-to-newest."""
+    """Fetch completed Coinbase 5m OHLCV candles for the discovered EUR/USD product."""
     now = time.time()
     cached = candle_cache.get(symbol)
     if cached and not force and now - cached["at"] < 60:
-        analysis_diagnostics[symbol] = {"candle_count": len(cached["candles"]), "candle_age_seconds": round(now-cached["at"], 1), "candle_source": "cache", "candle_error": None}
+        analysis_diagnostics[symbol] = {"candle_count": len(cached["candles"]), "candle_age_seconds": round(now-cached["at"], 1), "candle_source": "cache", "candle_error": None, "product": cached.get("product"), "quote_currency": cached.get("quote")}
         return cached["candles"]
-    product = PRODUCTS[symbol]
+    product_map = get_product_map()
+    meta = product_map.get(symbol)
+    if not meta:
+        message = "Ingen aktiv EUR/USD-marknad hittades för symbolen"
+        analysis_diagnostics[symbol] = {"candle_count": 0, "candle_age_seconds": None, "candle_source": "no_market", "candle_error": message}
+        market_cache["source_errors"][f"{symbol}_candles"] = message
+        return []
+    product, quote = meta["product"], meta["quote"]
+    fx = get_quote_fx(quote)
+    if fx <= 0:
+        message = f"Saknar giltig {quote}/SEK-kurs"
+        analysis_diagnostics[symbol] = {"candle_count": 0, "candle_age_seconds": None, "candle_source": "fx_error", "candle_error": message, "product": product, "quote_currency": quote}
+        market_cache["source_errors"][f"{symbol}_candles"] = message
+        return []
     try:
-        raw = http_get_json(f"https://api.exchange.coinbase.com/products/{product}/candles",
-                            {"granularity": CANDLE_GRANULARITY})
-        # Coinbase row: [time, low, high, open, close, volume], newest first
+        raw = http_get_json(f"https://api.exchange.coinbase.com/products/{product}/candles", {"granularity": CANDLE_GRANULARITY})
         candles = []
-        for row in raw:
+        for row in raw if isinstance(raw, list) else []:
             if not isinstance(row, list) or len(row) < 6:
                 continue
             t, low, high, opn, close, volume = map(num, row[:6])
-            # Only analyze fully closed 5-minute candles. Coinbase candle timestamps
-            # mark interval start; the current interval is excluded to avoid noisy signals.
             if min(opn, close, low, high) > 0 and high >= low and t + CANDLE_GRANULARITY <= int(time.time()):
-                candles.append({"time": t, "open": opn, "high": high, "low": low,
-                                "close": close, "volume": max(0.0, volume)})
+                candles.append({"time": t, "open": opn, "high": high, "low": low, "close": close, "volume": max(0.0, volume)})
         candles.sort(key=lambda x: x["time"])
         if candles:
-            candle_cache[symbol] = {"at": now, "candles": candles[-CANDLE_LIMIT:]}
-            analysis_diagnostics[symbol] = {"candle_count": len(candle_cache[symbol]["candles"]), "candle_age_seconds": 0, "candle_source": "coinbase", "candle_error": None}
+            candle_cache[symbol] = {"at": now, "candles": candles[-CANDLE_LIMIT:], "product": product, "quote": quote, "fx_to_sek": fx}
+            analysis_diagnostics[symbol] = {"candle_count": len(candle_cache[symbol]["candles"]), "candle_age_seconds": 0, "candle_source": "coinbase", "candle_error": None, "product": product, "quote_currency": quote}
             market_cache["source_errors"].pop(f"{symbol}_candles", None)
             return candle_cache[symbol]["candles"]
-        analysis_diagnostics[symbol] = {"candle_count": 0, "candle_age_seconds": None, "candle_source": "coinbase", "candle_error": "Coinbase returnerade inga kompletta candles"}
+        analysis_diagnostics[symbol] = {"candle_count": 0, "candle_age_seconds": None, "candle_source": "coinbase", "candle_error": "Coinbase returnerade inga kompletta candles", "product": product, "quote_currency": quote}
     except Exception as exc:
         market_cache["source_errors"][f"{symbol}_candles"] = str(exc)[:200]
-        analysis_diagnostics[symbol] = {"candle_count": len(cached["candles"]) if cached else 0, "candle_age_seconds": round(time.time()-cached["at"], 1) if cached else None, "candle_source": "stale_cache" if cached else "coinbase_error", "candle_error": str(exc)[:200]}
-    # Brief fallback for transient outages only; stale candles must not look current forever.
+        analysis_diagnostics[symbol] = {"candle_count": len(cached["candles"]) if cached else 0, "candle_age_seconds": round(time.time()-cached["at"], 1) if cached else None, "candle_source": "stale_cache" if cached else "coinbase_error", "candle_error": str(exc)[:200], "product": product, "quote_currency": quote}
     if cached and time.time() - cached["at"] <= 300:
         return cached["candles"]
     return []
-
 
 def ema(values: list[float], period: int) -> list[float]:
     if not values:
@@ -547,7 +612,9 @@ def news_blackout_status(now: datetime | None = None, force: bool = False) -> di
 def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     """Conservative signal model: confirmed trend + momentum + liquidity filters. Signals are computed from closed OHLCV candles. Confidence is a heuristic score, not a calibrated probability of profit. KÖP requires every primary gate below. """
     candles = get_candles(symbol)
-    fx = num(market_cache.get("eur_sek"), 11.2)
+    candle_meta = candle_cache.get(symbol, {})
+    fx = num(candle_meta.get("fx_to_sek"), get_quote_fx(candle_meta.get("quote", "EUR")))
+    product_label = str(candle_meta.get("product") or get_product_map().get(symbol, {}).get("product", PRODUCTS.get(symbol, f"{symbol}-EUR")))
     valid_candles = []
     for c in candles:
         try:
@@ -561,7 +628,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     closes = [c["close"] * fx for c in valid_candles]
     samples = len(closes)
     if samples < 2:
-        return {"symbol": symbol, "product": PRODUCTS[symbol], "price_sek": round(price_sek, 10),
+        return {"symbol": symbol, "product": product_label, "price_sek": round(price_sek, 10),
                 "signal": "AVVAKTA", "confidence": 35, "score": 0,
                 "indicators": {"samples": samples, "data_quality": "LOW", "candle_interval_minutes": 5},
                 "reason": "Otillräcklig giltig candle-data; ingen handelssignal", "not_financial_advice": True}
@@ -738,7 +805,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         failed = [name for name, passed in buy_gates.items() if not passed]
         reasons.append("KÖP spärrad: " + ", ".join(failed[:5]))
 
-    return {"symbol": symbol, "product": PRODUCTS[symbol], "price_sek": round(price_sek, 10),
+    return {"symbol": symbol, "product": product_label, "price_sek": round(price_sek, 10),
             "signal": signal, "confidence": int(confidence), "score": int(score),
             "indicators": {"ema9_sek": round(e9[-1], 8), "ema21_sek": round(e21[-1], 8),
                 "ema50_sek": round(e50[-1], 8), "ema200_sek": round(e200[-1], 8),
@@ -1184,6 +1251,8 @@ def health():
             "market_source_errors":market_cache.get("source_errors",{}),
             "valid_market_symbols":market_cache.get("valid_products",[]),
             "unavailable_market_symbols":market_cache.get("unavailable_products",[]),
+            "market_product_map":market_cache.get("product_map",{}),
+            "product_catalog_error":product_catalog_cache.get("errors",{}),
             "worker":dict(auto_runtime),
             "configured_symbol_count":len(SYMBOLS),
             "trade_count":len(state["trades"]),"last_error":state.get("last_error")}
@@ -1211,8 +1280,9 @@ def database_status():
 def market():
     prices=get_prices(force=True)
     return {"prices_sek":prices,"updated_at":now_iso(),"currency":"SEK",
-            "fx_eur_sek":market_cache["eur_sek"],"valid_symbols":market_cache.get("valid_products",[]),
-            "source_errors":market_cache.get("source_errors",{})}
+            "fx_eur_sek":market_cache["eur_sek"],"fx_usd_sek":market_cache.get("usd_sek"),
+            "valid_symbols":market_cache.get("valid_products",[]),"product_map":market_cache.get("product_map",{}),
+            "unavailable_symbols":market_cache.get("unavailable_products",[]),"source_errors":market_cache.get("source_errors",{})}
 
 
 @app.get("/api/signals")
