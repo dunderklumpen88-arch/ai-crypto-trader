@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "15.6.0-paper-8-trades-daily"
+APP_VERSION = "15.7.0-quality-entry-analysis"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -448,6 +448,9 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     macd = macd_line[-1] if macd_line else 0.0
     macd_sig = macd_signal[-1] if macd_signal else 0.0
     macd_hist = macd - macd_sig
+    macd_hist_prev = (macd_line[-2] - macd_signal[-2]) if len(macd_line) >= 2 and len(macd_signal) >= 2 else macd_hist
+    histogram_rising = macd_hist > macd_hist_prev
+    histogram_cross_up = macd_hist > 0 and macd_hist_prev <= 0
     momentum = ((last_close / closes[-4]) - 1) * 100 if samples >= 4 and closes[-4] else 0.0
     returns = [(closes[i] / closes[i-1] - 1) * 100 for i in range(1, samples) if closes[i-1] > 0]
     recent_returns = returns[-20:]
@@ -530,66 +533,77 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     elif vol_ratio < 0.50:
         reasons.append("Låg volym: svag bekräftelse")
 
-    # More permissive PAPER strategy: more candidates, while retaining momentum,
-    # liquidity, volatility, and position/risk caps. Confidence is heuristic, not
-    # a probability of profit. Test this version in PAPER before any live use.
+    # Quality-first PAPER decision model. It deliberately prefers a smaller number
+    # of better-confirmed entries over trading just to hit the daily trade allowance.
+    # Confidence remains a heuristic ranking, not a calibrated win probability.
     early_reversal = (
-        samples >= 60
-        and e21[-1] > e50[-1]
-        and e50_slope_pct > -0.15
-        and momentum > 0.0
-        and histogram_up
+        samples >= 200 and e21[-1] > e50[-1] and e50_slope_pct > 0.0
+        and last_close >= e21[-1] and momentum > 0.03
+        and histogram_up and histogram_rising
     )
-    # Adaptive confirmation: low relative candle volume alone should not block every
-    # otherwise credible setup, but breakouts still need stronger volume confirmation.
-    # A weak-volume setup is only allowed when MACD and short momentum both agree.
-    volume_momentum_confirmed = histogram_up and momentum >= 0.05 and 40 <= rsi_v <= 70
-    volume_ok = vol_ratio >= 0.10 or (not breakout and volume_momentum_confirmed)
-    stoch_ok = stoch_trigger or (20.0 <= stoch_now <= 95.0 and momentum >= 0.0)
-    trend_ok = long_trend_up or trend_up or early_reversal
+    volume_ok = vol_ratio >= 0.25
+    stoch_ok = 20.0 <= stoch_now <= 88.0 and (stoch_trigger or histogram_rising)
+    trend_ok = long_trend_up or (trend_up and last_close > e200[-1]) or early_reversal
+    not_overextended = price_above_ema21_pct <= 1.25
+    volatility_ok = volatility <= 1.5
+    timeframe_ok = (
+        (trend_15m != "DOWN" and trend_1h != "DOWN")
+        or (long_trend_up and histogram_cross_up and momentum >= 0.08)
+        or (trend_15m != "DOWN" and histogram_up and histogram_rising and momentum >= 0.08)
+    )
+    # Two entry paths: trend continuation after momentum confirmation, or a
+    # pullback/recovery in an established long trend. Avoid buying a late spike.
+    continuation_setup = (
+        trend_ok and e9[-1] > e21[-1] and histogram_up and histogram_rising
+        and momentum >= 0.03 and 45 <= rsi_v <= 68 and volume_ok
+        and not_overextended and 1 <= stoch_now <= 88 and volatility_ok
+        and timeframe_ok
+    )
+    pullback_recovery_setup = (
+        long_trend_up and e9[-1] > e21[-1] and stoch_trigger
+        and histogram_up and histogram_rising and momentum >= -0.02
+        and 42 <= rsi_v <= 65 and volume_ok and not_overextended
+        and stoch_now <= 82 and volatility_ok and timeframe_ok
+    )
     buy_gates = {
-        "tillräcklig historik": samples >= 60,
+        "tillräcklig historik": samples >= 200,
         "trend eller tidig trendvändning": trend_ok,
-        "stochastic eller positiv momentum": stoch_ok,
-        "bekräftelse med MACD": histogram_up,
-        "RSI inom utökat intervall": 40 <= rsi_v <= 75,
-        "momentum inte kraftigt negativt": momentum >= -0.10,
-        "volym tillräcklig eller bekräftad av momentum": volume_ok,
-        "breakout har rimlig volym": (not breakout) or vol_ratio >= 0.50,
-        "inte för långt över EMA21": price_above_ema21_pct <= 4.0,
-        "volatilitet rimlig": volatility <= 5.0,
-        "15m-trend eller momentumvändning": (
-            trend_15m != "DOWN" or (histogram_up and momentum > 0.05)
-        ),
-        "1h-trend eller momentumvändning": (
-            trend_1h != "DOWN" or (long_trend_up and momentum > 0.0)
-            or (histogram_up and momentum > 0.05)
-        ),
-        "ingen extrem översträckning i stochastic": stoch_now <= 95,
+        "EMA9 över EMA21": e9[-1] > e21[-1],
+        "MACD positivt och förbättras": histogram_up and histogram_rising,
+        "momentum bekräftar uppgång": momentum >= 0.03,
+        "RSI inom kvalitetsintervall": 42 <= rsi_v <= 68,
+        "volym tillräcklig": volume_ok,
+        "inte översträckt över EMA21": not_overextended,
+        "stochastic inte överköpt": stoch_now <= 88,
+        "volatilitet rimlig": volatility_ok,
+        "15m/1h-trend bekräftar eller stark vändning": timeframe_ok,
     }
-    buy_ok = all(buy_gates.values())
+    buy_ok = continuation_setup or pullback_recovery_setup
 
-    # SELL is a confirmed bearish signal, not a prediction that price must fall.
+    # A sell signal is an exit warning based on a confirmed weakening trend.
+    # Protective stop-loss/take-profit exits remain separate in the execution loop.
     sell_gates = {
         "tillräcklig historik": samples >= 100,
-        "bekräftad nedtrend": trend_down,
-        "MACD-histogram negativt": histogram_down,
-        "RSI svagt": rsi_v < 48,
-        "momentum negativt": momentum <= -0.20,
-        "volym inte extremt låg": vol_ratio >= 0.20,
+        "EMA9 under EMA21": e9[-1] < e21[-1],
+        "MACD negativt eller fallande": histogram_down or not histogram_rising,
+        "RSI svagt": rsi_v < 50,
+        "momentum negativt": momentum < -0.05,
+        "pris under EMA21": last_close < e21[-1],
     }
-    sell_ok = all(sell_gates.values())
+    sell_ok = sum(bool(v) for v in sell_gates.values()) >= 5 and samples >= 200
 
     if buy_ok:
         signal = "KÖP"
-        confirmations = sum([trend_up, histogram_up, 45 <= rsi_v <= 70, momentum >= 0.0, vol_ratio >= 0.60])
-        confidence = min(79, 68 + confirmations * 2)
-        reasons.append("KÖP godkänd: samtliga grundfilter uppfyllda; detta är ingen vinstgaranti")
+        confirmations = sum([trend_ok, e9[-1] > e21[-1], histogram_up and histogram_rising,
+                             momentum >= 0.03, 42 <= rsi_v <= 68, volume_ok, timeframe_ok])
+        confidence = min(82, 62 + confirmations * 3)
+        reasons.append("KÖP godkänd av kvalitetsmodell: trend + förbättrat momentum; ingen vinstgaranti")
+        reasons.append("Inträdesväg: trendfortsättning" if continuation_setup else "Inträdesväg: återhämtning i lång trend")
     elif sell_ok:
         signal = "SÄLJ"
-        confirmations = sum([trend_down, histogram_down, rsi_v < 48, momentum <= -0.20, vol_ratio >= 0.50])
-        confidence = min(82, 70 + confirmations * 2)
-        reasons.append("SÄLJ bekräftad av flera filter")
+        confirmations = sum(bool(v) for v in sell_gates.values())
+        confidence = min(82, 62 + confirmations * 3)
+        reasons.append("SÄLJ: flera tecken på försvagad trend; skyddsstoppar körs separat")
     else:
         signal = "AVVAKTA"
         confidence = min(69, 48 + min(5, abs(score)) * 3)
@@ -612,6 +626,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                 "multi_timeframe": {"15m_trend": trend_15m, "1h_trend": trend_1h,
                     "15m_samples": len(closes_15m), "1h_samples": len(closes_1h)},
                 "advanced": adv, "buy_gates": buy_gates, "sell_gates": sell_gates,
+                "decision_model": "quality_entry_v1",
                 "candle_interval_minutes": 5, "data_quality": data_quality},
             "reason": "; ".join(reasons), "not_financial_advice": True}
 
@@ -913,11 +928,12 @@ def auto_loop():
                         except HTTPException as exc:
                             if exc.status_code not in (409,):
                                 raise
-                # Ordinary signal-based exits require strong multi-indicator bearish confirmation.
-                # Stop-loss/take-profit exits above remain independent protective rules.
+                # Ordinary signal-based exits follow the analyzer's explicit sell decision.
+                # The analyzer requires at least five bearish checks; hard risk exits above
+                # remain independent and always take priority.
                 for sig in signals:
                     if (sig["symbol"] not in exited_this_cycle and sig["signal"] == "SÄLJ"
-                            and sig["score"] <= -4 and sig["confidence"] >= MIN_CONFIDENCE):
+                            and sig["confidence"] >= MIN_CONFIDENCE):
                         held = num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity"))
                         px = num(prices.get(sig["symbol"]))
                         if held > 0 and px > 0:
