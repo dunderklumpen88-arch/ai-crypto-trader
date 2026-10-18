@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "15.8.0-live-news-blackout"
+APP_VERSION = "15.9.0-market-throttle-autodiag"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -92,7 +92,18 @@ state: dict[str, Any] = {
     "created_at": datetime.now(timezone.utc).isoformat()
 }
 market_cache: dict[str, Any] = {"at": 0.0, "prices": {}, "valuation_prices": {}, "eur_sek": 11.2, "source_errors": {}, "valid_products": []}
+# Coinbase 400/404 products are cached as unavailable for six hours, avoiding repeated
+# requests for pairs that do not exist. 429s are never cached as unavailable.
+product_unavailable_until: dict[str, float] = {}
+PRODUCT_UNAVAILABLE_TTL_SECONDS = 6 * 60 * 60
+PRODUCT_CACHE_LOCK = threading.Lock()
 candle_cache: dict[str, dict[str, Any]] = {}
+auto_wake_event = threading.Event()
+auto_runtime: dict[str, Any] = {
+    "last_attempt": None, "last_success": None, "last_cycle_seconds": None,
+    "last_signal_count": 0, "last_buy_candidate_count": 0,
+    "last_news_guard": None, "worker_alive": False, "cycle_status": "starting"
+}
 db_info = {"configured": bool(DATABASE_URL), "available": False, "error": None, "backend": "local_json_file"}
 
 
@@ -312,8 +323,19 @@ def get_prices(force=False) -> dict[str, float]:
     fx = get_fx(force)
     fresh, errors = {}, {}
 
-    # Fetch ticker products concurrently. Sequential requests could take several
-    # minutes when several symbols time out, leaving the dashboard appearing stuck.
+    # Skip Coinbase EUR products that returned a definitive 400/404 recently.
+    # Use only three concurrent ticker requests to reduce 429 rate limiting.
+    with PRODUCT_CACHE_LOCK:
+        expired = [sym for sym, until in product_unavailable_until.items() if until <= now]
+        for sym in expired:
+            product_unavailable_until.pop(sym, None)
+        items = [(sym, product) for sym, product in PRODUCTS.items()
+                 if product_unavailable_until.get(sym, 0.0) <= now]
+        unavailable = {sym: int(max(0, until - now)) for sym, until in product_unavailable_until.items()}
+
+    for sym, seconds_left in unavailable.items():
+        errors[sym] = f"Coinbase EUR-marknad tillfälligt pausad efter 400/404; nytt försök om cirka {max(1, seconds_left // 60)} min"
+
     def fetch_one(item):
         sym, product = item
         ticker = http_get_json(f"https://api.exchange.coinbase.com/products/{product}/ticker")
@@ -322,26 +344,32 @@ def get_prices(force=False) -> dict[str, float]:
             raise ValueError("Ogiltigt pris")
         return sym, eur * fx
 
-    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="market-price") as pool:
-        futures = {pool.submit(fetch_one, item): item[0] for item in PRODUCTS.items()}
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="market-price") as pool:
+        futures = {pool.submit(fetch_one, item): item[0] for item in items}
         for future in as_completed(futures):
             sym = futures[future]
             try:
                 symbol, price_sek = future.result()
                 fresh[symbol] = price_sek
             except Exception as exc:
+                response = getattr(exc, "response", None)
+                status = getattr(response, "status_code", None)
                 errors[sym] = str(exc)[:200]
+                if status in (400, 404):
+                    with PRODUCT_CACHE_LOCK:
+                        product_unavailable_until[sym] = time.time() + PRODUCT_UNAVAILABLE_TTL_SECONDS
+                # 429 and transient errors are retried on a later scan, not marked unavailable.
+
     market_cache["source_errors"] = errors
     market_cache["valid_products"] = sorted(fresh.keys())
+    market_cache["unavailable_products"] = sorted(product_unavailable_until.keys())
     if fresh:
         # Keep only prices refreshed successfully in this scan. Do not silently use
-        # stale cached prices for products that failed the latest ticker request.
+        # stale cached prices for signals; last-known prices are valuation-only.
         market_cache["prices"] = dict(fresh)
         market_cache.setdefault("valuation_prices", {}).update(fresh)
         market_cache["at"] = time.time()
         return dict(market_cache["prices"])
-    # Do not pass stale prices to signal generation as if they were current.
-    # Last-known values remain in valuation_prices for portfolio valuation only.
     raise HTTPException(503, "Kunde inte hämta några aktuella marknadspriser. Försök igen senare.")
 
 
@@ -973,108 +1001,110 @@ def rebuild_tax_ledger_from_trades() -> dict[str, Any]:
 
 def auto_loop():
     log.info("PAPER worker started; real orders disabled")
-    while not stop_event.is_set():
-        try:
-            with lock: enabled = bool(state.get("auto_enabled"))
-            if enabled:
-                signals = make_signals()
-                prices = get_prices()
-                # Track exits this cycle so the bot cannot sell and re-buy the same coin
-                # immediately based on a stale signal from the start of the cycle.
-                exited_this_cycle: set[str] = set()
-                # Risk exits use estimated NET return after both buy and sell fees.
-                # The trailing stop records a high-water mark per holding in persistent state.
-                fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
-                for symbol,h in list(state["holdings"].items()):
-                    qty = num(h.get("quantity"))
-                    basis = num(h.get("cost_basis_sek"))
-                    price = num(prices.get(symbol))
-                    if qty <= 0 or basis <= 0 or price <= 0:
-                        continue
-                    net_exit_value = qty * price * (1.0 - fee_rate)
-                    net_return_pct = (net_exit_value / basis - 1.0) * 100.0
-                    peak_return_pct = num(h.get("peak_net_return_pct"), net_return_pct)
-                    peak_return_pct = max(peak_return_pct, net_return_pct)
-                    h["peak_net_return_pct"] = round(peak_return_pct, 6)
-                    h["last_net_return_pct"] = round(net_return_pct, 6)
-                    exit_reason = None
-                    if net_return_pct <= -STOP_LOSS_PCT:
-                        exit_reason = f"NET_STOP_LOSS_{STOP_LOSS_PCT:.1f}%"
-                    elif net_return_pct >= TAKE_PROFIT_PCT:
-                        exit_reason = f"NET_TAKE_PROFIT_{TAKE_PROFIT_PCT:.1f}%"
-                    elif (peak_return_pct >= TRAILING_ACTIVATION_PCT
-                          and net_return_pct <= peak_return_pct - TRAILING_DRAWDOWN_PCT):
-                        exit_reason = (f"TRAILING_STOP_peak_{peak_return_pct:.2f}%"
-                                       f"_drawdown_{TRAILING_DRAWDOWN_PCT:.1f}%")
-                    if exit_reason:
-                        try:
-                            paper_order("sell", symbol, qty * price, automatic=True, exit_reason=exit_reason)
-                            exited_this_cycle.add(symbol)
-                        except HTTPException as exc:
-                            if exc.status_code not in (409,):
-                                raise
-                # Ordinary signal-based exits follow the analyzer's explicit sell decision.
-                # The analyzer requires at least five bearish checks; hard risk exits above
-                # remain independent and always take priority.
-                for sig in signals:
-                    if (sig["symbol"] not in exited_this_cycle and sig["signal"] == "SÄLJ"
-                            and sig["confidence"] >= MIN_CONFIDENCE):
-                        held = num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity"))
-                        px = num(prices.get(sig["symbol"]))
-                        if held > 0 and px > 0:
-                            try:
-                                paper_order("sell", sig["symbol"], held * px, automatic=True)
-                                exited_this_cycle.add(sig["symbol"])
-                            except HTTPException as exc:
-                                if exc.status_code not in (409,): raise
-                # Do not repeatedly pyramid into the same coin every scan. Every BUY is hard-capped
-                # at 100 SEK including fee, with a backend check in paper_order().
-                news_guard = news_blackout_status()
-                buy_candidates = [] if news_guard["active"] else [sig for sig in signals
-                                  if sig["symbol"] not in exited_this_cycle
-                                  and sig["signal"] == "KÖP" and sig["confidence"] >= MIN_CONFIDENCE
-                                  and num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) <= 1e-12]
-                # Allocate scarce PAPER cash to the strongest confirmed candidates first.
-                # Score and indicators are ranking hints, not probabilities.
-                buy_candidates.sort(
-                    key=lambda sig: (
-                        num(sig.get("score")),
-                        num(sig.get("confidence")),
-                        num(sig.get("indicators", {}).get("momentum_pct")),
-                        num(sig.get("indicators", {}).get("volume_ratio")),
-                    ),
-                    reverse=True,
-                )
-                available = max(0.0, num(state.get("balance_sek")))
-                if buy_candidates and not state.get("risk_halt") and not news_guard["active"]:
-                    fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
-                    equity_now = max(0.0, equity_from_prices(prices))
-                    risk_budget_sek = equity_now * (RISK_PER_TRADE_PCT / 100.0)
-                    for sig in buy_candidates:
-                        if available <= 0.01:
-                            break
-                        atr_pct = num(sig.get("indicators", {}).get("advanced", {}).get("atr_pct"), 0.0)
-                        stop_distance_pct = max(STOP_LOSS_PCT, atr_pct * 1.5)
-                        risk_sized_principal = risk_budget_sek / max(stop_distance_pct / 100.0, 0.0001)
-                        current_value = num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) * num(prices.get(sig["symbol"]))
-                        position_room = max(0.0, MAX_POSITION_SEK - current_value)
-                        principal = min(MAX_TRADE_SEK / (1.0 + fee_rate),
-                                        risk_sized_principal / (1.0 + fee_rate),
-                                        position_room / (1.0 + fee_rate),
-                                        available / (1.0 + fee_rate))
-                        if principal <= 0.01:
-                            continue
-                        try:
-                            paper_order("buy", sig["symbol"], principal, automatic=True)
-                            available = max(0.0, num(state.get("balance_sek")))
-                        except HTTPException as exc:
-                            if exc.status_code not in (409,): raise
+    auto_runtime["worker_alive"] = True
+    auto_runtime["cycle_status"] = "waiting"
+    try:
+        while not stop_event.is_set():
+            cycle_started = time.monotonic()
+            auto_wake_event.clear()
+            try:
                 with lock:
-                    state["last_auto_run"]=now_iso(); state["last_error"]=None; persist()
-        except Exception as exc:
-            with lock: state["last_error"]=str(exc)[:500]
-            log.exception("Auto cycle failed")
-        stop_event.wait(AUTO_INTERVAL_SECONDS)
+                    enabled = bool(state.get("auto_enabled"))
+                if enabled:
+                    auto_runtime.update(last_attempt=now_iso(), cycle_status="running")
+                    signals = make_signals()
+                    prices = get_prices()
+                    exited_this_cycle: set[str] = set()
+                    fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
+                    for symbol, h in list(state["holdings"].items()):
+                        qty = num(h.get("quantity")); basis = num(h.get("cost_basis_sek")); price = num(prices.get(symbol))
+                        if qty <= 0 or basis <= 0 or price <= 0:
+                            continue
+                        net_exit_value = qty * price * (1.0 - fee_rate)
+                        net_return_pct = (net_exit_value / basis - 1.0) * 100.0
+                        peak_return_pct = max(num(h.get("peak_net_return_pct"), net_return_pct), net_return_pct)
+                        h["peak_net_return_pct"] = round(peak_return_pct, 6)
+                        h["last_net_return_pct"] = round(net_return_pct, 6)
+                        exit_reason = None
+                        if net_return_pct <= -STOP_LOSS_PCT:
+                            exit_reason = f"NET_STOP_LOSS_{STOP_LOSS_PCT:.1f}%"
+                        elif net_return_pct >= TAKE_PROFIT_PCT:
+                            exit_reason = f"NET_TAKE_PROFIT_{TAKE_PROFIT_PCT:.1f}%"
+                        elif peak_return_pct >= TRAILING_ACTIVATION_PCT and net_return_pct <= peak_return_pct - TRAILING_DRAWDOWN_PCT:
+                            exit_reason = f"TRAILING_STOP_peak_{peak_return_pct:.2f}%_drawdown_{TRAILING_DRAWDOWN_PCT:.1f}%"
+                        if exit_reason:
+                            try:
+                                paper_order("sell", symbol, qty * price, automatic=True, exit_reason=exit_reason)
+                                exited_this_cycle.add(symbol)
+                            except HTTPException as exc:
+                                if exc.status_code not in (409,):
+                                    raise
+                    # Ordinary signal exits only affect coins already held.
+                    for sig in signals:
+                        if sig["symbol"] not in exited_this_cycle and sig["signal"] == "SÄLJ" and sig["confidence"] >= MIN_CONFIDENCE:
+                            held = num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity"))
+                            px = num(prices.get(sig["symbol"]))
+                            if held > 0 and px > 0:
+                                try:
+                                    paper_order("sell", sig["symbol"], held * px, automatic=True)
+                                    exited_this_cycle.add(sig["symbol"])
+                                except HTTPException as exc:
+                                    if exc.status_code not in (409,):
+                                        raise
+                    news_guard = news_blackout_status()
+                    buy_candidates = [] if news_guard.get("active") else [sig for sig in signals
+                        if sig["symbol"] not in exited_this_cycle and sig["signal"] == "KÖP"
+                        and sig["confidence"] >= MIN_CONFIDENCE
+                        and num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) <= 1e-12]
+                    buy_candidates.sort(key=lambda sig: (num(sig.get("score")), num(sig.get("confidence")),
+                        num(sig.get("indicators", {}).get("momentum_pct")),
+                        num(sig.get("indicators", {}).get("volume_ratio"))), reverse=True)
+                    auto_runtime.update(last_signal_count=len(signals),
+                                        last_buy_candidate_count=len(buy_candidates),
+                                        last_news_guard={k: news_guard.get(k) for k in ("active", "reason", "checked_at")})
+                    available = max(0.0, num(state.get("balance_sek")))
+                    if buy_candidates and not state.get("risk_halt") and not news_guard.get("active"):
+                        fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
+                        equity_now = max(0.0, equity_from_prices(prices))
+                        risk_budget_sek = equity_now * (RISK_PER_TRADE_PCT / 100.0)
+                        for sig in buy_candidates:
+                            if available <= 0.01:
+                                break
+                            atr_pct = num(sig.get("indicators", {}).get("advanced", {}).get("atr_pct"), 0.0)
+                            stop_distance_pct = max(STOP_LOSS_PCT, atr_pct * 1.5)
+                            risk_sized_principal = risk_budget_sek / max(stop_distance_pct / 100.0, 0.0001)
+                            current_value = num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) * num(prices.get(sig["symbol"]))
+                            position_room = max(0.0, MAX_POSITION_SEK - current_value)
+                            principal = min(MAX_TRADE_SEK / (1.0 + fee_rate), risk_sized_principal / (1.0 + fee_rate),
+                                            position_room / (1.0 + fee_rate), available / (1.0 + fee_rate))
+                            if principal <= 0.01:
+                                continue
+                            try:
+                                paper_order("buy", sig["symbol"], principal, automatic=True)
+                                available = max(0.0, num(state.get("balance_sek")))
+                            except HTTPException as exc:
+                                if exc.status_code not in (409,):
+                                    raise
+                    with lock:
+                        state["last_auto_run"] = now_iso()
+                        state["last_error"] = None
+                        persist()
+                    auto_runtime.update(last_success=state["last_auto_run"], cycle_status="ok")
+                else:
+                    auto_runtime["cycle_status"] = "disabled"
+            except Exception as exc:
+                with lock:
+                    state["last_error"] = str(exc)[:500]
+                auto_runtime["cycle_status"] = "error"
+                log.exception("Auto cycle failed")
+            finally:
+                auto_runtime["last_cycle_seconds"] = round(time.monotonic() - cycle_started, 3)
+            # Keep the interval close to five minutes start-to-start; manual start wakes immediately.
+            wait_seconds = max(1.0, AUTO_INTERVAL_SECONDS - (time.monotonic() - cycle_started))
+            auto_wake_event.wait(timeout=wait_seconds)
+    finally:
+        auto_runtime["worker_alive"] = False
+        auto_runtime["cycle_status"] = "stopped"
 
 
 @app.on_event("startup")
@@ -1124,6 +1154,8 @@ def health():
             "market_cache_available":bool(market_cache["prices"]),
             "market_source_errors":market_cache.get("source_errors",{}),
             "valid_market_symbols":market_cache.get("valid_products",[]),
+            "unavailable_market_symbols":market_cache.get("unavailable_products",[]),
+            "worker":dict(auto_runtime),
             "configured_symbol_count":len(SYMBOLS),
             "trade_count":len(state["trades"]),"last_error":state.get("last_error")}
 
@@ -1179,7 +1211,12 @@ def auto_diagnostics():
         scanned = []
         scan_error = str(exc)[:300]
 
-    prices = get_prices()
+    market_error = None
+    try:
+        prices = get_prices()
+    except HTTPException as exc:
+        prices = {}
+        market_error = str(exc.detail)
     news_guard = news_blackout_status()
     reasons = []
     candidates = []
@@ -1209,7 +1246,9 @@ def auto_diagnostics():
         return {"mode": MODE, "real_orders_enabled": False,
                 "auto_enabled": bool(state.get("auto_enabled")),
                 "last_run": state.get("last_auto_run"), "last_error": state.get("last_error"),
-                "scan_error": scan_error, "scanned_count": len(scanned),
+                "worker": dict(auto_runtime),
+                "unavailable_market_symbols": market_cache.get("unavailable_products", []),
+                "scan_error": scan_error, "market_error": market_error, "scanned_count": len(scanned),
                 "buy_candidates_count": len(candidates), "buy_candidates": candidates,
                 "paper_balance_sek": round(num(state.get("balance_sek")), 2),
                 "risk_halt": bool(state.get("risk_halt")), "min_confidence": MIN_CONFIDENCE,
@@ -1261,7 +1300,8 @@ def auto_status():
             "min_confidence":MIN_CONFIDENCE,"risk_per_trade_pct":RISK_PER_TRADE_PCT,
             "news_blackout":news_blackout_status(),"news_blackout_minutes":NEWS_BLACKOUT_MINUTES,
             "last_run":state.get("last_auto_run"),
-            "last_error":state.get("last_error")}
+            "last_error":state.get("last_error"),"worker":dict(auto_runtime),
+            "unavailable_market_symbols":market_cache.get("unavailable_products",[])}
 
 
 @app.post("/api/auto/start")
@@ -1270,6 +1310,7 @@ def auto_start():
         if state.get("risk_halt"):
             raise HTTPException(409, "Riskspärren är aktiv efter total förlustgräns. Starta inte om utan att granska riskhistoriken.")
         state["real_orders_enabled"]=False; state["auto_enabled"]=True; persist()
+    auto_wake_event.set()
     return {"ok":True,"enabled":True,"mode":MODE,"real_orders_enabled":False,
             "message":"Automatisk PAPER-handel aktiverad. Inga riktiga order skickas."}
 
@@ -1277,6 +1318,7 @@ def auto_start():
 @app.post("/api/auto/stop")
 def auto_stop():
     with lock: state["auto_enabled"]=False; persist()
+    auto_wake_event.set()
     return {"ok":True,"enabled":False,"mode":MODE,"real_orders_enabled":False}
 
 
