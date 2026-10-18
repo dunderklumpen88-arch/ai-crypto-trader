@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "16.1.0-dynamic-coinbase-markets"
+APP_VERSION = "16.2.0-active-paper-analysis"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -35,14 +35,14 @@ MAX_TRADE_SEK = 100.0
 MAX_POSITION_SEK = 100.0
 # Ignore rapid repeated automatic buys of the same coin (duplicate signal protection).
 DUPLICATE_BUY_WINDOW_SECONDS = 15.0
-MAX_TOTAL_LOSS_SEK = max(1.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "500")))
-MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "8")))
-MAX_DAILY_LOSS_SEK = max(0.0, float(os.getenv("MAX_DAILY_LOSS_SEK", "500")))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "6"))
-TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "3"))
-TRAILING_DRAWDOWN_PCT = float(os.getenv("TRAILING_DRAWDOWN_PCT", "2"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "50"))
+MAX_TOTAL_LOSS_SEK = max(1.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "250")))
+MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "12")))
+MAX_DAILY_LOSS_SEK = max(0.0, float(os.getenv("MAX_DAILY_LOSS_SEK", "100")))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.5"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "4.5"))
+TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "2.0"))
+TRAILING_DRAWDOWN_PCT = float(os.getenv("TRAILING_DRAWDOWN_PCT", "1.2"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "60"))
 RISK_PER_TRADE_PCT = min(2.0, max(0.1, float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))))
 BACKTEST_SLIPPAGE_BPS = max(0.0, float(os.getenv("BACKTEST_SLIPPAGE_BPS", "10")))
 NEWS_BLACKOUT_MINUTES = max(0, int(os.getenv("NEWS_BLACKOUT_MINUTES", "15")))
@@ -63,7 +63,7 @@ NEWS_HIGH_IMPACT_TERMS = (
 )
 NEWS_CACHE: dict[str, Any] = {"checked_at": 0.0, "active": False, "reason": "not_checked", "events": [], "source_errors": {}, "sources_ok": []}
 NEWS_LOCK = threading.Lock()
-AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
+AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
 # Safety: always start with automation disabled; enable manually from the dashboard.
 AUTO_PAPER_ON_START = False
 HTTP_TIMEOUT = 10
@@ -728,9 +728,10 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     elif vol_ratio < 0.50:
         reasons.append("Låg volym: svag bekräftelse")
 
-    # Quality-first PAPER decision model. It deliberately prefers a smaller number
-    # of better-confirmed entries over trading just to hit the daily trade allowance.
-    # Confidence remains a heuristic ranking, not a calibrated win probability.
+    # PAPER decision model v2: retain multi-indicator entry confirmation while allowing
+    # earlier exits when the held asset weakens. More frequent scans do not guarantee
+    # more trades: signals still require completed candles and risk checks.
+    # Confidence is a heuristic ranking, not a calibrated probability of profit.
     early_reversal = (
         samples >= 200 and e21[-1] > e50[-1] and e50_slope_pct > 0.0
         and last_close >= e21[-1] and momentum > 0.03
@@ -785,7 +786,9 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         "momentum negativt": momentum < -0.05,
         "pris under EMA21": last_close < e21[-1],
     }
-    sell_ok = sum(bool(v) for v in sell_gates.values()) >= 5 and samples >= 200
+    # Faster deterioration detection: 4 of 6 independent checks can trigger a signal exit.
+    # Hard stop-loss/take-profit rules remain separate and always run first.
+    sell_ok = sum(bool(v) for v in sell_gates.values()) >= 4 and samples >= 200
 
     if buy_ok:
         signal = "KÖP"
@@ -1192,7 +1195,8 @@ def auto_loop():
                 log.exception("Auto cycle failed")
             finally:
                 auto_runtime["last_cycle_seconds"] = round(time.monotonic() - cycle_started, 3)
-            # Keep the interval close to five minutes start-to-start; manual start wakes immediately.
+            # Recheck every configured interval (default 3 minutes); market indicators still
+            # use completed 5-minute candles to avoid reacting to unfinished candles.
             wait_seconds = max(1.0, AUTO_INTERVAL_SECONDS - (time.monotonic() - cycle_started))
             auto_wake_event.wait(timeout=wait_seconds)
     finally:
