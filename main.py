@@ -1,7 +1,7 @@
 """AI Crypto Trader - PAPER ONLY backend. Live market data, OHLCV indicators, PostgreSQL persistence (with local fallback), risk-limited simulated orders, Swedish average-cost tax ledger, K4-oriented CSV exports. No live exchange order functionality is implemented. """
 from __future__ import annotations
 
-import csv, io, json, logging, math, os, threading, time, uuid, xml.etree.ElementTree as ET
+import csv, io, json, logging, math, os, secrets, threading, time, uuid, xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -10,11 +10,11 @@ from typing import Any
 
 import requests
 from worker import analyze_advanced
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "15.9.0-market-throttle-autodiag"
+APP_VERSION = "16.0.0-paper-safety-diagnostics"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -72,11 +72,20 @@ CANDLE_GRANULARITY = 300  # 5-minute candles
 CANDLE_LIMIT = 300
 STATE_FILE = os.getenv("PAPER_STATE_FILE", "/tmp/ai_trader_paper_state.json")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+# Set a long random value in Render to protect state-changing and tax/history endpoints.
+PAPER_API_TOKEN = os.getenv("PAPER_API_TOKEN", "").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("ai-crypto-paper")
 app = FastAPI(title="AI Crypto Trader PAPER", version=APP_VERSION)
+
+def require_admin_token(x_paper_admin_token: str | None = Header(default=None, alias="X-Paper-Admin-Token")):
+    """Protect write and sensitive ledger routes when PAPER_API_TOKEN is configured. No secret is embedded in the dashboard. Configure the same token in a trusted client. If the environment variable is missing, health reports that API write protection is not configured. """
+    if PAPER_API_TOKEN:
+        if not x_paper_admin_token or not secrets.compare_digest(x_paper_admin_token, PAPER_API_TOKEN):
+            raise HTTPException(status_code=401, detail="Admin-token saknas eller är felaktig.")
+    return True
 lock = threading.RLock()
 stop_event = threading.Event()
 auto_thread = None
@@ -98,6 +107,7 @@ product_unavailable_until: dict[str, float] = {}
 PRODUCT_UNAVAILABLE_TTL_SECONDS = 6 * 60 * 60
 PRODUCT_CACHE_LOCK = threading.Lock()
 candle_cache: dict[str, dict[str, Any]] = {}
+analysis_diagnostics: dict[str, dict[str, Any]] = {}
 auto_wake_event = threading.Event()
 auto_runtime: dict[str, Any] = {
     "last_attempt": None, "last_success": None, "last_cycle_seconds": None,
@@ -378,6 +388,7 @@ def get_candles(symbol: str, force=False) -> list[dict[str, float]]:
     now = time.time()
     cached = candle_cache.get(symbol)
     if cached and not force and now - cached["at"] < 60:
+        analysis_diagnostics[symbol] = {"candle_count": len(cached["candles"]), "candle_age_seconds": round(now-cached["at"], 1), "candle_source": "cache", "candle_error": None}
         return cached["candles"]
     product = PRODUCTS[symbol]
     try:
@@ -397,9 +408,13 @@ def get_candles(symbol: str, force=False) -> list[dict[str, float]]:
         candles.sort(key=lambda x: x["time"])
         if candles:
             candle_cache[symbol] = {"at": now, "candles": candles[-CANDLE_LIMIT:]}
+            analysis_diagnostics[symbol] = {"candle_count": len(candle_cache[symbol]["candles"]), "candle_age_seconds": 0, "candle_source": "coinbase", "candle_error": None}
+            market_cache["source_errors"].pop(f"{symbol}_candles", None)
             return candle_cache[symbol]["candles"]
+        analysis_diagnostics[symbol] = {"candle_count": 0, "candle_age_seconds": None, "candle_source": "coinbase", "candle_error": "Coinbase returnerade inga kompletta candles"}
     except Exception as exc:
         market_cache["source_errors"][f"{symbol}_candles"] = str(exc)[:200]
+        analysis_diagnostics[symbol] = {"candle_count": len(cached["candles"]) if cached else 0, "candle_age_seconds": round(time.time()-cached["at"], 1) if cached else None, "candle_source": "stale_cache" if cached else "coinbase_error", "candle_error": str(exc)[:200]}
     # Brief fallback for transient outages only; stale candles must not look current forever.
     if cached and time.time() - cached["at"] <= 300:
         return cached["candles"]
@@ -750,9 +765,15 @@ def make_signals() -> list[dict[str, Any]]:
     for s in SYMBOLS:
         if s in prices and num(prices[s]) > 0:
             try:
-                out.append(analyze_symbol(s, prices[s]))
+                signal = analyze_symbol(s, prices[s])
+                diag = analysis_diagnostics.get(s, {})
+                signal["data_diagnostics"] = dict(diag)
+                out.append(signal)
             except Exception as exc:
+                analysis_diagnostics[s] = {**analysis_diagnostics.get(s, {}), "analysis_error": str(exc)[:200]}
                 log.warning("Signal analysis failed for %s: %s", s, exc)
+        else:
+            analysis_diagnostics[s] = {"candle_count": 0, "candle_age_seconds": None, "candle_source": "skipped_no_price", "candle_error": "Ingen giltig ticker-pris"}
     return out
 
 
@@ -868,9 +889,14 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False, exit
             if side == "buy" and int(stats.get("trades",0)) >= MAX_DAILY_TRADES:
                 risk_event("DAILY_TRADE_LIMIT","Max automatiska köp per UTC-dygn uppnått; säljorder för riskreducering tillåts."); persist()
                 raise HTTPException(409,"Dagens köpgräns är nådd.")
-            if side == "buy" and num(stats.get("realized_pnl_sek")) <= -MAX_DAILY_LOSS_SEK:
-                risk_event("DAILY_LOSS_LIMIT","Daglig förlustgräns uppnådd; nya köp spärrade."); persist()
-                raise HTTPException(409,"Daglig förlustgräns nådd; köp spärrade.")
+            daily_start_equity = max(0.0, num(stats.get("starting_equity_sek"), current_equity))
+            daily_equity_drawdown = max(0.0, daily_start_equity - current_equity)
+            daily_realized_loss = max(0.0, -num(stats.get("realized_pnl_sek")))
+            daily_loss_measure = max(daily_equity_drawdown, daily_realized_loss)
+            if side == "buy" and MAX_DAILY_LOSS_SEK > 0 and daily_loss_measure >= MAX_DAILY_LOSS_SEK:
+                risk_event("DAILY_LOSS_LIMIT", f"Daglig förlustgräns uppnådd (equity-nedgång {daily_equity_drawdown:.2f} SEK; realiserad förlust {daily_realized_loss:.2f} SEK); nya köp spärrade.")
+                persist()
+                raise HTTPException(409,"Daglig förlustgräns nådd; nya köp spärrade. Säljning är fortfarande tillåten.")
         fee = amount_sek*fee_rate
         pnl, tax_event = 0.0, None
         if side == "buy":
@@ -1151,6 +1177,9 @@ def health():
             "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,
             "duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
             "local_state_exists":os.path.exists(STATE_FILE),"database":db_info,
+            "api_security":{"write_and_ledger_token_configured":bool(PAPER_API_TOKEN),
+                "status":"protected_by_X_Paper_Admin_Token" if PAPER_API_TOKEN else "not_configured_set_PAPER_API_TOKEN_in_Render"},
+            "candle_diagnostic_count":len(analysis_diagnostics),
             "market_cache_available":bool(market_cache["prices"]),
             "market_source_errors":market_cache.get("source_errors",{}),
             "valid_market_symbols":market_cache.get("valid_products",[]),
@@ -1255,6 +1284,7 @@ def auto_diagnostics():
                 "max_trade_sek": MAX_TRADE_SEK, "max_position_sek": MAX_POSITION_SEK,
                 "news_blackout": news_guard, "market_source_errors": market_cache.get("source_errors", {}),
                 "symbols": reasons,
+                "candle_diagnostics": {s: dict(d) for s, d in analysis_diagnostics.items()},
                 "interpretation": ("Automatiken är avstängd; starta PAPER via POST /api/auto/start." if not state.get("auto_enabled")
                     else "Inga köp-kandidater uppfyller samtliga villkor." if not candidates
                     else "Kandidater finns; kontrollera saldo, positionsgräns och senaste worker-loggar om köp ändå uteblir.")}
@@ -1278,12 +1308,12 @@ def paper_status():
             "risk_baseline_equity_sek":num(state.get("risk_baseline_equity_sek"),START_BALANCE_SEK)}
 
 
-@app.post("/api/paper/order")
+@app.post("/api/paper/order", dependencies=[Depends(require_admin_token)])
 def create_paper_order(payload:OrderRequest):
     return paper_order(payload.side,payload.symbol,payload.amount_sek)
 
 
-@app.get("/api/paper/history")
+@app.get("/api/paper/history", dependencies=[Depends(require_admin_token)])
 def paper_history(limit:int=Query(default=100,ge=1,le=1000)):
     return {"trades":state["trades"][-limit:],"count":len(state["trades"]),"mode":MODE}
 
@@ -1304,7 +1334,7 @@ def auto_status():
             "unavailable_market_symbols":market_cache.get("unavailable_products",[])}
 
 
-@app.post("/api/auto/start")
+@app.post("/api/auto/start", dependencies=[Depends(require_admin_token)])
 def auto_start():
     with lock:
         if state.get("risk_halt"):
@@ -1315,14 +1345,14 @@ def auto_start():
             "message":"Automatisk PAPER-handel aktiverad. Inga riktiga order skickas."}
 
 
-@app.post("/api/auto/stop")
+@app.post("/api/auto/stop", dependencies=[Depends(require_admin_token)])
 def auto_stop():
     with lock: state["auto_enabled"]=False; persist()
     auto_wake_event.set()
     return {"ok":True,"enabled":False,"mode":MODE,"real_orders_enabled":False}
 
 
-@app.post("/api/tax/repair")
+@app.post("/api/tax/repair", dependencies=[Depends(require_admin_token)])
 def tax_repair():
     result = rebuild_tax_ledger_from_trades()
     audit = tax_audit()
@@ -1331,22 +1361,26 @@ def tax_repair():
             "warning": "Kontrollera mot fullständig börshistorik innan deklaration."}
 
 
-@app.get("/api/tax/summary")
+@app.get("/api/tax/summary", dependencies=[Depends(require_admin_token)])
 def tax_summary():
     disposals=[e for e in state["tax_events"] if e.get("type")=="disposal"]
     gains=sum(max(0,num(e.get("gain_loss_sek"))) for e in disposals)
     losses=sum(min(0,num(e.get("gain_loss_sek"))) for e in disposals)
     sells=sum(t.get("side")=="sell" for t in state["trades"])
     complete=all(e.get("basis_complete",False) for e in disposals)
+    links={(e.get("trade_id"),e.get("type")) for e in state["tax_events"]}
+    missing_sells=any((t.get("trade_id"),"disposal") not in links for t in state["trades"] if t.get("side")=="sell")
+    missing_buys=any((t.get("trade_id"),"acquisition") not in links for t in state["trades"] if t.get("side")=="buy")
+    audit_ok=(len(disposals)==sells and complete and not missing_sells and not missing_buys)
     return {"mode":MODE,"disposals":len(disposals),"sell_trades_in_history":sells,
             "positive_gains_sek":round(gains,2),"negative_losses_sek":round(losses,2),
             "net_realized_result_sek":round(gains+losses,2),"tax_basis_complete":complete,
-            "audit_ok":len(disposals)==sells and complete,
+            "audit_ok":audit_ok,"missing_trade_tax_events":bool(missing_sells or missing_buys),
             "method":"AVERAGE_COST","tax_filing_ready":False,
             "note":"Beräknat från PAPER-loggen med genomsnittsmetoden. Inte färdig deklaration förrän komplett historik har jämförts."}
 
 
-@app.get("/api/tax/audit")
+@app.get("/api/tax/audit", dependencies=[Depends(require_admin_token)])
 def tax_audit():
     trades,events=state["trades"],state["tax_events"]
     sells=[t for t in trades if t.get("side")=="sell"]
@@ -1376,14 +1410,14 @@ def csv_response(rows,filename):
         headers={"Content-Disposition":f'attachment; filename="{filename}"'})
 
 
-@app.get("/api/tax.csv")
+@app.get("/api/tax.csv", dependencies=[Depends(require_admin_token)])
 def tax_csv():
     cols=["time","event_id","trade_id","type","symbol","quantity","proceeds_sek","cost_basis_sek",
           "gain_loss_sek","fee_sek","method","basis_complete","mode"]
     return csv_response([cols]+[[e.get(c,"") for c in cols] for e in state["tax_events"]],"paper_tax_ledger.csv")
 
 
-@app.get("/api/tax/k4.csv")
+@app.get("/api/tax/k4.csv", dependencies=[Depends(require_admin_token)])
 def tax_k4_csv(year: int | None = Query(default=None, ge=2009, le=2100)):
     """Annual K4 section-D helper: separate profitable and loss disposals per coin."""
     grouped: dict[tuple[int, str, str], dict[str, float]] = {}
@@ -1567,7 +1601,7 @@ def trader_intelligence_status():
             "message": "Ingen offentlig traderdata används. Den lokala analysmotorn kombinerar tekniska indikatorer; externa AI-signaler kräver separat verifierad integration."}
 
 
-@app.post("/api/safety/disable-real-orders")
+@app.post("/api/safety/disable-real-orders", dependencies=[Depends(require_admin_token)])
 def disable_real_orders():
     with lock: state["real_orders_enabled"]=False; persist()
     return {"ok":True,"real_orders_enabled":False,"mode":MODE}
@@ -1578,10 +1612,7 @@ def auto_enable_compat():
     return {"enabled":bool(state["auto_enabled"]),"message":"Använd POST /api/auto/start för att aktivera PAPER-handel."}
 
 
-@app.get("/api/auto/disable")
+@app.get("/api/auto/disable", dependencies=[Depends(require_admin_token)])
 def auto_disable_compat():
     with lock: state["auto_enabled"]=False; persist()
     return {"enabled":False,"message":"PAPER-handel stoppad."}
-
-
-restore()
