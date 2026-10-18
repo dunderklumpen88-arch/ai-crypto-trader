@@ -1,9 +1,10 @@
 """AI Crypto Trader - PAPER ONLY backend. Live market data, OHLCV indicators, PostgreSQL persistence (with local fallback), risk-limited simulated orders, Swedish average-cost tax ledger, K4-oriented CSV exports. No live exchange order functionality is implemented. """
 from __future__ import annotations
 
-import csv, io, json, logging, math, os, threading, time, uuid
+import csv, io, json, logging, math, os, threading, time, uuid, xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "15.7.0-quality-entry-analysis"
+APP_VERSION = "15.8.0-live-news-blackout"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -45,6 +46,23 @@ MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "50"))
 RISK_PER_TRADE_PCT = min(2.0, max(0.1, float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))))
 BACKTEST_SLIPPAGE_BPS = max(0.0, float(os.getenv("BACKTEST_SLIPPAGE_BPS", "10")))
 NEWS_BLACKOUT_MINUTES = max(0, int(os.getenv("NEWS_BLACKOUT_MINUTES", "15")))
+NEWS_CACHE_SECONDS = max(30, int(os.getenv("NEWS_CACHE_SECONDS", "60")))
+NEWS_FEEDS = [
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
+    ("Cointelegraph", "https://cointelegraph.com/rss"),
+]
+NEWS_HIGH_IMPACT_TERMS = (
+    "hack", "hacked", "exploit", "security breach", "breach", "stolen", "drained",
+    "sec sues", "sec lawsuit", "lawsuit", "regulatory action", "ban crypto", "crypto ban",
+    "etf approved", "etf rejected", "etf approval", "etf denial", "court ruling",
+    "exchange halts", "withdrawals suspended", "bankruptcy", "insolvency", "depeg",
+    "stablecoin loses peg", "liquidation cascade", "mass liquidation", "flash crash",
+    "market crash", "trading halted", "outage", "federal reserve", "fed decision",
+    "interest rate decision", "rate cut", "rate hike", "emergency rate", "sanctions",
+    "war escalates", "terror attack", "major exploit", "bridge exploit", "protocol exploit",
+)
+NEWS_CACHE: dict[str, Any] = {"checked_at": 0.0, "active": False, "reason": "not_checked", "events": [], "source_errors": {}, "sources_ok": []}
+NEWS_LOCK = threading.Lock()
 AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
 # Safety: always start with automation disabled; enable manually from the dashboard.
 AUTO_PAPER_ON_START = False
@@ -394,26 +412,93 @@ def stochastic_k(highs: list[float], lows: list[float], close: float, period: in
     return 100.0 * (close - lo) / (hi - lo) if hi > lo else 50.0
 
 
-def news_blackout_status(now: datetime | None = None) -> dict[str, Any]:
-    """Optional manual event blackout. NEWS_BLACKOUT_TIMES_UTC is comma-separated ISO timestamps. No news calendar is guessed or scraped; without configured timestamps this guard is inactive."""
-    now = now or datetime.now(timezone.utc)
-    raw = os.getenv("NEWS_BLACKOUT_TIMES_UTC", "").strip()
-    if not raw or NEWS_BLACKOUT_MINUTES <= 0:
-        return {"active": False, "reason": "no_configured_event_times", "minutes": NEWS_BLACKOUT_MINUTES}
-    for item in raw.split(","):
+def _parse_news_datetime(item: ET.Element) -> datetime | None:
+    raw = item.findtext("pubDate") or item.findtext("{http://www.w3.org/2005/Atom}published") or item.findtext("{http://www.w3.org/2005/Atom}updated")
+    if not raw:
+        return None
+    try:
+        stamp = parsedate_to_datetime(raw)
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return stamp.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
         try:
-            stamp = datetime.fromisoformat(item.strip().replace("Z", "+00:00"))
-            if stamp.tzinfo is None:
-                stamp = stamp.replace(tzinfo=timezone.utc)
-            delta = abs((now - stamp.astimezone(timezone.utc)).total_seconds()) / 60.0
-            if delta <= NEWS_BLACKOUT_MINUTES:
-                return {"active": True, "reason": "configured_economic_event_blackout",
-                        "event_time_utc": stamp.astimezone(timezone.utc).isoformat(),
-                        "minutes_until_or_since_event": round((stamp.astimezone(timezone.utc)-now).total_seconds()/60.0, 2),
-                        "minutes": NEWS_BLACKOUT_MINUTES}
-        except (ValueError, TypeError):
-            continue
-    return {"active": False, "reason": "outside_configured_event_windows", "minutes": NEWS_BLACKOUT_MINUTES}
+            stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+
+def _fetch_news_blackout(now: datetime) -> dict[str, Any]:
+    """Check public crypto-news RSS feeds; block new simulated BUYs around fresh high-impact headlines."""
+    if NEWS_BLACKOUT_MINUTES <= 0:
+        return {"active": False, "reason": "disabled_by_minutes_setting", "minutes": NEWS_BLACKOUT_MINUTES,
+                "sources_ok": [], "source_errors": {}, "events": []}
+    events: list[dict[str, Any]] = []
+    errors: dict[str, str] = {}
+    sources_ok: list[str] = []
+    terms = tuple(x.casefold() for x in NEWS_HIGH_IMPACT_TERMS)
+    for source, url in NEWS_FEEDS:
+        try:
+            response = requests.get(url, timeout=5, headers={"User-Agent": "AI-Crypto-Trader-Paper/15.8 (+news-risk-check)"})
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            sources_ok.append(source)
+            items = root.findall(".//item")
+            if not items:
+                items = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+            for item in items[:100]:
+                title = (item.findtext("title") or item.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
+                description = (item.findtext("description") or item.findtext("{http://www.w3.org/2005/Atom}summary") or "").strip()
+                text_blob = (title + " " + description).casefold()
+                if not any(term in text_blob for term in terms):
+                    continue
+                published = _parse_news_datetime(item)
+                if published is None:
+                    continue
+                age_minutes = (now - published).total_seconds() / 60.0
+                # Only use recent past headlines; ignore future timestamps and stale articles.
+                if 0 <= age_minutes <= NEWS_BLACKOUT_MINUTES:
+                    link = (item.findtext("link") or "").strip()
+                    if not link:
+                        link_el = item.find("{http://www.w3.org/2005/Atom}link")
+                        if link_el is not None:
+                            link = link_el.attrib.get("href", "")
+                    events.append({"source": source, "title": title[:240], "published_at_utc": published.isoformat(),
+                                   "age_minutes": round(age_minutes, 2), "link": link[:500]})
+        except Exception as exc:
+            errors[source] = str(exc)[:180]
+    events.sort(key=lambda x: x["age_minutes"])
+    if events:
+        return {"active": True, "reason": "recent_high_impact_news", "minutes": NEWS_BLACKOUT_MINUTES,
+                "events": events[:5], "sources_ok": sources_ok, "source_errors": errors, "checked_at": now.isoformat()}
+    # Fail closed when every feed is unavailable: no new buys until a source can be checked.
+    if not sources_ok:
+        return {"active": True, "reason": "news_sources_unavailable_buy_blocked_for_safety",
+                "minutes": NEWS_BLACKOUT_MINUTES, "events": [], "sources_ok": [],
+                "source_errors": errors, "checked_at": now.isoformat()}
+    return {"active": False, "reason": "no_recent_high_impact_headlines", "minutes": NEWS_BLACKOUT_MINUTES,
+            "events": [], "sources_ok": sources_ok, "source_errors": errors, "checked_at": now.isoformat()}
+
+
+def news_blackout_status(now: datetime | None = None, force: bool = False) -> dict[str, Any]:
+    """Cached live RSS news guard. A fresh high-impact headline pauses BUYs for NEWS_BLACKOUT_MINUTES."""
+    now = now or datetime.now(timezone.utc)
+    with NEWS_LOCK:
+        age = time.time() - float(NEWS_CACHE.get("checked_at", 0.0))
+        if not force and age < NEWS_CACHE_SECONDS:
+            cached = dict(NEWS_CACHE)
+            cached.pop("checked_at", None)
+            cached["cache_age_seconds"] = max(0, int(age))
+            cached["minutes"] = NEWS_BLACKOUT_MINUTES
+            return cached
+    result = _fetch_news_blackout(now)
+    with NEWS_LOCK:
+        NEWS_CACHE.clear()
+        NEWS_CACHE.update(result)
+        NEWS_CACHE["checked_at"] = time.time()
+    result["cache_age_seconds"] = 0
+    return result
 
 
 def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
