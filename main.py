@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "16.2.0-active-paper-analysis"
+APP_VERSION = "16.3.0-faster-scans-fee-aware-exits"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -36,13 +36,15 @@ MAX_POSITION_SEK = 100.0
 # Ignore rapid repeated automatic buys of the same coin (duplicate signal protection).
 DUPLICATE_BUY_WINDOW_SECONDS = 15.0
 MAX_TOTAL_LOSS_SEK = max(1.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "250")))
-MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "12")))
+MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "30")))
 MAX_DAILY_LOSS_SEK = max(0.0, float(os.getenv("MAX_DAILY_LOSS_SEK", "100")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.5"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "4.5"))
-TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "2.0"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "8.0"))
+TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "2.5"))
 TRAILING_DRAWDOWN_PCT = float(os.getenv("TRAILING_DRAWDOWN_PCT", "1.2"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "60"))
+# Ordinary trend-warning sells require a meaningful net gain; hard risk exits remain exempt.
+MIN_SIGNAL_EXIT_NET_PCT = max(0.0, float(os.getenv("MIN_SIGNAL_EXIT_NET_PCT", "1.0")))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "58"))
 RISK_PER_TRADE_PCT = min(2.0, max(0.1, float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))))
 BACKTEST_SLIPPAGE_BPS = max(0.0, float(os.getenv("BACKTEST_SLIPPAGE_BPS", "10")))
 NEWS_BLACKOUT_MINUTES = max(0, int(os.getenv("NEWS_BLACKOUT_MINUTES", "15")))
@@ -63,7 +65,7 @@ NEWS_HIGH_IMPACT_TERMS = (
 )
 NEWS_CACHE: dict[str, Any] = {"checked_at": 0.0, "active": False, "reason": "not_checked", "events": [], "source_errors": {}, "sources_ok": []}
 NEWS_LOCK = threading.Lock()
-AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
+AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "60")))
 # Safety: always start with automation disabled; enable manually from the dashboard.
 AUTO_PAPER_ON_START = False
 HTTP_TIMEOUT = 10
@@ -737,11 +739,13 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         and last_close >= e21[-1] and momentum > 0.03
         and histogram_up and histogram_rising
     )
-    volume_ok = vol_ratio >= 0.25
-    stoch_ok = 20.0 <= stoch_now <= 88.0 and (stoch_trigger or histogram_rising)
+    # Slightly more responsive entry gates than v16.2. These remain filters, not
+    # promises of profitability; the daily trade cap and per-position risk limits still apply.
+    volume_ok = vol_ratio >= 0.20
+    stoch_ok = 15.0 <= stoch_now <= 90.0 and (stoch_trigger or histogram_rising)
     trend_ok = long_trend_up or (trend_up and last_close > e200[-1]) or early_reversal
-    not_overextended = price_above_ema21_pct <= 1.25
-    volatility_ok = volatility <= 1.5
+    not_overextended = price_above_ema21_pct <= 1.75
+    volatility_ok = volatility <= 2.0
     timeframe_ok = (
         (trend_15m != "DOWN" and trend_1h != "DOWN")
         or (long_trend_up and histogram_cross_up and momentum >= 0.08)
@@ -751,30 +755,39 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     # pullback/recovery in an established long trend. Avoid buying a late spike.
     continuation_setup = (
         trend_ok and e9[-1] > e21[-1] and histogram_up and histogram_rising
-        and momentum >= 0.03 and 45 <= rsi_v <= 68 and volume_ok
-        and not_overextended and 1 <= stoch_now <= 88 and volatility_ok
+        and momentum >= 0.00 and 42 <= rsi_v <= 70 and volume_ok
+        and not_overextended and 5 <= stoch_now <= 90 and volatility_ok
         and timeframe_ok
     )
     pullback_recovery_setup = (
         long_trend_up and e9[-1] > e21[-1] and stoch_trigger
-        and histogram_up and histogram_rising and momentum >= -0.02
-        and 42 <= rsi_v <= 65 and volume_ok and not_overextended
-        and stoch_now <= 82 and volatility_ok and timeframe_ok
+        and histogram_up and histogram_rising and momentum >= -0.03
+        and 40 <= rsi_v <= 68 and volume_ok and not_overextended
+        and stoch_now <= 85 and volatility_ok and timeframe_ok
+    )
+    # A separate confirmed-breakout path helps the bot react to fresh upward moves
+    # instead of waiting for every slow-trend filter to turn positive first.
+    breakout_setup = (
+        samples >= 200 and breakout_volume_confirmed
+        and e9[-1] > e21[-1] and histogram_up and histogram_rising
+        and momentum >= 0.02 and 45 <= rsi_v <= 72
+        and price_above_ema21_pct <= 2.0 and volatility <= 2.0
+        and trend_15m != "DOWN" and trend_1h != "DOWN"
     )
     buy_gates = {
         "tillräcklig historik": samples >= 200,
         "trend eller tidig trendvändning": trend_ok,
         "EMA9 över EMA21": e9[-1] > e21[-1],
         "MACD positivt och förbättras": histogram_up and histogram_rising,
-        "momentum bekräftar uppgång": momentum >= 0.03,
-        "RSI inom kvalitetsintervall": 42 <= rsi_v <= 68,
+        "momentum inte tydligt negativt": momentum >= -0.03,
+        "RSI inom kvalitetsintervall": 40 <= rsi_v <= 72,
         "volym tillräcklig": volume_ok,
         "inte översträckt över EMA21": not_overextended,
         "stochastic inte överköpt": stoch_now <= 88,
         "volatilitet rimlig": volatility_ok,
         "15m/1h-trend bekräftar eller stark vändning": timeframe_ok,
     }
-    buy_ok = continuation_setup or pullback_recovery_setup
+    buy_ok = continuation_setup or pullback_recovery_setup or breakout_setup
 
     # A sell signal is an exit warning based on a confirmed weakening trend.
     # Protective stop-loss/take-profit exits remain separate in the execution loop.
@@ -796,7 +809,10 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                              momentum >= 0.03, 42 <= rsi_v <= 68, volume_ok, timeframe_ok])
         confidence = min(82, 62 + confirmations * 3)
         reasons.append("KÖP godkänd av kvalitetsmodell: trend + förbättrat momentum; ingen vinstgaranti")
-        reasons.append("Inträdesväg: trendfortsättning" if continuation_setup else "Inträdesväg: återhämtning i lång trend")
+        entry_path = ("trendfortsättning" if continuation_setup else
+                      "återhämtning i lång trend" if pullback_recovery_setup else
+                      "bekräftat breakout")
+        reasons.append(f"Inträdesväg: {entry_path}")
     elif sell_ok:
         signal = "SÄLJ"
         confirmations = sum(bool(v) for v in sell_gates.values())
@@ -1135,14 +1151,21 @@ def auto_loop():
                             except HTTPException as exc:
                                 if exc.status_code not in (409,):
                                     raise
-                    # Ordinary signal exits only affect coins already held.
+                    # Ordinary signal exits are not allowed to cash out for a tiny gain.
+                    # Stop-loss, trailing-stop and take-profit exits above remain independent
+                    # protective rules and can always sell when their thresholds are reached.
                     for sig in signals:
                         if sig["symbol"] not in exited_this_cycle and sig["signal"] == "SÄLJ" and sig["confidence"] >= MIN_CONFIDENCE:
-                            held = num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity"))
+                            holding = state.get("holdings", {}).get(sig["symbol"], {})
+                            held = num(holding.get("quantity"))
+                            basis = num(holding.get("cost_basis_sek"))
                             px = num(prices.get(sig["symbol"]))
-                            if held > 0 and px > 0:
+                            fee_now = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
+                            net_return_pct = ((held * px * (1.0 - fee_now)) / basis - 1.0) * 100.0 if held > 0 and basis > 0 else -999.0
+                            if held > 0 and px > 0 and net_return_pct >= MIN_SIGNAL_EXIT_NET_PCT:
                                 try:
-                                    paper_order("sell", sig["symbol"], held * px, automatic=True)
+                                    paper_order("sell", sig["symbol"], held * px, automatic=True,
+                                                exit_reason=f"SIGNAL_EXIT_NET_{net_return_pct:.2f}%")
                                     exited_this_cycle.add(sig["symbol"])
                                 except HTTPException as exc:
                                     if exc.status_code not in (409,):
@@ -1195,7 +1218,7 @@ def auto_loop():
                 log.exception("Auto cycle failed")
             finally:
                 auto_runtime["last_cycle_seconds"] = round(time.monotonic() - cycle_started, 3)
-            # Recheck every configured interval (default 3 minutes); market indicators still
+            # Recheck every configured interval (default 60 seconds); entry indicators still
             # use completed 5-minute candles to avoid reacting to unfinished candles.
             wait_seconds = max(1.0, AUTO_INTERVAL_SECONDS - (time.monotonic() - cycle_started))
             auto_wake_event.wait(timeout=wait_seconds)
@@ -1401,6 +1424,7 @@ def auto_status():
             "max_total_loss_sek":MAX_TOTAL_LOSS_SEK,"risk_halt":bool(state.get("risk_halt")),
             "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,
             "trailing_activation_pct":TRAILING_ACTIVATION_PCT,"trailing_drawdown_pct":TRAILING_DRAWDOWN_PCT,
+            "min_signal_exit_net_pct":MIN_SIGNAL_EXIT_NET_PCT,
             "min_confidence":MIN_CONFIDENCE,"risk_per_trade_pct":RISK_PER_TRADE_PCT,
             "news_blackout":news_blackout_status(),"news_blackout_minutes":NEWS_BLACKOUT_MINUTES,
             "last_run":state.get("last_auto_run"),
@@ -1541,6 +1565,7 @@ def risk_status():
             "max_daily_loss_sek":MAX_DAILY_LOSS_SEK,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
             "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,
             "trailing_activation_pct":TRAILING_ACTIVATION_PCT,"trailing_drawdown_pct":TRAILING_DRAWDOWN_PCT,
+            "min_signal_exit_net_pct":MIN_SIGNAL_EXIT_NET_PCT,
             "min_confidence":MIN_CONFIDENCE},
             "risk_baseline_equity_sek":num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK),
             "risk_halt":bool(state.get("risk_halt")),"today_utc":daily_key(),"daily_stats":stats,
