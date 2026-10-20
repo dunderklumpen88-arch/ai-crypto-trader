@@ -36,7 +36,8 @@ MAX_POSITION_SEK = 100.0
 # Ignore rapid repeated automatic buys of the same coin (duplicate signal protection).
 DUPLICATE_BUY_WINDOW_SECONDS = 15.0
 MAX_TOTAL_LOSS_SEK = max(1.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "250")))
-MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "12")))
+# 0 means unlimited daily trade count; loss and position safeguards remain active.
+MAX_DAILY_TRADES = max(0, int(os.getenv("MAX_DAILY_TRADES", "0")))
 MAX_DAILY_LOSS_SEK = max(0.0, float(os.getenv("MAX_DAILY_LOSS_SEK", "100")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.5"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "4.5"))
@@ -962,7 +963,7 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False, exit
             # A sell already in progress may still finish; future cycles stop when auto is disabled.
             if not state["auto_enabled"] and side == "buy":
                 raise HTTPException(409,"Automatisk PAPER-handel är avstängd eller riskspärrad.")
-            if side == "buy" and int(stats.get("trades",0)) >= MAX_DAILY_TRADES:
+            if side == "buy" and MAX_DAILY_TRADES > 0 and int(stats.get("trades",0)) >= MAX_DAILY_TRADES:
                 risk_event("DAILY_TRADE_LIMIT","Max automatiska köp per UTC-dygn uppnått; säljorder för riskreducering tillåts."); persist()
                 raise HTTPException(409,"Dagens köpgräns är nådd.")
             daily_start_equity = max(0.0, num(stats.get("starting_equity_sek"), current_equity))
@@ -1434,11 +1435,8 @@ def auto_status():
             "unavailable_market_symbols":market_cache.get("unavailable_products",[])}
 
 
-@app.post("/api/auto/start")
+@app.post("/api/auto/start", dependencies=[Depends(require_admin_token)])
 def auto_start():
-    # PAPER ONLY: allow the dashboard's same-origin start button to work without
-    # embedding an admin secret in public browser JavaScript. This endpoint can
-    # only start simulated trading; real exchange orders are not implemented.
     with lock:
         if state.get("risk_halt"):
             raise HTTPException(409, "Riskspärren är aktiv efter total förlustgräns. Starta inte om utan att granska riskhistoriken.")
@@ -1448,9 +1446,8 @@ def auto_start():
             "message":"Automatisk PAPER-handel aktiverad. Inga riktiga order skickas."}
 
 
-@app.post("/api/auto/stop")
+@app.post("/api/auto/stop", dependencies=[Depends(require_admin_token)])
 def auto_stop():
-    # PAPER ONLY: same-origin dashboard control; no live exchange orders exist.
     with lock: state["auto_enabled"]=False; persist()
     auto_wake_event.set()
     return {"ok":True,"enabled":False,"mode":MODE,"real_orders_enabled":False}
