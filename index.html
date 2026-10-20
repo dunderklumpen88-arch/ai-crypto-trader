@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="sv">
 <head>
@@ -8,43 +9,239 @@
 <style>
 :root{color-scheme:dark}*{box-sizing:border-box}
 body{margin:0;background:#0b1020;color:#edf2ff;font:15px system-ui,sans-serif}
-header{padding:18px 14px;background:#172554}main{max-width:760px;margin:auto;padding:12px}
+header{padding:18px 14px;background:#172554}
+main{max-width:760px;margin:auto;padding:12px}
 h1{margin:0;font-size:22px}h2{font-size:16px;margin:0}
-.muted{color:#a9b6ce;font-size:12px}.pill{display:inline-block;margin-top:8px;padding:5px 9px;border:1px solid #36a875;border-radius:20px;color:#9bf0c2;font-size:11px}
+.muted{color:#a9b6ce;font-size:12px}
+.pill{display:inline-block;margin-top:8px;padding:5px 9px;border:1px solid #36a875;border-radius:20px;color:#9bf0c2;font-size:11px}
 .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
 .card{background:#141e32;border:1px solid #2b3850;border-radius:12px;padding:13px;margin:9px 0}
 .metric{font-size:22px;font-weight:750;margin-top:4px;overflow-wrap:anywhere}
-.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.row>*{flex:1}
-button,input,select{padding:10px;border-radius:8px;border:1px solid #40506a;background:#0b1427;color:white;font:inherit;max-width:100%;min-width:0}
-button{background:#2563eb;border:0;cursor:pointer;font-weight:650}button.secondary{background:#334155}
-button:disabled{opacity:.5}label{display:block;font-size:12px;color:#a9b6ce;margin:8px 0 4px}
-input[type=url],input[type=password]{width:100%}
-.status{font-size:12px;color:#b9c6db;margin-top:9px;overflow-wrap:anywhere}.good{color:#8ff0bd}.bad{color:#ff9b9b}.warn{color:#ffdc8a}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.row>*{flex:1}
+button{padding:10px;border-radius:8px;border:1px solid #40506a;background:#2563eb;color:white;font:inherit;max-width:100%;min-width:0;cursor:pointer;font-weight:650}
+button.secondary{background:#334155}
+button:disabled{opacity:.5;cursor:wait}
+.status{font-size:12px;color:#b9c6db;margin-top:9px;overflow-wrap:anywhere}
+.good{color:#8ff0bd}.bad{color:#ff9b9b}.warn{color:#ffdc8a}
 .note{padding:10px;border-radius:9px;background:#302817;color:#ffe4a0;font-size:12px;margin:10px 0}
 details{background:#141e32;border:1px solid #2b3850;border-radius:12px;padding:12px;margin:9px 0}
-summary{cursor:pointer;font-weight:650;list-style:none}summary:after{content:"＋";float:right;color:#a9b6ce}details[open]>summary:after{content:"−"}
-.inner{padding-top:12px}.tablewrap{overflow:auto;max-height:330px}table{border-collapse:collapse;width:100%;font-size:12px}td,th{text-align:left;padding:8px 5px;border-bottom:1px solid #2b3850;vertical-align:top}th{color:#a9b6ce}
+summary{cursor:pointer;font-weight:650;list-style:none}
+summary:after{content:"＋";float:right;color:#a9b6ce}
+details[open]>summary:after{content:"−"}
+.inner{padding-top:12px}
+.tablewrap{overflow:auto;max-height:330px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+td,th{text-align:left;padding:8px 5px;border-bottom:1px solid #2b3850;vertical-align:top}
+th{color:#a9b6ce}
 .signal{display:grid;grid-template-columns:58px 1fr auto;gap:8px;align-items:center;padding:9px 0;border-bottom:1px solid #2b3850}
-.signal:last-child{border-bottom:0}.signal-name{font-weight:700}.small{font-size:11px;color:#a9b6ce}.signal-price{text-align:right;font-size:12px}
+.signal:last-child{border-bottom:0}
+.signal-name{font-weight:700}.small{font-size:11px;color:#a9b6ce}
+.signal-price{text-align:right;font-size:12px}
 @media(min-width:560px){.grid{grid-template-columns:repeat(4,minmax(0,1fr))}.metric{font-size:21px}}
 </style>
 </head>
 <body>
-<header><h1>AI Crypto Trader</h1><div class="muted">Översikt · marknadsanalys · paper trading</div><span class="pill">PAPER ONLY — INGA RIKTIGA ORDER</span></header>
+<header>
+<h1>AI Crypto Trader</h1>
+<div class="muted">Översikt · marknadsanalys · paper trading</div>
+<span class="pill">PAPER ONLY — INGA RIKTIGA ORDER</span>
+</header>
 <main>
 <div class="grid">
- <div class="card"><div class="muted">Kontantsaldo</div><div class="metric" id="cash">—</div></div>
- <div class="card"><div class="muted">Portföljvärde</div><div class="metric" id="equity">—</div></div>
- <div class="card"><div class="muted">Resultat sedan start</div><div class="metric" id="result">—</div></div>
- <div class="card"><div class="muted">Affärer</div><div class="metric" id="count">—</div></div>
+<div class="card"><div class="muted">Kontantsaldo</div><div class="metric" id="cash">—</div></div>
+<div class="card"><div class="muted">Portföljvärde</div><div class="metric" id="equity">—</div></div>
+<div class="card"><div class="muted">Resultat sedan start</div><div class="metric" id="result">—</div></div>
+<div class="card"><div class="muted">Affärer</div><div class="metric" id="count">—</div></div>
 </div>
-<div class="card">
- <div class="row"><div><h2>Automatisk handel</h2><div class="muted">Simulerade order med låtsaspengar</div></div><div style="text-align:right"><span id="autopill" class="pill">LADDAR STATUS</span></div></div>
- <div class="row" style="margin-top:12px"><button id="startBtn" onclick="autoAction('start')">Starta</button><button class="secondary" onclick="autoAction('stop')">Stoppa</button><button class="secondary" onclick="refreshAll()">Uppdatera</button></div>
- <div id="autostatus" class="status">Hämtar status…</div>
-</div>
-<div class="card"><div class="row"><div><h2>Viktigaste signalerna</h2><div class="muted">Visar köp först; övriga signaler kan öppnas nedan.</div></div><button class="secondary" onclick="loadScan()">Skanna</button></div><div id="topSignals" class="inner muted">Laddar marknadsanalys…</div></div>
-<div class="note">Detta är testhandel. Resultat i paper trading garanterar inte framtida vinst. Kontrollera att servern är online innan du startar.</div>
 
-<details><summary>Alla marknadssignaler</summary><div class="inner"><div class="tablewrap"><table><thead><tr><th>Valuta</th><th>Pris</th><th>Signal</th><th>Orsak</th></tr></thead><tbody id="signals"><tr><td colspan="4">Laddar…</td></tr></tbody></table></div></div></details>
-<details><summary>Innehav</summary><div class="inner"><div class="tablewrap"><table><thead><tr><th>Valuta</th><th>Antal</th><th>Värde</th></tr></thead><
+<div class="card">
+<div class="row">
+<div><h2>Automatisk handel</h2><div class="muted">Simulerade order med låtsaspengar</div></div>
+<div style="text-align:right"><span id="autopill" class="pill">KONTROLLERAR</span></div>
+</div>
+<div class="row" style="margin-top:12px">
+<button id="startBtn" onclick="autoAction('start')">Starta</button>
+<button class="secondary" onclick="autoAction('stop')">Stoppa</button>
+<button class="secondary" onclick="refreshAll()">Uppdatera</button>
+</div>
+<div id="autostatus" class="status">Kontrollerar servern…</div>
+</div>
+
+<div class="card">
+<div class="row">
+<div><h2>Viktigaste signalerna</h2><div class="muted">Köpsignaler visas först.</div></div>
+<button class="secondary" onclick="loadScan()">Skanna</button>
+</div>
+<div id="topSignals" class="inner muted">Hämtar marknadsanalys…</div>
+</div>
+
+<div class="note">Detta är testhandel. Resultat i paper trading garanterar inte framtida vinst. Kontrollera serverstatus innan du startar.</div>
+
+<details>
+<summary>Alla marknadssignaler</summary>
+<div class="inner"><div class="tablewrap"><table>
+<thead><tr><th>Valuta</th><th>Pris</th><th>Signal</th><th>Orsak</th></tr></thead>
+<tbody id="signals"><tr><td colspan="4">Hämtar…</td></tr></tbody>
+</table></div></div>
+</details>
+
+<details>
+<summary>Innehav</summary>
+<div class="inner"><div class="tablewrap"><table>
+<thead><tr><th>Valuta</th><th>Antal</th><th>Värde (SEK)</th></tr></thead>
+<tbody id="holdings"><tr><td colspan="3">Hämtar…</td></tr></tbody>
+</table></div></div>
+</details>
+
+<details>
+<summary>Senaste affärer</summary>
+<div class="inner"><div class="tablewrap"><table>
+<thead><tr><th>Tid</th><th>Valuta</th><th>Typ</th><th>Belopp</th><th>Resultat</th></tr></thead>
+<tbody id="trades"><tr><td colspan="5">Hämtar…</td></tr></tbody>
+</table></div></div>
+</details>
+<div id="globalError" class="status"></div>
+</main>
+
+<script>
+'use strict';
+const API_BASE = '';
+const $ = id => document.getElementById(id);
+const money = n => Number.isFinite(Number(n)) ? Number(n).toLocaleString('sv-SE',{minimumFractionDigits:2,maximumFractionDigits:2})+' kr' : '—';
+const num = n => Number.isFinite(Number(n)) ? Number(n).toLocaleString('sv-SE',{maximumFractionDigits:8}) : '—';
+
+function esc(v){
+return String(v ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function api(path, options={}){
+const controller = new AbortController();
+const timer = setTimeout(()=>controller.abort(),12000);
+try{
+const response = await fetch(API_BASE+path,{
+cache:'no-store',...options,signal:controller.signal,
+headers:{'Accept':'application/json',...(options.headers||{})}
+});
+const text = await response.text();
+let data;
+try{data=text?JSON.parse(text):{};}
+catch{throw new Error('API:t returnerade inte JSON (HTTP '+response.status+').');}
+if(!response.ok)throw new Error(data.detail||data.error||('HTTP '+response.status));
+return data;
+}catch(e){
+if(e.name==='AbortError')throw new Error('Servern svarade inte inom 12 sekunder. Kontrollera Render-loggarna.');
+if(e instanceof TypeError)throw new Error('Kunde inte ansluta till API:t. Kontrollera serveradressen.');
+throw e;
+}finally{clearTimeout(timer);}
+}
+
+function first(obj,keys,fallback=null){
+for(const k of keys)if(obj&&obj[k]!==undefined&&obj[k]!==null)return obj[k];
+return fallback;
+}
+
+function signalArray(d){
+if(Array.isArray(d))return d;
+for(const k of ['signals','results','scan','items','data'])if(Array.isArray(d?.[k]))return d[k];
+return [];
+}
+
+function signalText(s){
+return first(s,['signal','action','decision','recommendation'],'AVVAKTA');
+}
+
+function renderSignals(d){
+const arr=signalArray(d);
+if(!arr.length){
+$('topSignals').innerHTML='<span class="warn">API:t svarade, men ingen signal-lista hittades.</span>';
+$('signals').innerHTML='<tr><td colspan="4">Inga signaler att visa.</td></tr>';
+return;
+}
+const rank={KÖP:0,BUY:0,SÄLJ:1,SELL:1,AVVAKTA:2,HOLD:2};
+arr.sort((a,b)=>(rank[signalText(a).toUpperCase()]??3)-(rank[signalText(b).toUpperCase()]??3));
+$('topSignals').innerHTML=arr.slice(0,5).map(s=>
+`<div class="signal"><div class="signal-name">${esc(s.symbol||s.asset||s.product||'—')}</div><div><b>${esc(signalText(s))}</b><div class="small">${esc(s.reason||s.reasons||'')}</div></div><div class="signal-price">${money(Number(s.price_sek??s.price??NaN))}</div></div>`
+).join('');
+$('signals').innerHTML=arr.map(s=>
+`<tr><td>${esc(s.symbol||s.asset||s.product||'—')}</td><td>${money(Number(s.price_sek??s.price??NaN))}</td><td>${esc(signalText(s))} (${esc(s.confidence??'—')}%)</td><td>${esc(s.reason||s.reasons||'—')}</td></tr>`
+).join('');
+}
+
+async function loadScan(){
+$('topSignals').textContent='Hämtar marknadsanalys…';
+$('signals').innerHTML='<tr><td colspan="4">Skannar…</td></tr>';
+try{
+const d=await api('/api/scan');
+renderSignals(d);
+$('globalError').textContent='';
+}catch(e){
+$('topSignals').innerHTML='<span class="bad">Marknadsanalys misslyckades: '+esc(e.message)+'</span>';
+$('signals').innerHTML='<tr><td colspan="4">Fel: '+esc(e.message)+'</td></tr>';
+}
+}
+
+async function loadAuto(){
+try{
+const d=await api('/api/auto/status');
+const active=!!first(d,['running','active','enabled','auto_trading','is_running'],false);
+$('autopill').textContent=active?'AUTOMATISK HANDEL PÅ':'AUTOMATISK HANDEL AV';
+$('autostatus').innerHTML='<span class="'+(active?'good':'warn')+'">Serverkontakt fungerar.</span> '+esc(first(d,['status','message','mode'],'Status mottagen från API:t.'));
+}catch(e){
+$('autopill').textContent='API-FEL';
+$('autostatus').innerHTML='<span class="bad">Status kunde inte hämtas: '+esc(e.message)+'</span>';
+}
+}
+
+async function loadPaper(){
+try{
+const d=await api('/api/paper/status');
+const cash=first(d,['cash_sek','balance_sek','cash','balance'],null);
+const equity=first(d,['equity_sek','portfolio_value_sek','equity','total_value_sek'],null);
+const pnl=first(d,['profit_loss_sek','pnl_sek','total_pnl_sek','result_sek','profit'],null);
+const trades=first(d,['trade_count','total_trades','trades_count','count'],null);
+if(cash!==null)$('cash').textContent=money(Number(cash));
+if(equity!==null)$('equity').textContent=money(Number(equity));
+if(pnl!==null)$('result').textContent=money(Number(pnl));
+if(trades!==null)$('count').textContent=num(trades);
+
+const holdings=first(d,['holdings','positions','portfolio'],null);
+if(holdings&&typeof holdings==='object'){
+const entries=Array.isArray(holdings)?holdings.map((x,i)=>[x.symbol||x.asset||i,x]):Object.entries(holdings);
+$('holdings').innerHTML=entries.length?entries.map(([k,v])=>
+`<tr><td>${esc(k)}</td><td>${num(Number(v.quantity??v.amount??v.qty??0))}</td><td>${money(Number(v.market_value_sek??v.value_sek??v.market_value??NaN))}</td></tr>`
+).join(''):'<tr><td colspan="3">Inga innehav.</td></tr>';
+}
+const tr=first(d,['recent_trades','trade_history','trades','transactions'],null);
+if(Array.isArray(tr)){
+$('trades').innerHTML=tr.length?tr.slice(-20).reverse().map(t=>
+`<tr><td>${esc(t.time||t.timestamp||t.date||'—')}</td><td>${esc(t.symbol||t.asset||'—')}</td><td>${esc(t.side||t.type||t.action||'—')}</td><td>${money(Number(t.amount_sek??t.value_sek??t.amount??NaN))}</td><td>${money(Number(t.pnl_sek??t.profit_sek??t.realized_pnl??NaN))}</td></tr>`
+).join(''):'<tr><td colspan="5">Inga affärer rapporterade.</td></tr>';
+}
+}catch(e){
+$('globalError').innerHTML='<span class="bad">Paper-status kunde inte hämtas: '+esc(e.message)+'</span>';
+}
+}
+
+async function autoAction(action){
+const buttons=document.querySelectorAll('button');
+buttons.forEach(b=>b.disabled=true);
+$('autostatus').textContent=action==='start'?'Begär start…':'Begär stopp…';
+try{
+const d=await api('/api/auto/'+action,{method:'POST'});
+$('autostatus').innerHTML='<span class="good">Servern tog emot begäran.</span> '+esc(first(d,['message','status'],'Status uppdateras…'));
+await loadAuto();
+}catch(e){
+$('autostatus').innerHTML='<span class="bad">Begäran misslyckades: '+esc(e.message)+'</span><br><span class="small">Kontrollera API-rutten i main.py. Status kan vara oförändrad.</span>';
+}finally{
+buttons.forEach(b=>b.disabled=false);
+}
+}
+
+async function refreshAll(){
+await Promise.allSettled([loadAuto(),loadPaper(),loadScan()]);
+}
+document.addEventListener('DOMContentLoaded',()=>{refreshAll();});
+</script>
+</body>
+</html>
