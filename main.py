@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "16.3.0-faster-scans-fee-aware-exits"
+APP_VERSION = "17.0.0-trend-hold-dynamic-exit"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -36,15 +36,13 @@ MAX_POSITION_SEK = 100.0
 # Ignore rapid repeated automatic buys of the same coin (duplicate signal protection).
 DUPLICATE_BUY_WINDOW_SECONDS = 15.0
 MAX_TOTAL_LOSS_SEK = max(1.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "250")))
-MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "30")))
+MAX_DAILY_TRADES = max(1, int(os.getenv("MAX_DAILY_TRADES", "12")))
 MAX_DAILY_LOSS_SEK = max(0.0, float(os.getenv("MAX_DAILY_LOSS_SEK", "100")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.5"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "8.0"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "4.5"))
 TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "2.5"))
-TRAILING_DRAWDOWN_PCT = float(os.getenv("TRAILING_DRAWDOWN_PCT", "1.2"))
-# Ordinary trend-warning sells require a meaningful net gain; hard risk exits remain exempt.
-MIN_SIGNAL_EXIT_NET_PCT = max(0.0, float(os.getenv("MIN_SIGNAL_EXIT_NET_PCT", "1.0")))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "58"))
+TRAILING_DRAWDOWN_PCT = float(os.getenv("TRAILING_DRAWDOWN_PCT", "2.0"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "60"))
 RISK_PER_TRADE_PCT = min(2.0, max(0.1, float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))))
 BACKTEST_SLIPPAGE_BPS = max(0.0, float(os.getenv("BACKTEST_SLIPPAGE_BPS", "10")))
 NEWS_BLACKOUT_MINUTES = max(0, int(os.getenv("NEWS_BLACKOUT_MINUTES", "15")))
@@ -65,7 +63,7 @@ NEWS_HIGH_IMPACT_TERMS = (
 )
 NEWS_CACHE: dict[str, Any] = {"checked_at": 0.0, "active": False, "reason": "not_checked", "events": [], "source_errors": {}, "sources_ok": []}
 NEWS_LOCK = threading.Lock()
-AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "60")))
+AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
 # Safety: always start with automation disabled; enable manually from the dashboard.
 AUTO_PAPER_ON_START = False
 HTTP_TIMEOUT = 10
@@ -739,13 +737,11 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         and last_close >= e21[-1] and momentum > 0.03
         and histogram_up and histogram_rising
     )
-    # Slightly more responsive entry gates than v16.2. These remain filters, not
-    # promises of profitability; the daily trade cap and per-position risk limits still apply.
-    volume_ok = vol_ratio >= 0.20
-    stoch_ok = 15.0 <= stoch_now <= 90.0 and (stoch_trigger or histogram_rising)
+    volume_ok = vol_ratio >= 0.25
+    stoch_ok = 20.0 <= stoch_now <= 88.0 and (stoch_trigger or histogram_rising)
     trend_ok = long_trend_up or (trend_up and last_close > e200[-1]) or early_reversal
-    not_overextended = price_above_ema21_pct <= 1.75
-    volatility_ok = volatility <= 2.0
+    not_overextended = price_above_ema21_pct <= 1.25
+    volatility_ok = volatility <= 1.5
     timeframe_ok = (
         (trend_15m != "DOWN" and trend_1h != "DOWN")
         or (long_trend_up and histogram_cross_up and momentum >= 0.08)
@@ -755,42 +751,33 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     # pullback/recovery in an established long trend. Avoid buying a late spike.
     continuation_setup = (
         trend_ok and e9[-1] > e21[-1] and histogram_up and histogram_rising
-        and momentum >= 0.00 and 42 <= rsi_v <= 70 and volume_ok
-        and not_overextended and 5 <= stoch_now <= 90 and volatility_ok
+        and momentum >= 0.03 and 45 <= rsi_v <= 68 and volume_ok
+        and not_overextended and 1 <= stoch_now <= 88 and volatility_ok
         and timeframe_ok
     )
     pullback_recovery_setup = (
         long_trend_up and e9[-1] > e21[-1] and stoch_trigger
-        and histogram_up and histogram_rising and momentum >= -0.03
-        and 40 <= rsi_v <= 68 and volume_ok and not_overextended
-        and stoch_now <= 85 and volatility_ok and timeframe_ok
-    )
-    # A separate confirmed-breakout path helps the bot react to fresh upward moves
-    # instead of waiting for every slow-trend filter to turn positive first.
-    breakout_setup = (
-        samples >= 200 and breakout_volume_confirmed
-        and e9[-1] > e21[-1] and histogram_up and histogram_rising
-        and momentum >= 0.02 and 45 <= rsi_v <= 72
-        and price_above_ema21_pct <= 2.0 and volatility <= 2.0
-        and trend_15m != "DOWN" and trend_1h != "DOWN"
+        and histogram_up and histogram_rising and momentum >= -0.02
+        and 42 <= rsi_v <= 65 and volume_ok and not_overextended
+        and stoch_now <= 82 and volatility_ok and timeframe_ok
     )
     buy_gates = {
         "tillräcklig historik": samples >= 200,
         "trend eller tidig trendvändning": trend_ok,
         "EMA9 över EMA21": e9[-1] > e21[-1],
         "MACD positivt och förbättras": histogram_up and histogram_rising,
-        "momentum inte tydligt negativt": momentum >= -0.03,
-        "RSI inom kvalitetsintervall": 40 <= rsi_v <= 72,
+        "momentum bekräftar uppgång": momentum >= 0.03,
+        "RSI inom kvalitetsintervall": 42 <= rsi_v <= 68,
         "volym tillräcklig": volume_ok,
         "inte översträckt över EMA21": not_overextended,
         "stochastic inte överköpt": stoch_now <= 88,
         "volatilitet rimlig": volatility_ok,
         "15m/1h-trend bekräftar eller stark vändning": timeframe_ok,
     }
-    buy_ok = continuation_setup or pullback_recovery_setup or breakout_setup
+    buy_ok = continuation_setup or pullback_recovery_setup
 
     # A sell signal is an exit warning based on a confirmed weakening trend.
-    # Protective stop-loss/take-profit exits remain separate in the execution loop.
+    # Profit-taking is handled by a dynamic trailing exit, not a fixed take-profit.
     sell_gates = {
         "tillräcklig historik": samples >= 100,
         "EMA9 under EMA21": e9[-1] < e21[-1],
@@ -799,8 +786,8 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         "momentum negativt": momentum < -0.05,
         "pris under EMA21": last_close < e21[-1],
     }
-    # Faster deterioration detection: 4 of 6 independent checks can trigger a signal exit.
-    # Hard stop-loss/take-profit rules remain separate and always run first.
+    # A sell signal is only a warning. The execution loop requires extra confirmation
+    # across timeframes and repeated cycles before it can close a position.
     sell_ok = sum(bool(v) for v in sell_gates.values()) >= 4 and samples >= 200
 
     if buy_ok:
@@ -809,10 +796,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                              momentum >= 0.03, 42 <= rsi_v <= 68, volume_ok, timeframe_ok])
         confidence = min(82, 62 + confirmations * 3)
         reasons.append("KÖP godkänd av kvalitetsmodell: trend + förbättrat momentum; ingen vinstgaranti")
-        entry_path = ("trendfortsättning" if continuation_setup else
-                      "återhämtning i lång trend" if pullback_recovery_setup else
-                      "bekräftat breakout")
-        reasons.append(f"Inträdesväg: {entry_path}")
+        reasons.append("Inträdesväg: trendfortsättning" if continuation_setup else "Inträdesväg: återhämtning i lång trend")
     elif sell_ok:
         signal = "SÄLJ"
         confirmations = sum(bool(v) for v in sell_gates.values())
@@ -840,7 +824,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                 "multi_timeframe": {"15m_trend": trend_15m, "1h_trend": trend_1h,
                     "15m_samples": len(closes_15m), "1h_samples": len(closes_1h)},
                 "advanced": adv, "buy_gates": buy_gates, "sell_gates": sell_gates,
-                "decision_model": "quality_entry_v1",
+                "decision_model": "quality_entry_v2_dynamic_hold",
                 "candle_interval_minutes": 5, "data_quality": data_quality},
             "reason": "; ".join(reasons), "not_financial_advice": True}
 
@@ -927,6 +911,12 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False, exit
         balance = num(state["balance_sek"])
         fee_rate = clamp(num(state.get("fee_rate"),FEE_RATE),0,0.02)
         if side == "buy":
+            # Reset position-specific trailing state when opening a fresh position;
+            # otherwise a previous closed trade's peak could trigger a premature exit.
+            if num(h.get("quantity")) <= 1e-12:
+                h["peak_net_return_pct"] = 0.0
+                h["last_net_return_pct"] = 0.0
+                h["sell_signal_count"] = 0
             # Normalize principal so principal + fee can never exceed the hard order cap.
             amount_sek = min(float(amount_sek), MAX_TRADE_SEK / (1.0 + fee_rate))
             # Duplicate guard: the same symbol cannot be automatically bought twice in a
@@ -1128,6 +1118,7 @@ def auto_loop():
                     prices = get_prices()
                     exited_this_cycle: set[str] = set()
                     fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
+                    signals_by_symbol = {str(sig.get("symbol", "")).upper(): sig for sig in signals}
                     for symbol, h in list(state["holdings"].items()):
                         qty = num(h.get("quantity")); basis = num(h.get("cost_basis_sek")); price = num(prices.get(symbol))
                         if qty <= 0 or basis <= 0 or price <= 0:
@@ -1137,13 +1128,44 @@ def auto_loop():
                         peak_return_pct = max(num(h.get("peak_net_return_pct"), net_return_pct), net_return_pct)
                         h["peak_net_return_pct"] = round(peak_return_pct, 6)
                         h["last_net_return_pct"] = round(net_return_pct, 6)
+
+                        # Adaptive trailing protection: winners are allowed to run.
+                        # ATR widens the trail for volatile coins, with bounded limits.
+                        sig = signals_by_symbol.get(symbol, {})
+                        ind = sig.get("indicators", {}) if isinstance(sig.get("indicators"), dict) else {}
+                        adv = ind.get("advanced", {}) if isinstance(ind.get("advanced"), dict) else {}
+                        atr_pct = max(0.0, num(adv.get("atr_pct"), 0.0))
+                        trail_gap_pct = min(5.0, max(TRAILING_DRAWDOWN_PCT, atr_pct * 2.5))
                         exit_reason = None
                         if net_return_pct <= -STOP_LOSS_PCT:
                             exit_reason = f"NET_STOP_LOSS_{STOP_LOSS_PCT:.1f}%"
-                        elif net_return_pct >= TAKE_PROFIT_PCT:
-                            exit_reason = f"NET_TAKE_PROFIT_{TAKE_PROFIT_PCT:.1f}%"
-                        elif peak_return_pct >= TRAILING_ACTIVATION_PCT and net_return_pct <= peak_return_pct - TRAILING_DRAWDOWN_PCT:
-                            exit_reason = f"TRAILING_STOP_peak_{peak_return_pct:.2f}%_drawdown_{TRAILING_DRAWDOWN_PCT:.1f}%"
+
+                        # No fixed take-profit: after activation, the stop follows the
+                        # best net return and sells only after a meaningful pullback.
+                        elif (peak_return_pct >= TRAILING_ACTIVATION_PCT
+                              and net_return_pct <= peak_return_pct - trail_gap_pct):
+                            exit_reason = (f"DYNAMIC_TRAILING_STOP_peak_{peak_return_pct:.2f}%"
+                                           f"_drawdown_{trail_gap_pct:.2f}%")
+
+                        # Signal-based exits require repeated, stronger evidence. A single
+                        # SÄLJ signal is not enough to close a position. Require a bearish
+                        # 15m trend plus either bearish 1h trend or price below EMA50 with
+                        # negative momentum, and confirmation in two consecutive cycles.
+                        multi = ind.get("multi_timeframe", {}) if isinstance(ind.get("multi_timeframe"), dict) else {}
+                        trend_15m = str(multi.get("15m_trend", "NEUTRAL"))
+                        trend_1h = str(multi.get("1h_trend", "NEUTRAL"))
+                        ema50 = num(ind.get("ema50_sek"), 0.0)
+                        momentum_pct = num(ind.get("momentum_pct"), 0.0)
+                        strong_breakdown = (
+                            sig.get("signal") == "SÄLJ"
+                            and num(sig.get("confidence")) >= max(72, MIN_CONFIDENCE)
+                            and trend_15m == "DOWN"
+                            and (trend_1h == "DOWN" or (ema50 > 0 and price < ema50 and momentum_pct < -0.10))
+                        )
+                        h["sell_signal_count"] = int(num(h.get("sell_signal_count"))) + 1 if strong_breakdown else 0
+                        if exit_reason is None and h["sell_signal_count"] >= 2:
+                            exit_reason = (f"CONFIRMED_TREND_BREAKDOWN_15m_{trend_15m}"
+                                           f"_1h_{trend_1h}_momentum_{momentum_pct:.2f}%")
                         if exit_reason:
                             try:
                                 paper_order("sell", symbol, qty * price, automatic=True, exit_reason=exit_reason)
@@ -1151,25 +1173,6 @@ def auto_loop():
                             except HTTPException as exc:
                                 if exc.status_code not in (409,):
                                     raise
-                    # Ordinary signal exits are not allowed to cash out for a tiny gain.
-                    # Stop-loss, trailing-stop and take-profit exits above remain independent
-                    # protective rules and can always sell when their thresholds are reached.
-                    for sig in signals:
-                        if sig["symbol"] not in exited_this_cycle and sig["signal"] == "SÄLJ" and sig["confidence"] >= MIN_CONFIDENCE:
-                            holding = state.get("holdings", {}).get(sig["symbol"], {})
-                            held = num(holding.get("quantity"))
-                            basis = num(holding.get("cost_basis_sek"))
-                            px = num(prices.get(sig["symbol"]))
-                            fee_now = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
-                            net_return_pct = ((held * px * (1.0 - fee_now)) / basis - 1.0) * 100.0 if held > 0 and basis > 0 else -999.0
-                            if held > 0 and px > 0 and net_return_pct >= MIN_SIGNAL_EXIT_NET_PCT:
-                                try:
-                                    paper_order("sell", sig["symbol"], held * px, automatic=True,
-                                                exit_reason=f"SIGNAL_EXIT_NET_{net_return_pct:.2f}%")
-                                    exited_this_cycle.add(sig["symbol"])
-                                except HTTPException as exc:
-                                    if exc.status_code not in (409,):
-                                        raise
                     news_guard = news_blackout_status()
                     buy_candidates = [] if news_guard.get("active") else [sig for sig in signals
                         if sig["symbol"] not in exited_this_cycle and sig["signal"] == "KÖP"
@@ -1218,7 +1221,7 @@ def auto_loop():
                 log.exception("Auto cycle failed")
             finally:
                 auto_runtime["last_cycle_seconds"] = round(time.monotonic() - cycle_started, 3)
-            # Recheck every configured interval (default 60 seconds); entry indicators still
+            # Recheck every configured interval (default 3 minutes); market indicators still
             # use completed 5-minute candles to avoid reacting to unfinished candles.
             wait_seconds = max(1.0, AUTO_INTERVAL_SECONDS - (time.monotonic() - cycle_started))
             auto_wake_event.wait(timeout=wait_seconds)
@@ -1424,7 +1427,6 @@ def auto_status():
             "max_total_loss_sek":MAX_TOTAL_LOSS_SEK,"risk_halt":bool(state.get("risk_halt")),
             "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,
             "trailing_activation_pct":TRAILING_ACTIVATION_PCT,"trailing_drawdown_pct":TRAILING_DRAWDOWN_PCT,
-            "min_signal_exit_net_pct":MIN_SIGNAL_EXIT_NET_PCT,
             "min_confidence":MIN_CONFIDENCE,"risk_per_trade_pct":RISK_PER_TRADE_PCT,
             "news_blackout":news_blackout_status(),"news_blackout_minutes":NEWS_BLACKOUT_MINUTES,
             "last_run":state.get("last_auto_run"),
@@ -1565,7 +1567,6 @@ def risk_status():
             "max_daily_loss_sek":MAX_DAILY_LOSS_SEK,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
             "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,
             "trailing_activation_pct":TRAILING_ACTIVATION_PCT,"trailing_drawdown_pct":TRAILING_DRAWDOWN_PCT,
-            "min_signal_exit_net_pct":MIN_SIGNAL_EXIT_NET_PCT,
             "min_confidence":MIN_CONFIDENCE},
             "risk_baseline_equity_sek":num(state.get("risk_baseline_equity_sek"), START_BALANCE_SEK),
             "risk_halt":bool(state.get("risk_halt")),"today_utc":daily_key(),"daily_stats":stats,
