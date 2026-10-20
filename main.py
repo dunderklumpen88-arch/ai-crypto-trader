@@ -36,8 +36,8 @@ MAX_POSITION_SEK = 100.0
 # Ignore rapid repeated automatic buys of the same coin (duplicate signal protection).
 DUPLICATE_BUY_WINDOW_SECONDS = 15.0
 MAX_TOTAL_LOSS_SEK = max(1.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "250")))
-# 0 means unlimited daily trade count; loss and position safeguards remain active.
-MAX_DAILY_TRADES = max(0, int(os.getenv("MAX_DAILY_TRADES", "0")))
+# Unlimited automatic trades per UTC day; other risk controls remain active.
+MAX_DAILY_TRADES = 0
 MAX_DAILY_LOSS_SEK = max(0.0, float(os.getenv("MAX_DAILY_LOSS_SEK", "100")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.5"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "4.5"))
@@ -963,9 +963,7 @@ def paper_order(side: str, symbol: str, amount_sek: float, automatic=False, exit
             # A sell already in progress may still finish; future cycles stop when auto is disabled.
             if not state["auto_enabled"] and side == "buy":
                 raise HTTPException(409,"Automatisk PAPER-handel är avstängd eller riskspärrad.")
-            if side == "buy" and MAX_DAILY_TRADES > 0 and int(stats.get("trades",0)) >= MAX_DAILY_TRADES:
-                risk_event("DAILY_TRADE_LIMIT","Max automatiska köp per UTC-dygn uppnått; säljorder för riskreducering tillåts."); persist()
-                raise HTTPException(409,"Dagens köpgräns är nådd.")
+            # No daily trade-count cap. Daily and total loss protections remain active.
             daily_start_equity = max(0.0, num(stats.get("starting_equity_sek"), current_equity))
             daily_equity_drawdown = max(0.0, daily_start_equity - current_equity)
             daily_realized_loss = max(0.0, -num(stats.get("realized_pnl_sek")))
@@ -1424,7 +1422,7 @@ def auto_status():
     return {"enabled":bool(state["auto_enabled"]),"mode":MODE,"real_orders_enabled":False,
             "interval_seconds":AUTO_INTERVAL_SECONDS,"max_position_sek":MAX_POSITION_SEK,
             "duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,
-            "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_daily_trades":MAX_DAILY_TRADES,"max_daily_loss_sek":MAX_DAILY_LOSS_SEK,
+            "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_daily_trades":None,"daily_trade_limit":"unlimited","max_daily_loss_sek":MAX_DAILY_LOSS_SEK,
             "max_total_loss_sek":MAX_TOTAL_LOSS_SEK,"risk_halt":bool(state.get("risk_halt")),
             "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,
             "trailing_activation_pct":TRAILING_ACTIVATION_PCT,"trailing_drawdown_pct":TRAILING_DRAWDOWN_PCT,
@@ -1564,7 +1562,7 @@ def risk_status():
     with lock:
         stats=get_daily_stats(prices)
         return {"mode":MODE,"real_orders_enabled":False,"auto_enabled":bool(state["auto_enabled"]),
-            "limits":{"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,"duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,"purchase_amount_cap":True,"max_daily_trades":MAX_DAILY_TRADES,
+            "limits":{"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,"duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,"purchase_amount_cap":True,"max_daily_trades":None,"daily_trade_limit":"unlimited",
             "max_daily_loss_sek":MAX_DAILY_LOSS_SEK,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
             "stop_loss_pct":STOP_LOSS_PCT,"take_profit_pct":TAKE_PROFIT_PCT,
             "trailing_activation_pct":TRAILING_ACTIVATION_PCT,"trailing_drawdown_pct":TRAILING_DRAWDOWN_PCT,
