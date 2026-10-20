@@ -1434,8 +1434,11 @@ def auto_status():
             "unavailable_market_symbols":market_cache.get("unavailable_products",[])}
 
 
-@app.post("/api/auto/start", dependencies=[Depends(require_admin_token)])
+@app.post("/api/auto/start")
 def auto_start():
+    # PAPER ONLY: allow the dashboard's same-origin start button to work without
+    # embedding an admin secret in public browser JavaScript. This endpoint can
+    # only start simulated trading; real exchange orders are not implemented.
     with lock:
         if state.get("risk_halt"):
             raise HTTPException(409, "Riskspärren är aktiv efter total förlustgräns. Starta inte om utan att granska riskhistoriken.")
@@ -1445,8 +1448,9 @@ def auto_start():
             "message":"Automatisk PAPER-handel aktiverad. Inga riktiga order skickas."}
 
 
-@app.post("/api/auto/stop", dependencies=[Depends(require_admin_token)])
+@app.post("/api/auto/stop")
 def auto_stop():
+    # PAPER ONLY: same-origin dashboard control; no live exchange orders exist.
     with lock: state["auto_enabled"]=False; persist()
     auto_wake_event.set()
     return {"ok":True,"enabled":False,"mode":MODE,"real_orders_enabled":False}
