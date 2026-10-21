@@ -10,12 +10,12 @@ from typing import Any
 
 import requests
 from worker import analyze_advanced
-from trader_intelligence import collect_market_signals, market_filter_for_symbol
+from trader_intelligence import collect_market_signals, market_filter_for_symbol, collect_provider_status
 from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "18.0.0-market-filter-paper"
+APP_VERSION = "19.0.0-external-provider-paper"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -1706,11 +1706,15 @@ def backtest(symbol: str = Query(default="BTC"), slippage_bps: float = Query(def
 
 @app.get("/api/trader-intelligence/status")
 def trader_intelligence_status():
-    """Read-only status for independent BTC/ETH trend filter; never places real orders."""
+    """Read-only external market filter and optional provider diagnostics."""
     try:
         market = collect_market_signals()
     except Exception as exc:
         market = {"ok": False, "signals": [], "error": str(exc)[:200]}
+    try:
+        providers = collect_provider_status()
+    except Exception as exc:
+        providers = {"providers": [], "error": str(exc)[:180], "influences_trades": False}
     directions = [str(item.get("direction", "NEUTRAL")).upper() for item in market.get("signals", [])
                   if item.get("status") == "ok"]
     bearish = len(directions) >= 2 and all(d == "DOWN" for d in directions)
@@ -1719,8 +1723,16 @@ def trader_intelligence_status():
             "status": "ok" if market.get("ok") else "market_data_unavailable",
             "influences_trades": True, "influence_type": "bearish_market_buy_veto_only",
             "market_regime": "BEARISH" if bearish else "BULLISH" if bullish else "MIXED_OR_UNKNOWN",
-            "signals": market.get("signals", []), "updated_at": market.get("updated_at"),
-            "message": "Extern BTC/ETH-data kan stoppa nya köp vid samstämmig nedtrend. Den skapar aldrig köp eller säljer befintliga positioner."}
+            "signals": market.get("signals", []), "providers": providers.get("providers", []),
+            "provider_summary": {"configured": providers.get("configured_count", 0),
+                                 "ready": providers.get("ready_count", 0)},
+            "updated_at": market.get("updated_at"),
+            "message": "BTC/ETH-trendfiltret kan stoppa nya köp vid samstämmig nedtrend. Bitsgap, Cryptohopper och HelaSyn är read-only diagnostik tills officiell åtkomst och schema har verifierats; externa signaler skapar aldrig order."}
+
+@app.get("/api/external-tools/status")
+def external_tools_status():
+    """Diagnostics for Bitsgap, Cryptohopper and HelaSyn; no trading or credentials exposed."""
+    return collect_provider_status()
 @app.post("/api/safety/disable-real-orders", dependencies=[Depends(require_admin_token)])
 def disable_real_orders():
     with lock: state["real_orders_enabled"]=False; persist()
