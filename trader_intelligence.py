@@ -94,3 +94,94 @@ def trader_intelligence_adjustment(base_score: float, signal: dict[str, Any], tr
 
 def reset_signal_cache() -> None:
     _cache.update({"at":0.0,"result":None})
+
+
+# Optional external provider diagnostics. No provider payload can place an order.
+# Provider URLs and credentials are intentionally not hard-coded.
+import urllib.parse
+
+PROVIDER_TIMEOUT = min(8.0, max(1.0, float(os.getenv("EXTERNAL_PROVIDER_TIMEOUT", "4"))))
+PROVIDER_CACHE_SECONDS = max(30, int(os.getenv("EXTERNAL_PROVIDER_CACHE_SECONDS", "180")))
+_provider_cache: dict[str, Any] = {"at": 0.0, "result": None}
+
+def _provider_config() -> list[dict[str, str]]:
+    return [
+        {"name": "Bitsgap", "url": os.getenv("BITSGAP_SIGNAL_URL", "").strip(),
+         "credential": os.getenv("BITSGAP_API_KEY", "").strip(),
+         "note": "API-åtkomst måste konfigureras enligt Bitsgaps officiella autentisering."},
+        {"name": "Cryptohopper", "url": os.getenv("CRYPTOHOPPER_SIGNAL_URL", "").strip(),
+         "credential": os.getenv("CRYPTOHOPPER_ACCESS_TOKEN", "").strip(),
+         "note": "Kräver giltig Cryptohopper API/OAuth-åtkomst och en signal- eller dataendpoint."},
+        {"name": "HelaSyn", "url": os.getenv("HELASYN_SIGNAL_URL", "").strip(),
+         "credential": os.getenv("HELASYN_API_KEY", "").strip(),
+         "note": "HelaSyn har inte en verifierad API-specifikation i denna version; konfigurera endast om leverantören ger en officiell HTTPS-API."},
+    ]
+
+def _safe_provider_probe(item: dict[str, str]) -> dict[str, Any]:
+    name, url, credential = item["name"], item["url"], item["credential"]
+    base = {"provider": name, "configured": bool(url), "status": "not_configured",
+            "signals": [], "influences_trades": False, "note": item["note"]}
+    if not url:
+        return base
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return {**base, "status": "invalid_url", "note": "Endpoint måste vara en giltig HTTPS-URL."}
+    # Never send arbitrary credentials to unknown hosts. Credentials are only sent
+    # when the host is explicitly allowlisted by the user in the matching env var.
+    allowed_host = os.getenv(name.upper().replace(" ", "") + "_API_HOST", "").strip().lower()
+    if credential and (not allowed_host or parsed.hostname.lower() != allowed_host):
+        return {**base, "status": "credential_host_not_allowlisted",
+                "note": "API-nyckeln skickades inte: ange exakt betrodd värd i motsvarande *_API_HOST-variabel."}
+    try:
+        headers = {"Accept": "application/json", "User-Agent": "AI-Crypto-Trader-PAPER/19.0"}
+        if credential:
+            if name == "Cryptohopper":
+                headers["access-token"] = credential
+            else:
+                headers["Authorization"] = "Bearer " + credential
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=PROVIDER_TIMEOUT) as response:
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status}")
+            raw = response.read(500_001)
+        if len(raw) > 500_000:
+            raise ValueError("Svar större än 500 KB")
+        payload = json.loads(raw.decode("utf-8"))
+        raw_signals = payload.get("signals", []) if isinstance(payload, dict) else []
+        clean = []
+        if isinstance(raw_signals, list):
+            for row in raw_signals[:100]:
+                if not isinstance(row, dict):
+                    continue
+                symbol = str(row.get("symbol", "")).upper().strip()
+                direction = str(row.get("signal", row.get("direction", ""))).upper().strip()
+                if not symbol or len(symbol) > 24 or direction not in {"BUY", "SELL", "HOLD", "KÖP", "SÄLJ", "AVVAKTA", "NEUTRAL"}:
+                    continue
+                # Signals are recorded for comparison only, never used as trade commands.
+                clean.append({"symbol": symbol, "direction": direction,
+                              "timestamp": str(row.get("timestamp", ""))[:80],
+                              "source": name})
+        return {**base, "status": "ok", "signals": clean,
+                "payload_signal_count": len(raw_signals) if isinstance(raw_signals, list) else 0,
+                "accepted_signal_count": len(clean), "checked_at": utc_now(),
+                "note": "Signaler visas endast för jämförelse. De påverkar inte köp/säljbeslut."}
+    except Exception as exc:
+        return {**base, "status": "error", "error": str(exc)[:180],
+                "checked_at": utc_now()}
+
+def collect_provider_status(force: bool = False) -> dict[str, Any]:
+    """Return honest status for optional providers. Read-only, never places orders."""
+    now = time.time()
+    if not force and _provider_cache.get("result") is not None and now - float(_provider_cache.get("at", 0)) < PROVIDER_CACHE_SECONDS:
+        result = dict(_provider_cache["result"])
+        result["cached"] = True
+        return result
+    providers = [_safe_provider_probe(item) for item in _provider_config()]
+    result = {"mode": "PAPER ONLY", "real_orders_enabled": False,
+              "influences_trades": False, "providers": providers,
+              "configured_count": sum(1 for p in providers if p["configured"]),
+              "ready_count": sum(1 for p in providers if p["status"] == "ok"),
+              "updated_at": utc_now(), "cached": False,
+              "note": "Externa signaler loggas för jämförelse. Ingen extern signal får skapa order eller ändra saldo."}
+    _provider_cache.update({"at": now, "result": result})
+    return result
