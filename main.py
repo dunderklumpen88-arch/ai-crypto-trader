@@ -10,11 +10,12 @@ from typing import Any
 
 import requests
 from worker import analyze_advanced
+from trader_intelligence import collect_market_signals, market_filter_for_symbol
 from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "17.0.0-trend-hold-dynamic-exit"
+APP_VERSION = "18.0.0-market-filter-paper"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -833,10 +834,23 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
 def make_signals() -> list[dict[str, Any]]:
     prices = get_prices(force=True)
     out = []
+    # Independent BTC/ETH market context is a risk filter, not a buy-signal generator.
+    # If the external feed fails, local strategy continues but records the unavailable state.
+    try:
+        market_context = collect_market_signals()
+    except Exception as exc:
+        market_context = {"ok": False, "signals": [], "error": str(exc)[:160]}
     for s in SYMBOLS:
         if s in prices and num(prices[s]) > 0:
             try:
                 signal = analyze_symbol(s, prices[s])
+                external_filter = market_filter_for_symbol(s, market_context)
+                signal["external_market_filter"] = external_filter
+                # Do not manufacture BUYs from external data. A broad bearish BTC/ETH
+                # backdrop can veto a local BUY; it never forces a sell of an open position.
+                if signal.get("signal") == "KÖP" and external_filter.get("veto_buy"):
+                    signal["signal"] = "AVVAKTA"
+                    signal["reason"] = str(signal.get("reason", "")) + "; extern BTC/ETH-trendfilter stoppar köp i svag marknad"
                 diag = analysis_diagnostics.get(s, {})
                 signal["data_diagnostics"] = dict(diag)
                 out.append(signal)
@@ -1692,14 +1706,21 @@ def backtest(symbol: str = Query(default="BTC"), slippage_bps: float = Query(def
 
 @app.get("/api/trader-intelligence/status")
 def trader_intelligence_status():
-    """Read-only status: no public-trader data is used unless verified and normalized."""
-    enabled = os.getenv("TRADER_INTEL_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
-    return {"enabled": enabled, "mode": MODE, "real_orders_enabled": False,
-            "status": "disabled_safe_default" if not enabled else "adapter_required",
-            "influences_trades": False,
-            "message": "Ingen offentlig traderdata används. Den lokala analysmotorn kombinerar tekniska indikatorer; externa AI-signaler kräver separat verifierad integration."}
-
-
+    """Read-only status for independent BTC/ETH trend filter; never places real orders."""
+    try:
+        market = collect_market_signals()
+    except Exception as exc:
+        market = {"ok": False, "signals": [], "error": str(exc)[:200]}
+    directions = [str(item.get("direction", "NEUTRAL")).upper() for item in market.get("signals", [])
+                  if item.get("status") == "ok"]
+    bearish = len(directions) >= 2 and all(d == "DOWN" for d in directions)
+    bullish = len(directions) >= 2 and all(d == "UP" for d in directions)
+    return {"enabled": True, "mode": MODE, "real_orders_enabled": False,
+            "status": "ok" if market.get("ok") else "market_data_unavailable",
+            "influences_trades": True, "influence_type": "bearish_market_buy_veto_only",
+            "market_regime": "BEARISH" if bearish else "BULLISH" if bullish else "MIXED_OR_UNKNOWN",
+            "signals": market.get("signals", []), "updated_at": market.get("updated_at"),
+            "message": "Extern BTC/ETH-data kan stoppa nya köp vid samstämmig nedtrend. Den skapar aldrig köp eller säljer befintliga positioner."}
 @app.post("/api/safety/disable-real-orders", dependencies=[Depends(require_admin_token)])
 def disable_real_orders():
     with lock: state["real_orders_enabled"]=False; persist()
