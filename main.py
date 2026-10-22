@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "19.0.0-external-provider-paper"
+APP_VERSION = "19.1.0-adaptive-entry-guard-paper"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -1114,6 +1114,52 @@ def rebuild_tax_ledger_from_trades() -> dict[str, Any]:
                 "method": "AVERAGE_COST", "source": "recorded PAPER trades only"}
 
 
+def adaptive_buy_block_reason(sig: dict[str, Any]) -> str | None:
+    """PAPER-only entry quality guard; never generates a buy signal."""
+    symbol = str(sig.get("symbol", "")).upper()
+    indicators = sig.get("indicators", {}) if isinstance(sig.get("indicators"), dict) else {}
+    advanced = indicators.get("advanced", {}) if isinstance(indicators.get("advanced"), dict) else {}
+
+    # With a 0.5% fee per side, the approximate round-trip fee is 1% before slippage.
+    # Require a small additional buffer; the short-horizon volatility estimate is not
+    # a profit forecast, only a reason to avoid entries with too little expected movement.
+    fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
+    round_trip_fee_pct = fee_rate * 200.0
+    min_expected_move_pct = round_trip_fee_pct + 0.25
+    expected_move_15m_pct = num(advanced.get("expected_move_3bars_pct"), -1.0)
+    if expected_move_15m_pct < 0:
+        return "cost_edge_filter: volatilitetsskattning saknas"
+    # Approximate a 1-hour volatility horizon from the engine's 15-minute estimate.
+    # This is a rough volatility scaling, not a prediction of direction or profit.
+    expected_move_pct = expected_move_15m_pct * 2.0
+    if expected_move_pct < min_expected_move_pct:
+        return (f"cost_edge_filter: uppskattad 1h-rörelse {expected_move_pct:.2f}% "
+                f"under avgiftskrav + buffert {min_expected_move_pct:.2f}%")
+
+    # Pause re-entry in a coin after a recent losing streak of automatic PAPER exits.
+    # This is a guardrail only; previous outcomes do not predict future returns.
+    recent_sells = [
+        trade for trade in reversed(state.get("trades", []))
+        if isinstance(trade, dict)
+        and trade.get("side") == "sell"
+        and trade.get("automatic")
+        and str(trade.get("symbol", "")).upper() == symbol
+    ][:3]
+    if len(recent_sells) >= 3:
+        pnl_values = [num(trade.get("realized_pnl_sek")) for trade in recent_sells]
+        try:
+            last_exit = datetime.fromisoformat(str(recent_sells[0].get("time", "")).replace("Z", "+00:00"))
+            if last_exit.tzinfo is None:
+                last_exit = last_exit.replace(tzinfo=timezone.utc)
+            hours_since_exit = (datetime.now(timezone.utc) - last_exit).total_seconds() / 3600.0
+        except (TypeError, ValueError):
+            hours_since_exit = 999.0
+        if sum(pnl_values) < 0 and sum(1 for pnl in pnl_values if pnl < 0) >= 2 and 0 <= hours_since_exit < 6:
+            return (f"loss_streak_cooldown: senaste 3 automatiska exits {sum(pnl_values):.2f} SEK; "
+                    f"paus {6.0-hours_since_exit:.1f} timmar")
+    return None
+
+
 def auto_loop():
     log.info("PAPER worker started; real orders disabled")
     auto_runtime["worker_alive"] = True
@@ -1187,15 +1233,25 @@ def auto_loop():
                                 if exc.status_code not in (409,):
                                     raise
                     news_guard = news_blackout_status()
-                    buy_candidates = [] if news_guard.get("active") else [sig for sig in signals
+                    raw_buy_candidates = [] if news_guard.get("active") else [sig for sig in signals
                         if sig["symbol"] not in exited_this_cycle and sig["signal"] == "KÖP"
                         and sig["confidence"] >= MIN_CONFIDENCE
                         and num(state.get("holdings", {}).get(sig["symbol"], {}).get("quantity")) <= 1e-12]
+                    buy_candidates = []
+                    adaptive_blocks = []
+                    for candidate in raw_buy_candidates:
+                        block_reason = adaptive_buy_block_reason(candidate)
+                        if block_reason:
+                            adaptive_blocks.append({"symbol": candidate.get("symbol"), "reason": block_reason})
+                        else:
+                            buy_candidates.append(candidate)
                     buy_candidates.sort(key=lambda sig: (num(sig.get("score")), num(sig.get("confidence")),
                         num(sig.get("indicators", {}).get("momentum_pct")),
                         num(sig.get("indicators", {}).get("volume_ratio"))), reverse=True)
                     auto_runtime.update(last_signal_count=len(signals),
                                         last_buy_candidate_count=len(buy_candidates),
+                                        adaptive_block_count=len(adaptive_blocks),
+                                        adaptive_blocks=adaptive_blocks[:20],
                                         last_news_guard={k: news_guard.get(k) for k in ("active", "reason", "checked_at")})
                     available = max(0.0, num(state.get("balance_sek")))
                     if buy_candidates and not state.get("risk_halt") and not news_guard.get("active"):
