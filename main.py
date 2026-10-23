@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "19.1.0-adaptive-entry-guard-paper"
+APP_VERSION = "21.0.0-closed-candle-regime-guard-paper"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -65,7 +65,7 @@ NEWS_HIGH_IMPACT_TERMS = (
 )
 NEWS_CACHE: dict[str, Any] = {"checked_at": 0.0, "active": False, "reason": "not_checked", "events": [], "source_errors": {}, "sources_ok": []}
 NEWS_LOCK = threading.Lock()
-AUTO_INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
+# Candles are 5 minutes; scan at least once per completed candle so repeated-cycle\n# confirmations are less likely to count the same candle twice.\nAUTO_INTERVAL_SECONDS = max(300, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
 # Safety: always start with automation disabled; enable manually from the dashboard.
 AUTO_PAPER_ON_START = False
 HTTP_TIMEOUT = 10
@@ -825,8 +825,10 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                 "volume_ratio": round(vol_ratio, 3), "samples": samples,
                 "multi_timeframe": {"15m_trend": trend_15m, "1h_trend": trend_1h,
                     "15m_samples": len(closes_15m), "1h_samples": len(closes_1h)},
-                "advanced": adv, "buy_gates": buy_gates, "sell_gates": sell_gates,
-                "decision_model": "quality_entry_v2_dynamic_hold",
+                "advanced": {**adv, "score_adjustment": num(advanced.get("score_adjustment"), 0.0),
+                             "reasons": advanced.get("reasons", [])},
+                "buy_gates": buy_gates, "sell_gates": sell_gates,
+                "decision_model": "quality_entry_v3_advanced_regime_confirmation",
                 "candle_interval_minutes": 5, "data_quality": data_quality},
             "reason": "; ".join(reasons), "not_financial_advice": True}
 
@@ -1120,20 +1122,45 @@ def adaptive_buy_block_reason(sig: dict[str, Any]) -> str | None:
     indicators = sig.get("indicators", {}) if isinstance(sig.get("indicators"), dict) else {}
     advanced = indicators.get("advanced", {}) if isinstance(indicators.get("advanced"), dict) else {}
 
-    # With a 0.5% fee per side, the approximate round-trip fee is 1% before slippage.
-    # Require a small additional buffer; the short-horizon volatility estimate is not
-    # a profit forecast, only a reason to avoid entries with too little expected movement.
+    # V20: the advanced engine must independently confirm the local entry signal.
+    # This is deliberately a filter, not a claim that the score predicts profit.
+    regime = str(advanced.get("market_regime", "UNKNOWN")).upper()
+    adv_score = num(advanced.get("score_adjustment"), 0.0)
+    if regime != "TREND_UP":
+        return f"regime_filter: marknadsregim {regime}; strategin köper bara bekräftad upptrend"
+    if adv_score < 1:
+        return f"advanced_confirmation_filter: extra bekräftelse {adv_score:.0f} under +1"
+
+    # Do not enter against a confirmed higher-timeframe decline, even if the
+    # shorter chart briefly rebounds. Missing timeframe values are not treated
+    # as bearish; the primary model still applies its own data-quality gates.
+    trend_15m = str(advanced.get("trend_15m", "NEUTRAL")).upper()
+    trend_1h = str(advanced.get("trend_1h", "NEUTRAL")).upper()
+    if trend_15m == "DOWN":
+        return "timeframe_guard: 15m-trenden pekar nedåt"
+    if trend_1h == "DOWN":
+        return "timeframe_guard: 1h-trenden pekar nedåt"
+
+    # Avoid entering during extreme volatility or an exceptional volume spike,
+    # where short-horizon signals are particularly noisy.
+    atr_pct = max(0.0, num(advanced.get("atr_pct"), 0.0))
+    relative_volume = max(0.0, num(advanced.get("relative_volume"), 0.0))
+    if atr_pct >= 4.5:
+        return f"volatility_guard: ATR {atr_pct:.2f}% är för hög för denna strategi"
+    if relative_volume >= 4.0:
+        return f"volume_spike_guard: relativ volym {relative_volume:.2f}x; vänta på stabilisering"
+
+    # Require estimated movement to clear simulated round-trip fees plus a buffer.
+    # ATR is a volatility proxy, not a directional forecast; it is only one of several gates.
     fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
     round_trip_fee_pct = fee_rate * 200.0
-    min_expected_move_pct = round_trip_fee_pct + 0.25
+    min_expected_move_pct = round_trip_fee_pct + 0.30
     expected_move_15m_pct = num(advanced.get("expected_move_3bars_pct"), -1.0)
     if expected_move_15m_pct < 0:
         return "cost_edge_filter: volatilitetsskattning saknas"
-    # Approximate a 1-hour volatility horizon from the engine's 15-minute estimate.
-    # This is a rough volatility scaling, not a prediction of direction or profit.
     expected_move_pct = expected_move_15m_pct * 2.0
     if expected_move_pct < min_expected_move_pct:
-        return (f"cost_edge_filter: uppskattad 1h-rörelse {expected_move_pct:.2f}% "
+        return (f"cost_edge_filter: volatilitetsskattning {expected_move_pct:.2f}% "
                 f"under avgiftskrav + buffert {min_expected_move_pct:.2f}%")
 
     # Pause re-entry in a coin after a recent losing streak of automatic PAPER exits.
@@ -1245,7 +1272,11 @@ def auto_loop():
                             adaptive_blocks.append({"symbol": candidate.get("symbol"), "reason": block_reason})
                         else:
                             buy_candidates.append(candidate)
-                    buy_candidates.sort(key=lambda sig: (num(sig.get("score")), num(sig.get("confidence")),
+                    # Rank by the local signal plus independent advanced confirmation;
+                    # keep confidence heuristic and never interpret it as win probability.
+                    buy_candidates.sort(key=lambda sig: (
+                        num(sig.get("indicators", {}).get("advanced", {}).get("score_adjustment")),
+                        num(sig.get("score")), num(sig.get("confidence")),
                         num(sig.get("indicators", {}).get("momentum_pct")),
                         num(sig.get("indicators", {}).get("volume_ratio"))), reverse=True)
                     auto_runtime.update(last_signal_count=len(signals),
@@ -1338,7 +1369,7 @@ def root_head():
 
 @app.get("/api/health")
 def health():
-    return {"status":"online","version":APP_VERSION,"mode":MODE,"real_orders_enabled":False,
+    return {"status":"online","version":APP_VERSION,"strategy_model":"quality_entry_v4_closed_candle_regime_guard","mode":MODE,"real_orders_enabled":False,
             "auto_enabled":bool(state["auto_enabled"]),"state_file":STATE_FILE,
             "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,
             "duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
@@ -1390,7 +1421,7 @@ def signals():
     signals = make_signals()
     returned = {item.get("symbol") for item in signals}
     return {"signals":signals,"updated_at":now_iso(),"mode":MODE,
-            "strategy":"14.0: closed 5m candles, 15m/1h trend confirmation, EMA slope, MACD, RSI, momentum, prior-candle volume baseline, ranked candidates + net-fee exits",
+            "strategy":"21.0: closed 5m candles, scan interval aligned to candle cadence, multi-timeframe regime and volatility guards, fee-aware entries, adaptive trailing exits, PAPER only",
             "symbols_configured":SYMBOLS,
             "symbols_returned":sorted(returned),
             "symbols_missing":sorted(set(SYMBOLS) - returned),
@@ -1755,7 +1786,7 @@ def backtest(symbol: str = Query(default="BTC"), slippage_bps: float = Query(def
     return {"mode": "PAPER_ONLY_HISTORICAL_SIMULATION", "symbol": symbol,
             "timeframe_minutes": 5, "candles": len(candles), "slippage_bps_each_side": slippage_bps,
             "fee_rate_each_side": clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02),
-            "strategy": "EMA200 + EMA9/21/50 trend + rising stochastic + volume filter + ATR-aware stop distance",
+            "strategy": "EMA200 + EMA9/21/50 trend + rising stochastic + multi-timeframe/volatility guards + ATR-aware stop distance",
             "results": result,
             "warning": "In-sample simulation of the available recent candles only; not a full-market backtest, not out-of-sample validation, and no guarantee of future profit."}
 
