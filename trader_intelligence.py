@@ -39,17 +39,35 @@ def _one_product(product: str) -> dict[str, Any]:
             if close > 0 and ts + 300 <= now: candles.append((ts, close))
         except (TypeError, ValueError, AttributeError): pass
     candles=sorted(set(candles))
+    candles=sorted(candles)
     closes=[x[1] for x in candles]
     if len(closes) < 55:
         return {"product":product,"status":"insufficient_data","samples":len(closes)}
     e9=_ema(closes[-50:],9); e21=_ema(closes[-50:],21); e50=_ema(closes[-55:],50)
-    # Require EMA ordering and price confirmation, not a single crossing.
-    if e9 > e21 > e50 and closes[-1] > e21: direction="UP"
-    elif e9 < e21 < e50 and closes[-1] < e21: direction="DOWN"
+    # Build wall-clock-aligned 15m closes from three complete, consecutive 5m bars.
+    buckets={}
+    for ts, close in candles:
+        buckets.setdefault(ts // 900, []).append((ts, close))
+    closes_15m=[]
+    for bucket in sorted(buckets):
+        group=sorted(buckets[bucket])
+        if len(group)==3 and group[1][0]-group[0][0]==300 and group[2][0]-group[1][0]==300:
+            closes_15m.append(group[-1][1])
+    if len(closes_15m) >= 25:
+        e9_15=_ema(closes_15m[-50:],9); e21_15=_ema(closes_15m[-50:],21)
+        if e9_15[-1] > e21_15[-1]: direction_15m="UP"
+        elif e9_15[-1] < e21_15[-1]: direction_15m="DOWN"
+        else: direction_15m="NEUTRAL"
+    else:
+        direction_15m="NEUTRAL"
+    # Require EMA ordering, price confirmation and matching 15m direction.
+    if e9 > e21 > e50 and closes[-1] > e21 and direction_15m == "UP": direction="UP"
+    elif e9 < e21 < e50 and closes[-1] < e21 and direction_15m == "DOWN": direction="DOWN"
     else: direction="NEUTRAL"
-    return {"product":product,"status":"ok","direction":direction,"price":closes[-1],
-            "ema9":round(e9,8),"ema21":round(e21,8),"ema50":round(e50,8),
-            "samples":len(closes),"source":"Coinbase public closed 5-minute candles"}
+    return {"product":product,"status":"ok","direction":direction,"direction_15m":direction_15m,
+            "price":closes[-1],"ema9":round(e9,8),"ema21":round(e21,8),"ema50":round(e50,8),
+            "samples":len(closes),"samples_15m":len(closes_15m),
+            "source":"Coinbase public closed 5-minute candles with 15-minute confirmation"}
 
 def collect_market_signals(force: bool=False) -> dict[str, Any]:
     now=time.time()
@@ -66,7 +84,7 @@ def collect_market_signals(force: bool=False) -> dict[str, Any]:
     result={"ok":bool(valid),"signals":signals,"market_regime":"BEARISH" if bearish else "BULLISH" if bullish else "MIXED_OR_UNKNOWN",
             "veto_new_buys":bearish,"source":"Coinbase public market data","updated_at":utc_now(),
             "cache_seconds":CACHE_SECONDS,"influences_trades":True,
-            "note":"Endast samstämmig BTC- och ETH-nedtrend stoppar nya köp. Extern data skapar aldrig order."}
+            "note":"Endast samstämmig BTC/ETH-nedtrend bekräftad på 5m och 15m stoppar nya köp. Extern data skapar aldrig order."}
     _cache.update({"at":now,"result":result})
     return {**result,"cached":False}
 
@@ -76,7 +94,7 @@ def market_filter_for_symbol(symbol: str, context: dict[str, Any] | None) -> dic
     bearish=len(valid)>=2 and all(str(x.get("direction")).upper()=="DOWN" for x in valid[:2])
     return {"source":"Coinbase BTC/ETH benchmark","market_regime":context.get("market_regime","MIXED_OR_UNKNOWN"),
             "veto_buy":bool(bearish),"status":"ok" if valid else "unavailable",
-            "reason":"BTC och ETH visar båda nedtrend; nya köp filtreras bort." if bearish else
+            "reason":"BTC och ETH visar båda nedtrend med 15m-bekräftelse; nya köp filtreras bort." if bearish else
                      "Ingen samstämmig BTC/ETH-nedtrend bekräftad; lokala signalregler gäller." if valid else
                      "Extern marknadsdata otillgänglig; lokala signalregler används.",
             "benchmarks":[{"product":x.get("product"),"direction":x.get("direction"),"status":x.get("status")} for x in signals]}
