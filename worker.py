@@ -11,6 +11,15 @@ def _valid_candles(candles: list[dict[str, Any]] | None) -> list[dict[str, float
     for c in candles or []:
         try:
             row = {k: float(c[k]) for k in ("open", "high", "low", "close", "volume")}
+            # Keep Coinbase candle start time when available so higher-timeframe
+            # bars can be aligned to actual 15m/1h boundaries, not arbitrary list offsets.
+            try:
+                if c.get("time") is not None:
+                    row["time"] = float(c["time"])
+                elif c.get("start") is not None:
+                    row["time"] = float(c["start"])
+            except (TypeError, ValueError, OverflowError):
+                pass
             if not all(isfinite(v) for v in row.values()):
                 continue
             if min(row["open"], row["high"], row["low"], row["close"]) <= 0:
@@ -91,22 +100,48 @@ def _adx_proxy(rows: list[dict[str, float]], period: int = 14) -> float:
 
 
 def _aggregate(rows: list[dict[str, float]], n: int) -> list[dict[str, float]]:
-    """Aggregate sequential completed 5m bars into n-bar candles, ignoring partial groups."""
+    """Aggregate completed 5m bars into wall-clock-aligned n-bar candles. If timestamps are missing, fall back to sequential grouping for backwards compatibility. Timestamped groups are emitted only when all n 5m bars are present and consecutive, preventing partial or gapped groups from distorting 15m/1h confirmation. """
     if n <= 1:
         return rows[:]
+    interval = 300
+    if rows and all("time" in row for row in rows):
+        buckets: dict[int, list[dict[str, float]]] = {}
+        for row in rows:
+            ts = int(row["time"])
+            bucket = ts // (interval * n)
+            buckets.setdefault(bucket, []).append(row)
+        out = []
+        for bucket in sorted(buckets):
+            chunk = sorted(buckets[bucket], key=lambda x: x["time"])
+            if len(chunk) != n:
+                continue
+            times = [int(x["time"]) for x in chunk]
+            if any(times[i] - times[i - 1] != interval for i in range(1, len(times))):
+                continue
+            if times[0] // (interval * n) != times[-1] // (interval * n):
+                continue
+            out.append({
+                "time": float(times[0]),
+                "open": chunk[0]["open"],
+                "high": max(x["high"] for x in chunk),
+                "low": min(x["low"] for x in chunk),
+                "close": chunk[-1]["close"],
+                "volume": sum(x["volume"] for x in chunk),
+            })
+        return out
+
     usable = len(rows) - (len(rows) % n)
     out = []
     for start in range(0, usable, n):
         chunk = rows[start:start + n]
-        if not chunk:
-            continue
-        out.append({
-            "open": chunk[0]["open"],
-            "high": max(x["high"] for x in chunk),
-            "low": min(x["low"] for x in chunk),
-            "close": chunk[-1]["close"],
-            "volume": sum(x["volume"] for x in chunk),
-        })
+        if chunk:
+            out.append({
+                "open": chunk[0]["open"],
+                "high": max(x["high"] for x in chunk),
+                "low": min(x["low"] for x in chunk),
+                "close": chunk[-1]["close"],
+                "volume": sum(x["volume"] for x in chunk),
+            })
     return out
 
 
@@ -138,7 +173,7 @@ def analyze_advanced( candles: list[dict[str, Any]], fx: float = 1.0, current_pr
         }
 
     # Convert all price fields to SEK before calculating indicators.
-    scaled = [{k: (v * fx if k != "volume" else v) for k, v in row.items()} for row in rows]
+    scaled = [{k: (v * fx if k not in ("volume", "time") else v) for k, v in row.items()} for row in rows]
     closes = [x["close"] for x in scaled]
     highs = [x["high"] for x in scaled]
     lows = [x["low"] for x in scaled]
