@@ -1518,6 +1518,9 @@ def paper_history(limit:int=Query(default=100,ge=1,le=1000)):
     return {"trades":state["trades"][-limit:],"count":len(state["trades"]),"mode":MODE}
 
 
+# Defensive definition for deployments where the configuration constant was omitted.
+AUTO_INTERVAL_SECONDS = max(300, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
+
 @app.get("/api/auto/status")
 def auto_status():
     return {"enabled":bool(state["auto_enabled"]),"mode":MODE,"real_orders_enabled":False,
