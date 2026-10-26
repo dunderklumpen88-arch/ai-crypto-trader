@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "22.0.0-cost-aware-regime-quality-paper"
+APP_VERSION = "22.0.1-auto-loop-interval-fix-paper"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -1195,7 +1195,15 @@ def adaptive_buy_block_reason(sig: dict[str, Any]) -> str | None:
 
 
 def auto_loop():
-    log.info("PAPER worker started; real orders disabled")
+    # Resolve the scan interval locally as well as at module scope. This makes
+    # the worker resilient if a deployment omits the global constant by mistake.
+    try:
+        interval_seconds = max(300, int(os.getenv(
+            "AUTO_INTERVAL_SECONDS", str(globals().get("AUTO_INTERVAL_SECONDS", 300))
+        )))
+    except (TypeError, ValueError):
+        interval_seconds = 300
+    log.info("PAPER worker started; real orders disabled; interval=%ss", interval_seconds)
     auto_runtime["worker_alive"] = True
     auto_runtime["cycle_status"] = "waiting"
     try:
@@ -1330,7 +1338,7 @@ def auto_loop():
                 auto_runtime["last_cycle_seconds"] = round(time.monotonic() - cycle_started, 3)
             # Recheck every configured interval (default 3 minutes); market indicators still
             # use completed 5-minute candles to avoid reacting to unfinished candles.
-            wait_seconds = max(1.0, AUTO_INTERVAL_SECONDS - (time.monotonic() - cycle_started))
+            wait_seconds = max(1.0, interval_seconds - (time.monotonic() - cycle_started))
             auto_wake_event.wait(timeout=wait_seconds)
     finally:
         auto_runtime["worker_alive"] = False
