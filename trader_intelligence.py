@@ -14,7 +14,7 @@ def utc_now() -> str:
 def _fetch_json(url: str) -> Any:
     if not url.startswith("https://api.coinbase.com/"):
         raise ValueError("Endast Coinbases publika HTTPS-marknadsdata tillåts.")
-    req = urllib.request.Request(url, headers={"Accept":"application/json", "User-Agent":"AI-Crypto-Trader-PAPER/3.0"})
+    req = urllib.request.Request(url, headers={"Accept":"application/json", "User-Agent":"AI-Crypto-Trader-PAPER/22.0"})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
         if response.status != 200: raise RuntimeError(f"Coinbase HTTP {response.status}")
         raw = response.read(1_000_001)
