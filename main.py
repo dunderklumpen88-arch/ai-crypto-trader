@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "21.0.0-closed-candle-regime-guard-paper"
+APP_VERSION = "22.0.0-cost-aware-regime-quality-paper"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -44,7 +44,7 @@ STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.5"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "4.5"))
 TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "2.5"))
 TRAILING_DRAWDOWN_PCT = float(os.getenv("TRAILING_DRAWDOWN_PCT", "2.0"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "60"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "65"))
 RISK_PER_TRADE_PCT = min(2.0, max(0.1, float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))))
 BACKTEST_SLIPPAGE_BPS = max(0.0, float(os.getenv("BACKTEST_SLIPPAGE_BPS", "10")))
 NEWS_BLACKOUT_MINUTES = max(0, int(os.getenv("NEWS_BLACKOUT_MINUTES", "15")))
@@ -828,7 +828,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                 "advanced": {**adv, "score_adjustment": num(advanced.get("score_adjustment"), 0.0),
                              "reasons": advanced.get("reasons", [])},
                 "buy_gates": buy_gates, "sell_gates": sell_gates,
-                "decision_model": "quality_entry_v3_advanced_regime_confirmation",
+                "decision_model": "quality_entry_v4_cost_aware_regime_efficiency",
                 "candle_interval_minutes": 5, "data_quality": data_quality},
             "reason": "; ".join(reasons), "not_financial_advice": True}
 
@@ -1127,19 +1127,25 @@ def adaptive_buy_block_reason(sig: dict[str, Any]) -> str | None:
     regime = str(advanced.get("market_regime", "UNKNOWN")).upper()
     adv_score = num(advanced.get("score_adjustment"), 0.0)
     if regime != "TREND_UP":
-        return f"regime_filter: marknadsregim {regime}; strategin köper bara bekräftad upptrend"
-    if adv_score < 1:
-        return f"advanced_confirmation_filter: extra bekräftelse {adv_score:.0f} under +1"
+        return f"regime_filter: marknadsregim {regime}; köp endast i bekräftad upptrend"
+    if adv_score < 2:
+        return f"advanced_confirmation_filter: extra bekräftelse {adv_score:.0f} under +2"
 
-    # Do not enter against a confirmed higher-timeframe decline, even if the
-    # shorter chart briefly rebounds. Missing timeframe values are not treated
-    # as bearish; the primary model still applies its own data-quality gates.
+    # Require a positive 15m trend, not merely the absence of a bearish trend.
+    # The 1h trend may be neutral, but must not be down. This reduces counter-trend
+    # entries while avoiding a hard requirement for a very slow 1h crossover.
     trend_15m = str(advanced.get("trend_15m", "NEUTRAL")).upper()
     trend_1h = str(advanced.get("trend_1h", "NEUTRAL")).upper()
-    if trend_15m == "DOWN":
-        return "timeframe_guard: 15m-trenden pekar nedåt"
+    if trend_15m != "UP":
+        return "timeframe_guard: 15m-trenden är inte bekräftat uppåt"
     if trend_1h == "DOWN":
         return "timeframe_guard: 1h-trenden pekar nedåt"
+    directional_strength = max(0.0, num(advanced.get("directional_strength"), 0.0))
+    if directional_strength < 25.0:
+        return f"directional_quality_guard: riktad styrka {directional_strength:.1f} under 25"
+    efficiency = max(0.0, min(1.0, num(advanced.get("trend_efficiency_ratio"), 0.0)))
+    if efficiency < 0.18:
+        return f"chop_filter: marknaden är ryckig (effektivitet {efficiency:.2f})"
 
     # Avoid entering during extreme volatility or an exceptional volume spike,
     # where short-horizon signals are particularly noisy.
@@ -1150,18 +1156,19 @@ def adaptive_buy_block_reason(sig: dict[str, Any]) -> str | None:
     if relative_volume >= 4.0:
         return f"volume_spike_guard: relativ volym {relative_volume:.2f}x; vänta på stabilisering"
 
-    # Require estimated movement to clear simulated round-trip fees plus a buffer.
-    # ATR is a volatility proxy, not a directional forecast; it is only one of several gates.
+    # Cost hurdle: round-trip fees plus a slippage/uncertainty buffer. ATR is only
+    # a measure of available movement, NOT a directional profit prediction; do not
+    # multiply it to manufacture a larger edge. The directional filters above must
+    # independently confirm the trend.
     fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
     round_trip_fee_pct = fee_rate * 200.0
-    min_expected_move_pct = round_trip_fee_pct + 0.30
-    expected_move_15m_pct = num(advanced.get("expected_move_3bars_pct"), -1.0)
-    if expected_move_15m_pct < 0:
+    min_move_room_pct = round_trip_fee_pct + 0.60
+    move_room_pct = num(advanced.get("expected_move_3bars_pct"), -1.0)
+    if move_room_pct < 0:
         return "cost_edge_filter: volatilitetsskattning saknas"
-    expected_move_pct = expected_move_15m_pct * 2.0
-    if expected_move_pct < min_expected_move_pct:
-        return (f"cost_edge_filter: volatilitetsskattning {expected_move_pct:.2f}% "
-                f"under avgiftskrav + buffert {min_expected_move_pct:.2f}%")
+    if move_room_pct < min_move_room_pct:
+        return (f"cost_edge_filter: rörelseutrymme {move_room_pct:.2f}% "
+                f"under avgifter + säkerhetsmarginal {min_move_room_pct:.2f}%")
 
     # Pause re-entry in a coin after a recent losing streak of automatic PAPER exits.
     # This is a guardrail only; previous outcomes do not predict future returns.
@@ -1517,9 +1524,6 @@ def create_paper_order(payload:OrderRequest):
 def paper_history(limit:int=Query(default=100,ge=1,le=1000)):
     return {"trades":state["trades"][-limit:],"count":len(state["trades"]),"mode":MODE}
 
-
-# Defensive definition for deployments where the configuration constant was omitted.
-AUTO_INTERVAL_SECONDS = max(300, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
 
 @app.get("/api/auto/status")
 def auto_status():
