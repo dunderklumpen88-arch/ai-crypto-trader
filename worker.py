@@ -295,6 +295,8 @@ def analyze_advanced( candles: list[dict[str, Any]], fx: float = 1.0, current_pr
     path = sum(abs(x) for x in changes)
     efficiency = abs(sum(changes)) / path if path > 1e-15 else 0.0
     directional_strength = min(100.0, 0.55 * adx + 45.0 * efficiency)
+    # Efficiency ratio: near 1 means movement is directional; near 0 means chop.
+    trend_efficiency_ratio = max(0.0, min(1.0, efficiency))
 
     return {
         "score_adjustment": max(-3, min(3, score)),
@@ -323,6 +325,7 @@ def analyze_advanced( candles: list[dict[str, Any]], fx: float = 1.0, current_pr
             "atr_sek": round(atr_abs, 8),
             "adx_proxy": round(adx, 3),
             "directional_strength": round(directional_strength, 3),
+            "trend_efficiency_ratio": round(trend_efficiency_ratio, 5),
             "relative_volume": round(relative_volume, 4),
             "volume_ratio_20": round(relative_volume, 4),  # backward-compatible key
             "expected_move_3bars_pct": round(expected_move_3bars_pct, 5),
