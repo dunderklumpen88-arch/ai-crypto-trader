@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "22.0.1-auto-loop-interval-fix-paper"
+APP_VERSION = "22.0.2-auto-interval-status-guard-paper"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -1536,7 +1536,7 @@ def paper_history(limit:int=Query(default=100,ge=1,le=1000)):
 @app.get("/api/auto/status")
 def auto_status():
     return {"enabled":bool(state["auto_enabled"]),"mode":MODE,"real_orders_enabled":False,
-            "interval_seconds":AUTO_INTERVAL_SECONDS,"max_position_sek":MAX_POSITION_SEK,
+            "interval_seconds":int(globals().get("AUTO_INTERVAL_SECONDS", 300)),"max_position_sek":MAX_POSITION_SEK,
             "duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,
             "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_daily_trades":None,"daily_trade_limit":"unlimited","max_daily_loss_sek":MAX_DAILY_LOSS_SEK,
             "max_total_loss_sek":MAX_TOTAL_LOSS_SEK,"risk_halt":bool(state.get("risk_halt")),
