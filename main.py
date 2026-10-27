@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "22.1.0-balanced-entry-paper"
+APP_VERSION = "22.2.0-balanced-entry-diagnostics-paper"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -114,6 +114,7 @@ auto_wake_event = threading.Event()
 auto_runtime: dict[str, Any] = {
     "last_attempt": None, "last_success": None, "last_cycle_seconds": None,
     "last_signal_count": 0, "last_buy_candidate_count": 0,
+    "last_raw_buy_signal_count": 0, "last_blocked_buy_candidates": [],
     "last_news_guard": None, "worker_alive": False, "cycle_status": "starting"
 }
 db_info = {"configured": bool(DATABASE_URL), "available": False, "error": None, "backend": "local_json_file"}
@@ -745,10 +746,15 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     trend_ok = long_trend_up or (trend_up and last_close > e50[-1]) or early_reversal
     not_overextended = price_above_ema21_pct <= 2.0
     volatility_ok = volatility <= 2.0
+    # Controlled timeframe check: a strong local recovery may proceed when one
+    # timeframe is neutral, but never when both 15m and 1h are explicitly bearish.
     timeframe_ok = (
         (trend_15m != "DOWN" and trend_1h != "DOWN")
-        or (long_trend_up and histogram_cross_up and momentum >= 0.08)
-        or (trend_15m != "DOWN" and histogram_up and histogram_rising and momentum >= 0.08)
+        or (long_trend_up and histogram_cross_up and momentum >= 0.05)
+        or (trend_15m != "DOWN" and histogram_up and histogram_rising and momentum >= 0.05)
+    )
+    recovery_timeframe_ok = not (trend_15m == "DOWN" and trend_1h == "DOWN") and (
+        trend_15m == "UP" or trend_1h == "UP" or long_trend_up
     )
     # Two entry paths: trend continuation after momentum confirmation, or a
     # pullback/recovery in an established long trend. Avoid buying a late spike.
@@ -757,6 +763,16 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         and momentum >= -0.02 and 40 <= rsi_v <= 72 and volume_ok
         and not_overextended and 1 <= stoch_now <= 92 and volatility_ok
         and timeframe_ok
+    )
+    # Additional early-recovery route. It still requires an upward EMA structure,
+    # positive MACD histogram, usable volume and at least one non-bearish higher
+    # timeframe; it does not buy a coin when both 15m and 1h are falling.
+    early_recovery_setup = (
+        trend_ok and e9[-1] > e21[-1] and histogram_up
+        and (histogram_rising or histogram_cross_up)
+        and momentum >= -0.08 and 38 <= rsi_v <= 74 and vol_ratio >= 0.20
+        and not_overextended and stoch_now <= 94 and volatility <= 2.2
+        and recovery_timeframe_ok
     )
     pullback_recovery_setup = (
         long_trend_up and e9[-1] > e21[-1] and stoch_trigger
@@ -768,16 +784,16 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
         "tillräcklig historik": samples >= 120,
         "trend eller tidig trendvändning": trend_ok,
         "EMA9 över EMA21": e9[-1] > e21[-1],
-        "MACD positivt och förbättras": histogram_up and histogram_rising,
+        "MACD positivt och förbättras eller korsar upp": histogram_up and (histogram_rising or histogram_cross_up),
         "momentum inte tydligt negativt": momentum >= -0.02,
         "RSI inom kvalitetsintervall": 38 <= rsi_v <= 72,
         "volym tillräcklig": volume_ok,
         "inte översträckt över EMA21": not_overextended,
         "stochastic inte extremt överköpt": stoch_now <= 92,
         "volatilitet rimlig": volatility_ok,
-        "15m/1h-trend bekräftar eller stark vändning": timeframe_ok,
+        "15m/1h-trend bekräftar eller återhämtning": timeframe_ok or recovery_timeframe_ok,
     }
-    buy_ok = continuation_setup or pullback_recovery_setup
+    buy_ok = continuation_setup or pullback_recovery_setup or early_recovery_setup
 
     # A sell signal is an exit warning based on a confirmed weakening trend.
     # Profit-taking is handled by a dynamic trailing exit, not a fixed take-profit.
@@ -799,7 +815,10 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                              momentum >= -0.02, 38 <= rsi_v <= 72, volume_ok, timeframe_ok])
         confidence = min(82, 62 + confirmations * 3)
         reasons.append("KÖP godkänd av kvalitetsmodell: trend + förbättrat momentum; ingen vinstgaranti")
-        reasons.append("Inträdesväg: trendfortsättning" if continuation_setup else "Inträdesväg: återhämtning i lång trend")
+        entry_path = ("trendfortsättning" if continuation_setup else
+                      "återhämtning i lång trend" if pullback_recovery_setup else
+                      "tidig återhämtning med bekräftad trendstruktur")
+        reasons.append(f"Inträdesväg: {entry_path}")
     elif sell_ok:
         signal = "SÄLJ"
         confirmations = sum(bool(v) for v in sell_gates.values())
@@ -829,7 +848,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                 "advanced": {**adv, "score_adjustment": num(advanced.get("score_adjustment"), 0.0),
                              "reasons": advanced.get("reasons", [])},
                 "buy_gates": buy_gates, "sell_gates": sell_gates,
-                "decision_model": "balanced_entry_v5_transition_cost_aware",
+                "decision_model": "balanced_entry_v6_recovery_diagnostics_cost_aware",
                 "candle_interval_minutes": 5, "data_quality": data_quality},
             "reason": "; ".join(reasons), "not_financial_advice": True}
 
@@ -1127,10 +1146,13 @@ def adaptive_buy_block_reason(sig: dict[str, Any]) -> str | None:
     # This is deliberately a filter, not a claim that the score predicts profit.
     regime = str(advanced.get("market_regime", "UNKNOWN")).upper()
     adv_score = num(advanced.get("score_adjustment"), 0.0)
-    if regime not in ("TREND_UP", "TRANSITION"):
-        return f"regime_filter: marknadsregim {regime}; ingen bekräftad uppåt-/övergångsregim"
-    if adv_score < (1.0 if regime == "TREND_UP" else 2.0):
-        return f"advanced_confirmation_filter: extra bekräftelse {adv_score:.0f} under gränsen för {regime}"
+    if regime not in ("TREND_UP", "TRANSITION", "RANGE"):
+        return f"regime_filter: marknadsregim {regime}; ingen godkänd marknadsregim"
+    # The local model has already emitted KÖP. Permit a modest independent score
+    # for trend/transition setups, while range-bound markets need stronger evidence.
+    required_adv_score = 0.0 if regime == "TREND_UP" else (1.0 if regime == "TRANSITION" else 1.5)
+    if adv_score < required_adv_score:
+        return f"advanced_confirmation_filter: extra bekräftelse {adv_score:.1f} under gränsen {required_adv_score:.1f} för {regime}"
 
     # Accept a neutral 15m trend when the local model has already identified a
     # setup; still reject an explicitly bearish 15m or 1h trend. This increases
@@ -1142,11 +1164,11 @@ def adaptive_buy_block_reason(sig: dict[str, Any]) -> str | None:
     if trend_1h == "DOWN":
         return "timeframe_guard: 1h-trenden pekar nedåt"
     directional_strength = max(0.0, num(advanced.get("directional_strength"), 0.0))
-    if directional_strength < 18.0:
-        return f"directional_quality_guard: riktad styrka {directional_strength:.1f} under 18"
+    if directional_strength < 14.0:
+        return f"directional_quality_guard: riktad styrka {directional_strength:.1f} under 14"
     efficiency = max(0.0, min(1.0, num(advanced.get("trend_efficiency_ratio"), 0.0)))
-    if efficiency < 0.12:
-        return f"chop_filter: marknaden är ryckig (effektivitet {efficiency:.2f})"
+    if efficiency < 0.08:
+        return f"chop_filter: marknaden är ryckig (effektivitet {efficiency:.2f}, min 0.08)"
 
     # Avoid entering during extreme volatility or an exceptional volume spike,
     # where short-horizon signals are particularly noisy.
@@ -1163,7 +1185,7 @@ def adaptive_buy_block_reason(sig: dict[str, Any]) -> str | None:
     # independently confirm the trend.
     fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
     round_trip_fee_pct = fee_rate * 200.0
-    min_move_room_pct = round_trip_fee_pct + 0.35
+    min_move_room_pct = round_trip_fee_pct + 0.10
     move_room_pct = num(advanced.get("expected_move_3bars_pct"), -1.0)
     if move_room_pct < 0:
         return "cost_edge_filter: volatilitetsskattning saknas"
@@ -1296,7 +1318,9 @@ def auto_loop():
                         num(sig.get("indicators", {}).get("momentum_pct")),
                         num(sig.get("indicators", {}).get("volume_ratio"))), reverse=True)
                     auto_runtime.update(last_signal_count=len(signals),
+                                        last_raw_buy_signal_count=len(raw_buy_candidates),
                                         last_buy_candidate_count=len(buy_candidates),
+                                        last_blocked_buy_candidates=adaptive_blocks[:20],
                                         adaptive_block_count=len(adaptive_blocks),
                                         adaptive_blocks=adaptive_blocks[:20],
                                         last_news_guard={k: news_guard.get(k) for k in ("active", "reason", "checked_at")})
@@ -1385,7 +1409,7 @@ def root_head():
 
 @app.get("/api/health")
 def health():
-    return {"status":"online","version":APP_VERSION,"strategy_model":"quality_entry_v4_closed_candle_regime_guard","mode":MODE,"real_orders_enabled":False,
+    return {"status":"online","version":APP_VERSION,"strategy_model":"balanced_entry_v6_recovery_diagnostics_cost_aware","mode":MODE,"real_orders_enabled":False,
             "auto_enabled":bool(state["auto_enabled"]),"state_file":STATE_FILE,
             "purchase_amount_cap":True,"max_trade_sek":MAX_TRADE_SEK,"max_position_sek":MAX_POSITION_SEK,
             "duplicate_buy_window_seconds":DUPLICATE_BUY_WINDOW_SECONDS,"max_total_loss_sek":MAX_TOTAL_LOSS_SEK,
