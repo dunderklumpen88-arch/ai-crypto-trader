@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import csv
+import io
 import logging
 import math
 import os
@@ -14,7 +16,8 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
 
 APP_VERSION = "24.0.0-dashboard-compat-paper"
 MODE = "PAPER ONLY"
@@ -439,8 +442,8 @@ def run_cycle() -> dict[str, Any]:
                 signals.append(analyze_market(symbol))
             except Exception as exc:
                 errors.append({"symbol": symbol, "error": str(exc)[:220]})
-        if not signals:
-            raise RuntimeError("Ingen marknadsdata kunde hämtas från Coinbase")
+        if len(signals) < 3:
+            raise RuntimeError(f"För lite marknadsdata: endast {len(signals)} symboler kunde analyseras")
         fx = get_fx_usd_sek()
         exits = manage_positions(signals, fx)
         blocked = []
@@ -518,16 +521,88 @@ def shutdown() -> None:
     stop_event.set()
 
 
+
+def dashboard_market_payload(signals: list[dict[str, Any]], errors: list[dict[str, Any]]) -> dict[str, Any]:
+    """Adapt the new signal schema to the existing index.html dashboard contract."""
+    fx = get_fx_usd_sek()
+    adapted = []
+    prices_sek: dict[str, float] = {}
+    for item in signals:
+        row = dict(item)
+        price_sek = float(item.get("price_usd", 0.0)) * fx
+        prices_sek[item["symbol"]] = round(price_sek, 8)
+        row["price_sek"] = round(price_sek, 6)
+        row["score"] = int(item.get("confidence", 0))
+        row["reason"] = "; ".join(item.get("reasons", [])) or item.get("block_reason") or "Ingen tydlig signal"
+        adapted.append(row)
+    return {
+        "status": "ok" if adapted else "error",
+        "version": APP_VERSION,
+        "mode": MODE,
+        "real_orders_enabled": False,
+        "updated_at": utc_now(),
+        "count": len(adapted),
+        "signals": sorted(adapted, key=lambda x: (x["confidence"], x["momentum_1h_pct"]), reverse=True),
+        "prices_sek": prices_sek,
+        "market_source": "Coinbase Exchange public candles",
+        "errors": errors,
+        "unavailable_market_symbols": [e["symbol"] for e in errors],
+        "fx_usd_sek": fx,
+    }
+
+
+def dashboard_portfolio_payload() -> dict[str, Any]:
+    base = equity_and_unrealized()
+    positions = state.get("positions", {})
+    holdings = {
+        symbol: {"quantity": float(pos.get("quantity", 0)), "entry_price_sek": float(pos.get("entry_price_sek", 0))}
+        for symbol, pos in positions.items()
+    }
+    trades = []
+    for t in state.get("trades", []):
+        trades.append({
+            **t,
+            "amount_sek": float(t.get("gross_sek", 0)),
+            "automatic": t.get("reason", "").startswith("paper_") or t.get("reason") in ("stop_loss", "take_profit", "trailing_stop", "trend_exit"),
+        })
+    return {
+        **base,
+        "balance_sek": base["cash_sek"],
+        "equity_sek": base["equity_sek"],
+        "holdings": holdings,
+        "trades": trades[-500:],
+        "trade_count": len(state.get("trades", [])),
+        "risk_baseline_equity_sek": float(state.get("starting_balance_sek", START_BALANCE_SEK)),
+        "starting_balance_sek": float(state.get("starting_balance_sek", START_BALANCE_SEK)),
+        "mode": MODE,
+        "real_orders_enabled": False,
+    }
+
+
+def _check_admin(request: Request) -> None:
+    """Require a token only when one is configured in Render; never expose it."""
+    expected = os.getenv("PAPER_API_TOKEN", "").strip()
+    if not expected:
+        return
+    supplied = request.headers.get("X-Paper-Admin-Token", "").strip()
+    if not supplied or supplied != expected:
+        raise HTTPException(status_code=403, detail="Admin-token saknas eller är fel. Kontrollera PAPER_API_TOKEN i Render.")
+
+
 @app.get("/")
-def root() -> dict[str, Any]:
+def root():
+    """Serve the actual dashboard instead of raw JSON."""
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+    if os.path.isfile(html_path):
+        return FileResponse(html_path, media_type="text/html; charset=utf-8")
     return {
         "status": "online",
         "app": "AI Crypto Trader",
         "version": APP_VERSION,
         "mode": MODE,
         "real_orders_enabled": False,
-        "message": "Paper trading only. No real orders can be sent by this build.",
-        "endpoints": ["/api/status", "/api/auto/status", "/api/market", "/api/scan", "/api/trades", "/api/portfolio", "/api/paper/start"],
+        "message": "Dashboardfilen index.html saknas i deploymenten.",
+        "endpoints": ["/api/status", "/api/auto/status", "/api/health", "/api/market", "/api/scan", "/api/trades", "/api/portfolio", "/api/paper/status"],
     }
 
 
@@ -603,28 +678,16 @@ def auto_status() -> dict[str, Any]:
 
 @app.get("/api/market")
 def api_market() -> dict[str, Any]:
-    """Compatibility endpoint for the existing dashboard, which calls /api/market."""
-    try:
-        signals, errors = [], []
-        for symbol in SYMBOLS:
-            try:
-                signals.append(analyze_market(symbol))
-            except Exception as exc:
-                errors.append({"symbol": symbol, "error": str(exc)[:220]})
-        return {
-            "status": "ok" if signals else "error",
-            "version": APP_VERSION,
-            "mode": MODE,
-            "real_orders_enabled": False,
-            "updated_at": utc_now(),
-            "count": len(signals),
-            "signals": sorted(signals, key=lambda x: (x["confidence"], x["momentum_1h_pct"]), reverse=True),
-            "market_source": "Coinbase Exchange public candles",
-            "errors": errors,
-            "unavailable_market_symbols": [e["symbol"] for e in errors],
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)[:300])
+    """Dashboard-compatible market endpoint with SEK prices and legacy field names."""
+    signals, errors = [], []
+    for symbol in SYMBOLS:
+        try:
+            signals.append(analyze_market(symbol))
+        except Exception as exc:
+            errors.append({"symbol": symbol, "error": str(exc)[:220]})
+    if not signals:
+        raise HTTPException(status_code=503, detail={"message": "No market data available", "errors": errors})
+    return dashboard_market_payload(signals, errors)
 
 
 @app.get("/api/scan")
@@ -642,7 +705,7 @@ def api_scan() -> dict[str, Any]:
         return {
             "version": APP_VERSION, "mode": MODE, "real_orders_enabled": False,
             "updated_at": utc_now(), "signal_count": len(signals),
-            "signals": sorted(signals, key=lambda x: (x["confidence"], x["momentum_1h_pct"]), reverse=True),
+            "signals": dashboard_market_payload(signals, errors)["signals"],
             "errors": errors, "unavailable_market_symbols": [e["symbol"] for e in errors],
         }
     except HTTPException:
@@ -670,13 +733,20 @@ def api_portfolio() -> dict[str, Any]:
         }
 
 
+@app.get("/api/health")
+def api_health() -> dict[str, Any]:
+    return {"status": "ok", "version": APP_VERSION, "mode": MODE, "real_orders_enabled": False}
+
+
 @app.get("/api/paper/status")
 def paper_status() -> dict[str, Any]:
-    return api_portfolio()
+    with lock:
+        return dashboard_portfolio_payload()
 
 
 @app.post("/api/paper/start")
-def paper_start() -> dict[str, Any]:
+def paper_start(request: Request) -> dict[str, Any]:
+    _check_admin(request)
     with lock:
         state["auto_enabled"] = True
         state["risk_halt"] = False
@@ -686,12 +756,13 @@ def paper_start() -> dict[str, Any]:
 
 
 @app.post("/api/auto/start")
-def auto_start() -> dict[str, Any]:
-    return paper_start()
+def auto_start(request: Request) -> dict[str, Any]:
+    return paper_start(request)
 
 
 @app.post("/api/auto/stop")
-def auto_stop() -> dict[str, Any]:
+def auto_stop(request: Request) -> dict[str, Any]:
+    _check_admin(request)
     with lock:
         state["auto_enabled"] = False
         save_state()
@@ -724,6 +795,99 @@ def news_status() -> dict[str, Any]:
         "message": "News sentiment is not connected in this build; do not treat the strategy as news-aware.",
         "mode": MODE,
     }
+
+
+
+@app.post("/api/paper/order")
+async def paper_order(request: Request) -> dict[str, Any]:
+    """Manual simulated order used by the existing dashboard; never sends real orders."""
+    _check_admin(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Ogiltig JSON.")
+    symbol = str(body.get("symbol", "")).upper().strip()
+    side = str(body.get("side", "")).lower().strip()
+    try:
+        amount = float(body.get("amount_sek", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Beloppet måste vara ett tal.")
+    if symbol not in SYMBOLS:
+        raise HTTPException(status_code=400, detail="Valutan stöds inte.")
+    if side not in ("buy", "sell"):
+        raise HTTPException(status_code=400, detail="Sidan måste vara buy eller sell.")
+    if not math.isfinite(amount) or amount < 1 or amount > MAX_TRADE_SEK:
+        raise HTTPException(status_code=400, detail=f"Belopp måste vara mellan 1 och {MAX_TRADE_SEK:.0f} SEK.")
+    try:
+        sig = analyze_market(symbol)
+        fx = get_fx_usd_sek()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Marknadsdata saknas: {str(exc)[:180]}")
+    with lock:
+        if side == "buy":
+            if symbol in state.get("positions", {}):
+                raise HTTPException(status_code=409, detail="Det finns redan en position i denna valuta.")
+            if amount > float(state.get("cash_sek", 0)) / (1.0 + FEE_RATE):
+                raise HTTPException(status_code=400, detail="Otillräckligt kontantsaldo inklusive avgift.")
+            price_sek = float(sig["price_usd"]) * fx
+            fee = amount * FEE_RATE
+            quantity = amount / price_sek if price_sek > 0 else 0
+            if quantity <= 0:
+                raise HTTPException(status_code=502, detail="Ogiltigt marknadspris.")
+            state["cash_sek"] -= amount + fee
+            state["fees_paid_sek"] = float(state.get("fees_paid_sek", 0)) + fee
+            state.setdefault("positions", {})[symbol] = {
+                "quantity": quantity, "entry_price_sek": price_sek,
+                "entry_price_usd": float(sig["price_usd"]), "entry_time": utc_now(),
+                "cost_sek": amount + fee, "highest_price_sek": price_sek,
+                "last_value_sek": amount, "entry_confidence": sig.get("confidence", 0),
+            }
+            trade = {
+                "time": utc_now(), "symbol": symbol, "side": "BUY", "price_sek": round(price_sek, 6),
+                "quantity": quantity, "gross_sek": round(amount, 2), "fee_sek": round(fee, 2),
+                "amount_sek": round(amount, 2), "realized_pnl_sek": 0.0,
+                "reason": "manual_paper_buy", "automatic": False,
+            }
+        else:
+            pos = state.get("positions", {}).get(symbol)
+            if not pos:
+                raise HTTPException(status_code=400, detail="Det finns ingen position att sälja.")
+            price_sek = float(sig["price_usd"]) * fx
+            quantity = float(pos["quantity"])
+            gross = quantity * price_sek
+            fee = gross * FEE_RATE
+            net = gross - fee
+            pnl = net - float(pos.get("cost_sek", 0))
+            state["cash_sek"] += net
+            state["realized_pnl_sek"] = float(state.get("realized_pnl_sek", 0)) + pnl
+            state["fees_paid_sek"] = float(state.get("fees_paid_sek", 0)) + fee
+            trade = {
+                "time": utc_now(), "symbol": symbol, "side": "SELL", "price_sek": round(price_sek, 6),
+                "quantity": quantity, "gross_sek": round(gross, 2), "fee_sek": round(fee, 2),
+                "amount_sek": round(gross, 2), "realized_pnl_sek": round(pnl, 2),
+                "reason": "manual_paper_sell", "automatic": False,
+            }
+            del state["positions"][symbol]
+        state.setdefault("trades", []).append(trade)
+        state["trades"] = state["trades"][-2000:]
+        save_state()
+    return {"ok": True, "mode": MODE, "real_orders_enabled": False, "trade": trade}
+
+
+@app.get("/api/tax.csv")
+def tax_csv(request: Request):
+    _check_admin(request)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["time", "symbol", "side", "quantity", "price_sek", "gross_sek", "fee_sek", "realized_pnl_sek", "reason"])
+    with lock:
+        for t in state.get("trades", []):
+            writer.writerow([t.get("time", ""), t.get("symbol", ""), t.get("side", ""),
+                             t.get("quantity", ""), t.get("price_sek", ""), t.get("gross_sek", ""),
+                             t.get("fee_sek", ""), t.get("realized_pnl_sek", ""), t.get("reason", "")])
+    from fastapi.responses import Response
+    return Response(content=output.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="paper-trading-tax.csv"'})
 
 
 @app.get("/api/metrics")
