@@ -19,7 +19,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 
-APP_VERSION = "24.0.0-dashboard-compat-paper"
+APP_VERSION = "25.2.0-dashboard-recovery-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -591,19 +591,27 @@ def _check_admin(request: Request) -> None:
 
 @app.get("/")
 def root():
-    """Serve the actual dashboard instead of raw JSON."""
-    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-    if os.path.isfile(html_path):
-        return FileResponse(html_path, media_type="text/html; charset=utf-8")
-    return {
-        "status": "online",
-        "app": "AI Crypto Trader",
-        "version": APP_VERSION,
-        "mode": MODE,
-        "real_orders_enabled": False,
-        "message": "Dashboardfilen index.html saknas i deploymenten.",
-        "endpoints": ["/api/status", "/api/auto/status", "/api/health", "/api/market", "/api/scan", "/api/trades", "/api/portfolio", "/api/paper/status"],
-    }
+    """Serve the dashboard HTML; never silently present API JSON as the home page."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base_dir, "index.html"),
+        os.path.join(base_dir, "index-3.html"),
+        os.path.join(base_dir, "static", "index.html"),
+        os.path.join(base_dir, "frontend", "index.html"),
+    ]
+    for html_path in candidates:
+        if os.path.isfile(html_path):
+            return FileResponse(html_path, media_type="text/html; charset=utf-8")
+
+    diagnostic = """<!doctype html> <html lang="sv"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"> <title>AI Crypto Trader – dashboard saknas</title> <body style="font:16px system-ui;background:#0b1020;color:#edf2ff;padding:24px;line-height:1.5"> <h1>AI Crypto Trader är online</h1> <p>Backend startade, men dashboardfilen hittades inte.</p> <p>Lägg <code>index.html</code> i samma mapp som <code>main.py</code> i GitHub och gör en ny deployment i Render.</p> <p>Handelsläget är PAPER ONLY. Inga riktiga order skickas.</p> <p><a style="color:#93c5fd" href="/api/health">Testa backend</a> · <a style="color:#93c5fd" href="/api/scan">Marknadsskanning</a></p> </body></html>"""
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=diagnostic, status_code=503)
+
+
+@app.head("/")
+def root_head():
+    """Lightweight response for HEAD requests to the homepage."""
+    return {"status": "online", "version": APP_VERSION, "mode": MODE}
 
 
 @app.get("/health")
