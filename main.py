@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "22.0.2-auto-interval-status-guard-paper"
+APP_VERSION = "22.1.0-balanced-entry-paper"
 MODE = "PAPER ONLY"
 # Expanded universe. Coinbase products without a working EUR ticker are skipped automatically.
 SYMBOLS = [
@@ -44,7 +44,7 @@ STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.5"))
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "4.5"))
 TRAILING_ACTIVATION_PCT = float(os.getenv("TRAILING_ACTIVATION_PCT", "2.5"))
 TRAILING_DRAWDOWN_PCT = float(os.getenv("TRAILING_DRAWDOWN_PCT", "2.0"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "65"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "60"))
 RISK_PER_TRADE_PCT = min(2.0, max(0.1, float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))))
 BACKTEST_SLIPPAGE_BPS = max(0.0, float(os.getenv("BACKTEST_SLIPPAGE_BPS", "10")))
 NEWS_BLACKOUT_MINUTES = max(0, int(os.getenv("NEWS_BLACKOUT_MINUTES", "15")))
@@ -741,9 +741,10 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     )
     volume_ok = vol_ratio >= 0.25
     stoch_ok = 20.0 <= stoch_now <= 88.0 and (stoch_trigger or histogram_rising)
-    trend_ok = long_trend_up or (trend_up and last_close > e200[-1]) or early_reversal
-    not_overextended = price_above_ema21_pct <= 1.25
-    volatility_ok = volatility <= 1.5
+    # Permit a confirmed medium-term uptrend before the slow EMA200 has fully caught up.
+    trend_ok = long_trend_up or (trend_up and last_close > e50[-1]) or early_reversal
+    not_overextended = price_above_ema21_pct <= 2.0
+    volatility_ok = volatility <= 2.0
     timeframe_ok = (
         (trend_15m != "DOWN" and trend_1h != "DOWN")
         or (long_trend_up and histogram_cross_up and momentum >= 0.08)
@@ -753,26 +754,26 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     # pullback/recovery in an established long trend. Avoid buying a late spike.
     continuation_setup = (
         trend_ok and e9[-1] > e21[-1] and histogram_up and histogram_rising
-        and momentum >= 0.03 and 45 <= rsi_v <= 68 and volume_ok
-        and not_overextended and 1 <= stoch_now <= 88 and volatility_ok
+        and momentum >= -0.02 and 40 <= rsi_v <= 72 and volume_ok
+        and not_overextended and 1 <= stoch_now <= 92 and volatility_ok
         and timeframe_ok
     )
     pullback_recovery_setup = (
         long_trend_up and e9[-1] > e21[-1] and stoch_trigger
         and histogram_up and histogram_rising and momentum >= -0.02
-        and 42 <= rsi_v <= 65 and volume_ok and not_overextended
+        and 38 <= rsi_v <= 70 and volume_ok and not_overextended
         and stoch_now <= 82 and volatility_ok and timeframe_ok
     )
     buy_gates = {
-        "tillräcklig historik": samples >= 200,
+        "tillräcklig historik": samples >= 120,
         "trend eller tidig trendvändning": trend_ok,
         "EMA9 över EMA21": e9[-1] > e21[-1],
         "MACD positivt och förbättras": histogram_up and histogram_rising,
-        "momentum bekräftar uppgång": momentum >= 0.03,
-        "RSI inom kvalitetsintervall": 42 <= rsi_v <= 68,
+        "momentum inte tydligt negativt": momentum >= -0.02,
+        "RSI inom kvalitetsintervall": 38 <= rsi_v <= 72,
         "volym tillräcklig": volume_ok,
         "inte översträckt över EMA21": not_overextended,
-        "stochastic inte överköpt": stoch_now <= 88,
+        "stochastic inte extremt överköpt": stoch_now <= 92,
         "volatilitet rimlig": volatility_ok,
         "15m/1h-trend bekräftar eller stark vändning": timeframe_ok,
     }
@@ -795,7 +796,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
     if buy_ok:
         signal = "KÖP"
         confirmations = sum([trend_ok, e9[-1] > e21[-1], histogram_up and histogram_rising,
-                             momentum >= 0.03, 42 <= rsi_v <= 68, volume_ok, timeframe_ok])
+                             momentum >= -0.02, 38 <= rsi_v <= 72, volume_ok, timeframe_ok])
         confidence = min(82, 62 + confirmations * 3)
         reasons.append("KÖP godkänd av kvalitetsmodell: trend + förbättrat momentum; ingen vinstgaranti")
         reasons.append("Inträdesväg: trendfortsättning" if continuation_setup else "Inträdesväg: återhämtning i lång trend")
@@ -828,7 +829,7 @@ def analyze_symbol(symbol: str, price_sek: float) -> dict[str, Any]:
                 "advanced": {**adv, "score_adjustment": num(advanced.get("score_adjustment"), 0.0),
                              "reasons": advanced.get("reasons", [])},
                 "buy_gates": buy_gates, "sell_gates": sell_gates,
-                "decision_model": "quality_entry_v4_cost_aware_regime_efficiency",
+                "decision_model": "balanced_entry_v5_transition_cost_aware",
                 "candle_interval_minutes": 5, "data_quality": data_quality},
             "reason": "; ".join(reasons), "not_financial_advice": True}
 
@@ -1126,34 +1127,34 @@ def adaptive_buy_block_reason(sig: dict[str, Any]) -> str | None:
     # This is deliberately a filter, not a claim that the score predicts profit.
     regime = str(advanced.get("market_regime", "UNKNOWN")).upper()
     adv_score = num(advanced.get("score_adjustment"), 0.0)
-    if regime != "TREND_UP":
-        return f"regime_filter: marknadsregim {regime}; köp endast i bekräftad upptrend"
-    if adv_score < 2:
-        return f"advanced_confirmation_filter: extra bekräftelse {adv_score:.0f} under +2"
+    if regime not in ("TREND_UP", "TRANSITION"):
+        return f"regime_filter: marknadsregim {regime}; ingen bekräftad uppåt-/övergångsregim"
+    if adv_score < (1.0 if regime == "TREND_UP" else 2.0):
+        return f"advanced_confirmation_filter: extra bekräftelse {adv_score:.0f} under gränsen för {regime}"
 
-    # Require a positive 15m trend, not merely the absence of a bearish trend.
-    # The 1h trend may be neutral, but must not be down. This reduces counter-trend
-    # entries while avoiding a hard requirement for a very slow 1h crossover.
+    # Accept a neutral 15m trend when the local model has already identified a
+    # setup; still reject an explicitly bearish 15m or 1h trend. This increases
+    # opportunities without allowing entries against clearly falling timeframes.
     trend_15m = str(advanced.get("trend_15m", "NEUTRAL")).upper()
     trend_1h = str(advanced.get("trend_1h", "NEUTRAL")).upper()
-    if trend_15m != "UP":
+    if trend_15m not in ("UP", "NEUTRAL"):
         return "timeframe_guard: 15m-trenden är inte bekräftat uppåt"
     if trend_1h == "DOWN":
         return "timeframe_guard: 1h-trenden pekar nedåt"
     directional_strength = max(0.0, num(advanced.get("directional_strength"), 0.0))
-    if directional_strength < 25.0:
-        return f"directional_quality_guard: riktad styrka {directional_strength:.1f} under 25"
+    if directional_strength < 18.0:
+        return f"directional_quality_guard: riktad styrka {directional_strength:.1f} under 18"
     efficiency = max(0.0, min(1.0, num(advanced.get("trend_efficiency_ratio"), 0.0)))
-    if efficiency < 0.18:
+    if efficiency < 0.12:
         return f"chop_filter: marknaden är ryckig (effektivitet {efficiency:.2f})"
 
     # Avoid entering during extreme volatility or an exceptional volume spike,
     # where short-horizon signals are particularly noisy.
     atr_pct = max(0.0, num(advanced.get("atr_pct"), 0.0))
     relative_volume = max(0.0, num(advanced.get("relative_volume"), 0.0))
-    if atr_pct >= 4.5:
+    if atr_pct >= 6.0:
         return f"volatility_guard: ATR {atr_pct:.2f}% är för hög för denna strategi"
-    if relative_volume >= 4.0:
+    if relative_volume >= 6.0:
         return f"volume_spike_guard: relativ volym {relative_volume:.2f}x; vänta på stabilisering"
 
     # Cost hurdle: round-trip fees plus a slippage/uncertainty buffer. ATR is only
@@ -1162,7 +1163,7 @@ def adaptive_buy_block_reason(sig: dict[str, Any]) -> str | None:
     # independently confirm the trend.
     fee_rate = clamp(num(state.get("fee_rate"), FEE_RATE), 0.0, 0.02)
     round_trip_fee_pct = fee_rate * 200.0
-    min_move_room_pct = round_trip_fee_pct + 0.60
+    min_move_room_pct = round_trip_fee_pct + 0.35
     move_room_pct = num(advanced.get("expected_move_3bars_pct"), -1.0)
     if move_room_pct < 0:
         return "cost_edge_filter: volatilitetsskattning saknas"
