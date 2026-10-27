@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 
-APP_VERSION = "23.0.0-market-analysis-paper"
+APP_VERSION = "24.0.0-dashboard-compat-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -527,7 +527,7 @@ def root() -> dict[str, Any]:
         "mode": MODE,
         "real_orders_enabled": False,
         "message": "Paper trading only. No real orders can be sent by this build.",
-        "endpoints": ["/api/status", "/api/auto/status", "/api/scan", "/api/trades", "/api/portfolio", "/api/paper/start"],
+        "endpoints": ["/api/status", "/api/auto/status", "/api/market", "/api/scan", "/api/trades", "/api/portfolio", "/api/paper/start"],
     }
 
 
@@ -599,6 +599,32 @@ def auto_status() -> dict[str, Any]:
         },
     })
     return status
+
+
+@app.get("/api/market")
+def api_market() -> dict[str, Any]:
+    """Compatibility endpoint for the existing dashboard, which calls /api/market."""
+    try:
+        signals, errors = [], []
+        for symbol in SYMBOLS:
+            try:
+                signals.append(analyze_market(symbol))
+            except Exception as exc:
+                errors.append({"symbol": symbol, "error": str(exc)[:220]})
+        return {
+            "status": "ok" if signals else "error",
+            "version": APP_VERSION,
+            "mode": MODE,
+            "real_orders_enabled": False,
+            "updated_at": utc_now(),
+            "count": len(signals),
+            "signals": sorted(signals, key=lambda x: (x["confidence"], x["momentum_1h_pct"]), reverse=True),
+            "market_source": "Coinbase Exchange public candles",
+            "errors": errors,
+            "unavailable_market_symbols": [e["symbol"] for e in errors],
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)[:300])
 
 
 @app.get("/api/scan")
