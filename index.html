@@ -1,80 +1,466 @@
 
-<!DOCTYPE html>
+<!doctype html>
 <html lang="sv">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0b1020">
-<title>AI Crypto Trader</title>
+<title>AI Crypto Trader — Smart</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
-:root{color-scheme:dark}*{box-sizing:border-box}
-body{margin:0;background:#0b1020;color:#edf2ff;font:15px system-ui,sans-serif}
-header{padding:18px 14px;background:#172554}main{max-width:760px;margin:auto;padding:12px}
-h1{margin:0;font-size:22px}h2{font-size:16px;margin:0}
-.muted{color:#a9b6ce;font-size:12px}.pill{display:inline-block;margin-top:8px;padding:5px 9px;border:1px solid #36a875;border-radius:20px;color:#9bf0c2;font-size:11px}
-.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-.card{background:#141e32;border:1px solid #2b3850;border-radius:12px;padding:13px;margin:9px 0}
-.metric{font-size:22px;font-weight:750;margin-top:4px;overflow-wrap:anywhere}
-.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.row>*{flex:1}
-button,input,select{padding:10px;border-radius:8px;border:1px solid #40506a;background:#0b1427;color:white;font:inherit;max-width:100%;min-width:0}
-button{background:#2563eb;border:0;cursor:pointer;font-weight:650}button.secondary{background:#334155}
-button:disabled{opacity:.5}label{display:block;font-size:12px;color:#a9b6ce;margin:8px 0 4px}
-input[type=url],input[type=password]{width:100%}
-.status{font-size:12px;color:#b9c6db;margin-top:9px;overflow-wrap:anywhere}.good{color:#8ff0bd}.bad{color:#ff9b9b}.warn{color:#ffdc8a}
-.note{padding:10px;border-radius:9px;background:#302817;color:#ffe4a0;font-size:12px;margin:10px 0}
-details{background:#141e32;border:1px solid #2b3850;border-radius:12px;padding:12px;margin:9px 0}
-summary{cursor:pointer;font-weight:650;list-style:none}summary:after{content:"＋";float:right;color:#a9b6ce}details[open]>summary:after{content:"−"}
-.inner{padding-top:12px}.tablewrap{overflow:auto;max-height:330px}table{border-collapse:collapse;width:100%;font-size:12px}td,th{text-align:left;padding:8px 5px;border-bottom:1px solid #2b3850;vertical-align:top}th{color:#a9b6ce}
-.signal{display:grid;grid-template-columns:58px 1fr auto;gap:8px;align-items:center;padding:9px 0;border-bottom:1px solid #2b3850}
-.signal:last-child{border-bottom:0}.signal-name{font-weight:700}.small{font-size:11px;color:#a9b6ce}.signal-price{text-align:right;font-size:12px}
-@media(min-width:560px){.grid{grid-template-columns:repeat(4,minmax(0,1fr))}.metric{font-size:21px}}
+:root{color-scheme:dark;--bg:#080d19;--panel:#111a2b;--panel2:#162238;--line:#27364d;--muted:#9cabc4;--text:#edf3ff;--blue:#5685ff;--green:#5ce0ac;--red:#ff7f8c;--amber:#ffd27d}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(ellipse at top,#142348 0,#080d19 42rem);color:var(--text);font:15px/1.45 system-ui,-apple-system,sans-serif}
+header{padding:24px 18px 22px;border-bottom:1px solid #263655;background:linear-gradient(130deg,#172b58,#111b34 70%)}
+.head{max-width:1040px;margin:auto;display:flex;justify-content:space-between;gap:16px;align-items:center}
+h1{font-size:clamp(23px,5vw,34px);margin:0;letter-spacing:-.04em}
+h2{font-size:17px;margin:0 0 4px}
+p{margin:5px 0}
+.muted,.sub{color:var(--muted);font-size:13px}
+.statuspill{display:inline-flex;align-items:center;gap:7px;border:1px solid #287e67;border-radius:99px;padding:7px 11px;color:#a5f5d2;font-size:12px;font-weight:700;white-space:nowrap}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green)}
+main{max-width:1040px;margin:auto;padding:15px 14px 36px}
+.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:8px 0 14px}
+.panel,.metric{background:linear-gradient(145deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:17px;box-shadow:0 8px 24px #0002}
+.metric{padding:15px;min-width:0}
+.metric .label{font-size:12px;color:var(--muted)}
+.metric strong{display:block;font-size:clamp(19px,3.5vw,27px);letter-spacing:-.03em;margin-top:7px;overflow-wrap:anywhere}
+.positive{color:var(--green)!important}
+.negative{color:var(--red)!important}
+.warning{color:var(--amber)!important}
+.layout{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(270px,1fr);gap:12px}
+.panel{padding:17px;margin-bottom:12px;min-width:0}
+.panelhead{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}
+.chartwrap{height:260px;position:relative}
+.chartwrap.small{height:190px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+button,input,select{font:inherit;border-radius:10px;border:1px solid #364862;background:#0b1425;color:var(--text);padding:10px 12px;min-width:0}
+button{cursor:pointer;font-weight:700;border:0;background:var(--blue)}
+button.secondary{background:#29384e}
+button.danger{background:#7c3445}
+button:disabled{opacity:.5}
+.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.tinycard{padding:12px;border:1px solid var(--line);border-radius:12px;background:#0c1526}
+.tinycard .label{font-size:11px;color:var(--muted)}
+.tinycard strong{display:block;font-size:18px;margin-top:4px}
+.signal{display:grid;grid-template-columns:48px 1fr auto;gap:9px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}
+.signal:last-child{border-bottom:0}
+.coin{font-weight:800}
+.sigmeta{font-size:12px;color:var(--muted)}
+.badge{display:inline-block;padding:4px 8px;border-radius:99px;font-size:11px;font-weight:800;background:#24334b}
+.badge.buy{color:var(--green);background:#143b35}
+.badge.sell{color:var(--red);background:#452532}
+.badge.wait{color:var(--amber);background:#3c321d}
+.price{text-align:right;font-size:12px;white-space:nowrap}
+.scroll{overflow:auto;max-height:350px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+td,th{text-align:left;padding:10px 7px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:600}
+.note{border:1px solid #64522a;background:#2b2519;color:#ffe2a0;padding:12px 14px;border-radius:13px;font-size:12px;margin:12px 0}
+details{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}
+summary{cursor:pointer;font-weight:700}
+label{display:block;color:var(--muted);font-size:12px;margin:9px 0 5px}
+input,select{width:100%}
+.rowform{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.status{font-size:12px;color:var(--muted);overflow-wrap:anywhere;margin-top:9px}
+.foot{text-align:center;color:var(--muted);font-size:11px;padding:18px}
+@media(max-width:700px){
+.head{align-items:flex-start;flex-direction:column}
+.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+.layout{grid-template-columns:1fr}
+.chartwrap{height:230px}
+.panel{padding:14px}
+.metric{padding:13px}
+.grid2{gap:7px}
+}
 </style>
 </head>
 <body>
-<header><h1>AI Crypto Trader</h1><div class="muted">Översikt · marknadsanalys · paper trading</div><span class="pill">PAPER ONLY — INGA RIKTIGA ORDER</span></header>
+<header>
+<div class="head">
+<div>
+<h1>AI Crypto Trader</h1>
+<p class="muted">Smart analysis · portfolio intelligence · paper trading</p>
+</div>
+<span class="statuspill"><span class="dot"></span>PAPER ONLY — INGA RIKTIGA ORDER</span>
+</div>
+</header>
 <main>
-<div class="grid">
- <div class="card"><div class="muted">Kontantsaldo</div><div class="metric" id="cash">—</div></div>
- <div class="card"><div class="muted">Portföljvärde</div><div class="metric" id="equity">—</div></div>
- <div class="card"><div class="muted">Resultat sedan start</div><div class="metric" id="result">—</div></div>
- <div class="card"><div class="muted">Affärer</div><div class="metric" id="count">—</div></div>
-</div>
-<div class="card">
- <div class="row"><div><h2>Automatisk handel</h2><div class="muted">Simulerade order med låtsaspengar</div></div><div style="text-align:right"><span id="autopill" class="pill">LADDAR STATUS</span></div></div>
- <div class="row" style="margin-top:12px"><button id="startBtn" onclick="autoAction('start')">Starta</button><button class="secondary" onclick="autoAction('stop')">Stoppa</button><button class="secondary" onclick="refreshAll()">Uppdatera</button></div>
- <div id="autostatus" class="status">Hämtar status…</div>
-</div>
-<div class="card"><div class="row"><div><h2>Viktigaste signalerna</h2><div class="muted">Visar köp först; övriga signaler kan öppnas nedan.</div></div><button class="secondary" onclick="loadScan()">Skanna</button></div><div id="topSignals" class="inner muted">Laddar marknadsanalys…</div></div>
-<div class="note">Detta är testhandel. Resultat i paper trading garanterar inte framtida vinst. Kontrollera att servern är online innan du startar.</div>
+<section class="metrics">
+<div class="metric"><div class="label">Portföljvärde</div><strong id="equity">—</strong><div class="sub" id="equitySub">inklusive innehav</div></div>
+<div class="metric"><div class="label">Resultat sedan start</div><strong id="pnl">—</strong><div class="sub" id="pnlPct">—</div></div>
+<div class="metric"><div class="label">Kontantsaldo</div><strong id="cash">—</strong><div class="sub">tillgängligt i simuleringen</div></div>
+<div class="metric"><div class="label">Registrerade affärer</div><strong id="tradesCount">—</strong><div class="sub" id="fees">Avgifter: —</div></div>
+</section>
 
-<details><summary>Alla marknadssignaler</summary><div class="inner"><div class="tablewrap"><table><thead><tr><th>Valuta</th><th>Pris</th><th>Signal</th><th>Orsak</th></tr></thead><tbody id="signals"><tr><td colspan="4">Laddar…</td></tr></tbody></table></div></div></details>
-<details><summary>Innehav</summary><div class="inner"><div class="tablewrap"><table><thead><tr><th>Valuta</th><th>Antal</th><th>Värde</th></tr></thead><tbody id="positions"></tbody></table></div></div></details>
-<details><summary>Affärshistorik och CSV</summary><div class="inner"><button onclick="exportCsv()">Exportera CSV</button><div class="tablewrap" style="margin-top:10px"><table><thead><tr><th>Tid</th><th>Sida</th><th>Valuta</th><th>Belopp</th><th>Typ</th></tr></thead><tbody id="trades"></tbody></table></div></div></details>
-<details><summary>Manuell simulerad order</summary><div class="inner"><div class="row"><div><label for="product">Kryptovaluta</label><select id="product"><option>BTC</option><option>ETH</option><option>SOL</option><option>XRP</option><option>SHIB</option><option>ADA</option><option>DOGE</option><option>LINK</option></select></div><div><label for="amount">Belopp SEK (max 100)</label><input id="amount" type="number" min="1" max="100" value="100"></div></div><div class="row" style="margin-top:10px"><button onclick="placeOrder('buy')">Simulera köp</button><button class="secondary" onclick="placeOrder('sell')">Simulera sälj</button></div><div id="orderstatus" class="status">Välj valuta och belopp.</div></div></details>
-<details id="settings"><summary>Anslutning och säkerhet</summary><div class="inner"><div class="muted">Använd Render-adressen. Admin-token behövs bara för start/stopp, order och CSV-export.</div><label for="apiBase">Backend-URL</label><input id="apiBase" type="url" placeholder="https://din-render-tjanst.onrender.com"><label for="adminToken">Admin-token (PAPER_API_TOKEN)</label><input id="adminToken" type="password" autocomplete="off" spellcheck="false" placeholder="Klistra in token"><div class="row" style="margin-top:10px"><button onclick="saveSettings()">Spara och anslut</button><button class="secondary" onclick="testConnection()">Testa</button><button class="secondary" onclick="clearToken()">Rensa token</button></div><div id="connectionstatus" class="status">Kontrollerar anslutning…</div></div></details>
-<div id="globalstatus" class="status">Ansluter…</div>
+<section class="layout">
+<div>
+<div class="panel">
+<div class="panelhead">
+<div><h2>Portföljens utveckling</h2><div class="sub">Historiska snapshots från paper trading</div></div>
+<select id="historyRange" style="width:auto" onchange="renderEquityChart()">
+<option value="24">Senaste 24 punkter</option>
+<option value="100">Senaste 100 punkter</option>
+<option value="all">All historik</option>
+</select>
+</div>
+<div class="chartwrap"><canvas id="equityChart"></canvas></div>
+<div class="status" id="historyNote">Grafen fylls på vid varje lyckad skanningscykel.</div>
+</div>
+
+<div class="panel">
+<div class="panelhead">
+<div><h2>Marknadens signaler</h2><div class="sub">Trend, momentum, RSI och volym vägs samman</div></div>
+<button class="secondary" onclick="loadScan()">Skanna nu</button>
+</div>
+<div id="signals"><div class="status">Hämtar marknadsdata…</div></div>
+</div>
+
+<div class="panel">
+<div class="panelhead">
+<div><h2>Affärshistorik</h2><div class="sub">Senaste simulerade köp och försäljningar</div></div>
+<button class="secondary" onclick="exportCsv()">CSV</button>
+</div>
+<div class="scroll">
+<table>
+<thead><tr><th>Tid</th><th>Valuta</th><th>Sida</th><th>Belopp</th><th>Realiserat</th></tr></thead>
+<tbody id="tradeRows"><tr><td colspan="5">Laddar…</td></tr></tbody>
+</table>
+</div>
+</div>
+</div>
+
+<div>
+<div class="panel">
+<div class="panelhead">
+<div><h2>Automatisk handel</h2><div class="sub">Simulerade affärer, inga riktiga ordrar</div></div>
+<span class="badge wait" id="autoBadge">LADDAR</span>
+</div>
+<div class="grid2">
+<div class="tinycard"><div class="label">Senaste cykel</div><strong id="lastRun" style="font-size:13px">—</strong></div>
+<div class="tinycard"><div class="label">Analyserade valutor</div><strong id="scanned">—</strong></div>
+</div>
+<div class="actions">
+<button onclick="autoAction('start')">Starta</button>
+<button class="danger" onclick="autoAction('stop')">Stoppa</button>
+<button class="secondary" onclick="refreshAll()">Uppdatera</button>
+</div>
+<div id="autoStatus" class="status">Hämtar status…</div>
+</div>
+
+<div class="panel">
+<h2>AI-marknadsbedömning</h2>
+<p class="sub">Förklaring till hur signalerna bedöms</p>
+<div class="grid2" style="margin-top:12px">
+<div class="tinycard"><div class="label">Köp-kandidater</div><strong id="buyCandidates">—</strong></div>
+<div class="tinycard"><div class="label">Riskläge</div><strong id="riskState">—</strong></div>
+<div class="tinycard"><div class="label">Vinstaffärer</div><strong id="winRate">—</strong></div>
+<div class="tinycard"><div class="label">Avgift per sida</div><strong id="feeRate">—</strong></div>
+</div>
+<div class="status" id="aiExplanation">Multi-factor analys laddas…</div>
+</div>
+
+<div class="panel">
+<h2>Innehav</h2>
+<div class="sub">Aktuella simulerade positioner</div>
+<div class="scroll" style="margin-top:8px">
+<table>
+<thead><tr><th>Valuta</th><th>Antal</th><th>Värde</th></tr></thead>
+<tbody id="positions"><tr><td colspan="3">Laddar…</td></tr></tbody>
+</table>
+</div>
+
+<details>
+<summary>Manuell simulerad order</summary>
+<div class="rowform">
+<div><label for="symbol">Valuta</label>
+<select id="symbol">
+<option>BTC</option><option>ETH</option><option>SOL</option><option>XRP</option>
+<option>ADA</option><option>DOGE</option><option>LINK</option><option>SHIB</option>
+</select>
+</div>
+<div><label for="amount">Belopp SEK</label><input id="amount" type="number" min="1" max="100" value="25"></div>
+</div>
+<div class="actions">
+<button onclick="placeOrder('buy')">Simulera köp</button>
+<button class="secondary" onclick="placeOrder('sell')">Simulera sälj</button>
+</div>
+<div id="orderStatus" class="status">Manuell order kräver admin-token om sådan är inställd.</div>
+</details>
+</div>
+
+<div class="panel">
+<h2>Anslutning & säkerhet</h2>
+<div class="sub">Token lagras endast i aktuell webbsession.</div>
+<label for="apiBase">Backend-URL</label>
+<input id="apiBase" type="url" placeholder="https://din-render-tjanst.onrender.com">
+<label for="adminToken">Admin-token (PAPER_API_TOKEN)</label>
+<input id="adminToken" type="password" autocomplete="off" placeholder="Klistra in token">
+<div class="actions">
+<button onclick="saveSettings()">Spara / anslut</button>
+<button class="secondary" onclick="testConnection()">Testa</button>
+<button class="secondary" onclick="clearToken()">Rensa token</button>
+</div>
+<div class="status" id="connectionStatus">Ansluter…</div>
+</div>
+</div>
+</section>
+
+<div class="note">Testmiljö: PAPER ONLY. Resultat i simulering garanterar inte framtida vinst. Avgifter, spread och marknadsdata kan skilja sig från verklig handel. Om Render använder tillfällig lagring kan historik försvinna vid omstart; konfigurera persistent lagring för att bevara den.</div>
+<div class="status" id="globalStatus">Startar dashboard…</div>
+<div class="foot">AI Crypto Trader · Smart Paper Edition · <span id="version">version laddas</span></div>
 </main>
+
 <script>
 'use strict';
 const $=id=>document.getElementById(id);
 const DEFAULT_API='https://ai-crypto-trader-f8cz.onrender.com';
+let equityChart=null, historyData=[], portfolioData={}, scanData={};
+
 const sek=n=>n==null||!Number.isFinite(Number(n))?'—':Number(n).toLocaleString('sv-SE',{style:'currency',currency:'SEK',maximumFractionDigits:2});
+const fmtNum=n=>n==null||!Number.isFinite(Number(n))?'—':Number(n).toLocaleString('sv-SE',{maximumFractionDigits:6});
+
 function storedApiBase(){try{return localStorage.getItem('aiCryptoTraderApiBase')||''}catch(_){return ''}}
-function apiBase(){const typed=($('apiBase').value||'').trim();const base=(typed||(location.protocol==='file:'?DEFAULT_API:location.origin)).replace(/\/+$/,'');if(!/^https?:\/\//i.test(base))throw Error('Ange en giltig backend-URL.');return base}
+function apiBase(){
+const typed=($('apiBase').value||'').trim();
+const base=(typed||(location.protocol==='file:'?DEFAULT_API:location.origin)).replace(/\/+$/,'');
+if(!/^https?:\/\//i.test(base))throw Error('Ange en giltig backend-URL.');
+return base;
+}
 function adminToken(){try{return sessionStorage.getItem('aiCryptoTraderAdminToken')||''}catch(_){return ''}}
-function saveSettings(){const value=$('apiBase').value.trim().replace(/\/+$/,'');if(value&&!/^https?:\/\/[^ ]+$/i.test(value)){$('connectionstatus').textContent='Ange en giltig URL som börjar med https://';return}const token=$('adminToken').value.trim();try{if(value)localStorage.setItem('aiCryptoTraderApiBase',value);else localStorage.removeItem('aiCryptoTraderApiBase');if(token)sessionStorage.setItem('aiCryptoTraderAdminToken',token);else sessionStorage.removeItem('aiCryptoTraderAdminToken')}catch(_){}$('adminToken').value='';testConnection().then(refreshAll).catch(()=>{})}
-function clearToken(){try{sessionStorage.removeItem('aiCryptoTraderAdminToken')}catch(_){}$('adminToken').value='';$('connectionstatus').textContent='Token rensad från sessionen.'}
-async function api(url,options={}){const base=apiBase();const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),20000);const headers={'Accept':'application/json',...(options.headers||{})};const method=(options.method||'GET').toUpperCase();if(['POST','PUT','PATCH','DELETE'].includes(method)){const token=adminToken();if(!token)throw Error('Admin-token saknas. Öppna Anslutning och säkerhet och ange PAPER_API_TOKEN.');headers['X-Paper-Admin-Token']=token}let response;try{response=await fetch(base+url,{...options,headers,signal:controller.signal})}catch(e){if(e.name==='AbortError')throw Error('Servern svarade inte inom 20 sekunder.');throw Error('Kunde inte nå backend. Kontrollera Render-URL. '+e.message)}finally{clearTimeout(timeout)}const raw=await response.text();let data={};try{data=raw?JSON.parse(raw):{}}catch(_){data={detail:raw.slice(0,200)||'Servern returnerade inte JSON.'}}if(!response.ok){if(response.status===401||response.status===403)throw Error('Token nekades. Kontrollera PAPER_API_TOKEN i Render.');throw Error(data.detail||data.message||('HTTP '+response.status))}return data}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-async function testConnection(){try{const d=await api('/api/health');$('connectionstatus').textContent='Server online · '+(d.version||d.status||'OK');$('connectionstatus').className='status good';$('globalstatus').textContent='Ansluten · endast paper trading.';return d}catch(e){$('connectionstatus').textContent='Anslutningsfel: '+e.message;$('connectionstatus').className='status bad';$('globalstatus').textContent=e.message;throw e}}
-async function refresh(){try{const d=await api('/api/paper/status');$('cash').textContent=sek(d.balance_sek);$('count').textContent=d.trade_count??(d.trades||[]).length;let value=0,rows=[],prices={};try{const m=await api('/api/market');prices=m.prices_sek||{}}catch(_){}for(const [s,h] of Object.entries(d.holdings||{})){const q=Number(h.quantity||0),p=prices[s];if(p!=null&&Number.isFinite(Number(p)))value+=q*Number(p);rows.push('<tr><td>'+esc(s)+'</td><td>'+q.toPrecision(8)+'</td><td>'+sek(p==null?null:q*Number(p))+'</td></tr>')}$('positions').innerHTML=rows.join('')||'<tr><td colspan="3">Inga innehav ännu.</td></tr>';const eq=Number.isFinite(Number(d.equity_sek))?Number(d.equity_sek):Number(d.balance_sek||0)+value;const baseline=Number(d.risk_baseline_equity_sek??1000);$('equity').textContent=sek(eq);$('result').textContent=sek(eq-baseline);$('result').className='metric '+(eq>=baseline?'good':'bad');$('trades').innerHTML=(d.trades||[]).slice().reverse().map(t=>'<tr><td>'+esc(t.time?new Date(t.time).toLocaleString('sv-SE'):'—')+'</td><td>'+esc(String(t.side||'').toUpperCase())+'</td><td>'+esc(t.symbol||'—')+'</td><td>'+sek(t.amount_sek)+'</td><td>'+(t.automatic?'Automatisk':'Manuell')+'</td></tr>').join('')||'<tr><td colspan="5">Ingen historik.</td></tr>'}catch(e){$('globalstatus').textContent='Kontofel: '+e.message;$('cash').textContent='—';$('equity').textContent='—';$('result').textContent='—';$('count').textContent='—'}}
-async function loadScan(){$('topSignals').textContent='Analyserar marknaden…';try{const d=await api('/api/scan');const arr=d.signals||[];const rank={KÖP:0,AVVAKTA:1,SÄLJ:2};arr.sort((a,b)=>(rank[a.signal]??3)-(rank[b.signal]??3)||(Number(b.score)||0)-(Number(a.score)||0));const buys=arr.filter(s=>s.signal==='KÖP');const top=(buys.length?buys:arr.filter(s=>s.signal==='SÄLJ')).slice(0,4);$('topSignals').innerHTML=top.length?top.map(s=>'<div class="signal"><div class="signal-name">'+esc(s.symbol)+'</div><div><div class="'+(s.signal==='KÖP'?'good':s.signal==='SÄLJ'?'bad':'warn')+'">'+esc(s.signal||'AVVAKTA')+' · '+esc(s.confidence??'—')+'%</div><div class="small">'+esc((s.reason||'').slice(0,115))+'</div></div><div class="signal-price">'+sek(s.price_sek)+'</div></div>').join(''):'Inga signaler tillgängliga.';$('signals').innerHTML=arr.map(s=>'<tr><td>'+esc(s.symbol)+'</td><td>'+sek(s.price_sek)+'</td><td class="'+(s.signal==='KÖP'?'good':s.signal==='SÄLJ'?'bad':'warn')+'">'+esc(s.signal||'AVVAKTA')+'</td><td>'+esc(s.reason||'—')+'</td></tr>').join('')||'<tr><td colspan="4">Ingen data.</td></tr>'}catch(e){$('topSignals').textContent='Analysfel: '+e.message;$('signals').innerHTML='<tr><td colspan="4">'+esc(e.message)+'</td></tr>'}}
-async function loadAuto(){try{const d=await api('/api/auto/status');$('autopill').textContent=d.enabled?'AUTOMATIK AKTIV':'AUTOMATIK AV';$('autopill').className='pill '+(d.enabled?'good':'warn');$('autostatus').textContent=(d.enabled?'Aktiv':'Avstängd')+' · '+(d.mode||'läge okänt')+' · '+(d.risk_halt?'Riskspärr aktiv':(d.last_error||'Inga rapporterade systemfel'));$('autostatus').className='status '+(d.enabled?'good':'warn')}catch(e){$('autopill').textContent='STATUS OKÄND';$('autostatus').textContent='Kunde inte läsa status: '+e.message;$('autostatus').className='status bad'}}
-async function autoAction(action){if(!['start','stop'].includes(action))return;const btn=$('startBtn');btn.disabled=true;$('autostatus').textContent='Skickar begäran…';try{await api('/api/auto/'+action,{method:'POST'});await loadAuto();await refresh()}catch(e){$('autostatus').textContent='Fel: '+e.message;$('autostatus').className='status bad';if(/token/i.test(e.message)){$('settings').open=true;$('connectionstatus').textContent='Ange exakt samma PAPER_API_TOKEN som finns i Render → Environment.'}}finally{btn.disabled=false}}
-async function placeOrder(side){const amount=Number($('amount').value);if(!Number.isFinite(amount)||amount<1||amount>100){$('orderstatus').textContent='Ange 1–100 kr.';return}try{const d=await api('/api/paper/order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:$('product').value,side,amount_sek:amount})});$('orderstatus').textContent='Simulerad '+side+' registrerad: '+(d.trade?.symbol||$('product').value);await refresh()}catch(e){$('orderstatus').textContent='Orderfel: '+e.message}}
-async function exportCsv(){try{const token=adminToken();if(!token)throw Error('Admin-token saknas.');const response=await fetch(apiBase()+'/api/tax.csv',{headers:{'X-Paper-Admin-Token':token,'Accept':'text/csv'}});if(!response.ok)throw Error(response.status+' '+(await response.text()).slice(0,150));const blob=await response.blob(),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='paper-trading-tax.csv';document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url)}catch(e){$('globalstatus').textContent='CSV-export misslyckades: '+e.message}}
-async function refreshAll(){await Promise.all([refresh(),loadScan(),loadAuto()])}
-$('apiBase').value=storedApiBase();testConnection().then(refreshAll).catch(()=>{loadAuto();loadScan()});setInterval(()=>{refresh();loadAuto()},30000);
+
+async function api(path,options={}){
+const controller=new AbortController();
+const timeout=setTimeout(()=>controller.abort(),20000);
+const method=(options.method||'GET').toUpperCase();
+const headers={'Accept':'application/json',...(options.headers||{})};
+if(['POST','PUT','PATCH','DELETE'].includes(method)){
+const token=adminToken();
+if(token)headers['X-Paper-Admin-Token']=token;
+}
+let response;
+try{
+response=await fetch(apiBase()+path,{...options,headers,signal:controller.signal});
+}catch(e){
+if(e.name==='AbortError')throw Error('Servern svarade inte inom 20 sekunder.');
+throw Error('Kunde inte nå backend: '+e.message);
+}finally{clearTimeout(timeout)}
+const raw=await response.text();
+let data={};
+try{data=raw?JSON.parse(raw):{}}catch(_){data={detail:raw.slice(0,180)||'Servern returnerade inte JSON.'}}
+if(!response.ok)throw Error(data.detail?.message||data.detail||data.message||('HTTP '+response.status));
+return data;
+}
+
+function saveSettings(){
+const base=$('apiBase').value.trim().replace(/\/+$/,'');
+if(base&&!/^https?:\/\/[^ ]+$/i.test(base)){
+$('connectionStatus').textContent='Ange en giltig URL som börjar med https://';return;
+}
+const token=$('adminToken').value.trim();
+try{
+if(base)localStorage.setItem('aiCryptoTraderApiBase',base);
+else localStorage.removeItem('aiCryptoTraderApiBase');
+if(token)sessionStorage.setItem('aiCryptoTraderAdminToken',token);
+else sessionStorage.removeItem('aiCryptoTraderAdminToken');
+}catch(_){}
+$('adminToken').value='';
+testConnection().then(refreshAll).catch(()=>{});
+}
+function clearToken(){
+try{sessionStorage.removeItem('aiCryptoTraderAdminToken')}catch(_){}
+$('adminToken').value='';
+$('connectionStatus').textContent='Token borttagen från sessionen.';
+}
+
+async function testConnection(){
+try{
+const d=await api('/api/health');
+$('connectionStatus').textContent='Server online · '+(d.version||d.status);
+$('connectionStatus').className='status positive';
+$('version').textContent=d.version||'';
+$('globalStatus').textContent='Ansluten · '+d.mode+' · riktiga order avstängda';
+return d;
+}catch(e){
+$('connectionStatus').textContent='Anslutningsfel: '+e.message;
+$('connectionStatus').className='status negative';
+$('globalStatus').textContent=e.message;
+throw e;
+}
+}
+
+async function refreshPortfolio(){
+const d=await api('/api/paper/status');
+portfolioData=d;
+const eq=Number(d.equity_sek??d.balance_sek??0);
+const start=Number(d.starting_balance_sek??d.risk_baseline_equity_sek??1000);
+const pnl=eq-start;
+$('equity').textContent=sek(eq);
+$('cash').textContent=sek(d.balance_sek??d.cash_sek);
+$('pnl').textContent=(pnl>0?'+':'')+sek(pnl);
+$('pnl').className=pnl>=0?'positive':'negative';
+$('pnlPct').textContent=(start?pnl/start*100:0).toLocaleString('sv-SE',{maximumFractionDigits:2})+'% sedan start';
+$('tradesCount').textContent=d.trade_count??(d.trades||[]).length;
+$('fees').textContent='Avgifter: '+sek(d.fees_paid_sek);
+
+const holds=d.holdings||{};
+const prices=d.position_values_sek||{};
+const rows=Object.entries(holds).map(([s,h])=>'<tr><td><b>'+esc(s)+'</b></td><td>'+fmtNum(h.quantity)+'</td><td>'+sek(prices[s]??h.quantity*(Number(d.prices_sek?.[s])||0))+'</td></tr>');
+$('positions').innerHTML=rows.join('')||'<tr><td colspan="3">Inga öppna innehav.</td></tr>';
+
+const trades=(d.trades||[]).slice().reverse();
+$('tradeRows').innerHTML=trades.slice(0,100).map(t=>'<tr><td>'+esc(t.time?new Date(t.time).toLocaleString('sv-SE'):'—')+'</td><td>'+esc(t.symbol)+'</td><td class="'+(t.side==='BUY'?'positive':'negative')+'">'+esc(t.side)+'</td><td>'+sek(t.amount_sek??t.gross_sek)+'</td><td class="'+(Number(t.realized_pnl_sek)>0?'positive':Number(t.realized_pnl_sek)<0?'negative':'')+'">'+(t.side==='SELL'?sek(t.realized_pnl_sek):'—')+'</td></tr>').join('')||'<tr><td colspan="5">Ingen historik ännu.</td></tr>';
+
+const sells=trades.filter(t=>t.side==='SELL'&&t.realized_pnl_sek!=null);
+const wins=sells.filter(t=>Number(t.realized_pnl_sek)>0).length;
+$('winRate').textContent=sells.length?(wins/sells.length*100).toLocaleString('sv-SE',{maximumFractionDigits:1})+'%':'—';
+$('feeRate').textContent=(Number(d.fees_paid_sek||0)).toLocaleString('sv-SE',{maximumFractionDigits:2})+' kr';
+}
+
+async function refreshHistory(){
+try{
+const d=await api('/api/history?limit=1000');
+historyData=d.history||[];
+}catch(_){historyData=[]}
+renderEquityChart();
+}
+
+function renderEquityChart(){
+const mode=$('historyRange').value;
+let arr=historyData.slice();
+if(mode!=='all')arr=arr.slice(-Number(mode));
+const labels=arr.map(x=>x.time?new Date(x.time).toLocaleString('sv-SE',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'');
+const values=arr.map(x=>Number(x.equity_sek??x.total_equity_sek??0));
+const ctx=$('equityChart').getContext('2d');
+if(equityChart)equityChart.destroy();
+if(typeof Chart==='undefined'){
+$('historyNote').textContent='Grafbiblioteket kunde inte laddas. Kontrollera internetanslutningen.';
+return;
+}
+equityChart=new Chart(ctx,{
+type:'line',
+data:{labels,datasets:[{
+label:'Portföljvärde (SEK)',data:values,borderColor:'#70a0ff',
+backgroundColor:'rgba(86,133,255,.14)',fill:true,tension:.25,
+pointRadius:arr.length>40?0:2,borderWidth:2
+}]},
+options:{
+responsive:true,maintainAspectRatio:false,
+interaction:{intersect:false,mode:'index'},
+plugins:{
+legend:{labels:{color:'#c8d5ec'}},
+tooltip:{callbacks:{label:c=>' '+sek(c.parsed.y)}}
+},
+scales:{
+x:{ticks:{color:'#9cabc4',maxTicksLimit:6},grid:{color:'rgba(130,150,180,.08)'}},
+y:{ticks:{color:'#9cabc4',callback:v=>Number(v).toLocaleString('sv-SE')+' kr'},grid:{color:'rgba(130,150,180,.1)'}}
+}
+}
+});
+$('historyNote').textContent=arr.length?'Visar '+arr.length+' sparade värdepunkter. Historiken växer vid lyckade cykler.':'Ingen sparad historik ännu — grafen fylls på efter nästa lyckade skanning.';
+}
+
+async function loadScan(){
+$('signals').innerHTML='<div class="status">Analyserar marknaden…</div>';
+try{
+const d=await api('/api/scan');
+scanData=d;
+const arr=d.signals||[];
+const rank={'KÖP':0,'AVVAKTA':1,'SÄLJ':2};
+arr.sort((a,b)=>(rank[a.signal]??3)-(rank[b.signal]??3)||Number(b.confidence||0)-Number(a.confidence||0));
+$('signals').innerHTML=arr.slice(0,18).map(s=>
+'<div class="signal"><div class="coin">'+esc(s.symbol)+'</div><div><span class="badge '+(s.signal==='KÖP'?'buy':s.signal==='SÄLJ'?'sell':'wait')+'">'+esc(s.signal)+'</span><div class="sigmeta" style="margin-top:5px">'+esc(s.confidence)+'% styrka · RSI '+esc(s.rsi_14??'—')+'</div><div class="sigmeta">'+esc((s.reason||s.block_reason||'').slice(0,150))+'</div></div><div class="price">'+sek(s.price_sek)+'<div class="sigmeta">'+(Number(s.momentum_1h_pct)>0?'+':'')+esc(s.momentum_1h_pct??0)+'%</div></div></div>'
+).join('')||'<div class="status">Inga signaler tillgängliga.</div>';
+$('buyCandidates').textContent=arr.filter(s=>s.signal==='KÖP').length;
+$('scanned').textContent=arr.length;
+$('aiExplanation').textContent='Analysen kombinerar trend (EMA), momentum på flera intervall, RSI, volym och volatilitet. Köp kräver samstämmiga signaler och en uppskattad rörelse som klarar en förenklad kostnadströskel. Detta är regelbaserad analys, inte en tränad AI eller vinstgaranti.';
+if(d.updated_at)$('lastRun').textContent=new Date(d.updated_at).toLocaleTimeString('sv-SE');
+}catch(e){
+$('signals').innerHTML='<div class="status negative">Kunde inte skanna: '+esc(e.message)+'</div>';
+}
+}
+
+async function refreshAuto(){
+try{
+const d=await api('/api/auto/status');
+const on=!!(d.enabled??d.auto_enabled);
+$('autoBadge').textContent=on?'AUTOMATIK AKTIV':'STOPPAD';
+$('autoBadge').className='badge '+(on?'buy':'wait');
+$('riskState').textContent=d.risk_halt?'STOPP':'Normal';
+$('riskState').className=d.risk_halt?'negative':'';
+$('lastRun').textContent=d.last_run?new Date(d.last_run).toLocaleTimeString('sv-SE'):'Väntar';
+$('autoStatus').textContent=(on?'Automatisk paper trading är aktiv.':'Automatisk handel är stoppad.')+' · '+(d.worker_alive?'worker igång':'worker-status okänd')+(d.last_error?' · Senaste fel: '+d.last_error:'')+(d.fx_live===false?' · Växelkursfallback används':'');
+}catch(e){
+$('autoStatus').textContent='Statusfel: '+e.message;
+}
+}
+
+async function autoAction(action){
+try{
+const d=await api(action==='start'?'/api/auto/start':'/api/auto/stop',{method:'POST'});
+$('autoStatus').textContent=d.running?'Automatisk paper trading startad.':'Automatisk paper trading stoppad.';
+await refreshAll();
+}catch(e){
+$('autoStatus').textContent='Åtgärden misslyckades: '+e.message+' Om PAPER_API_TOKEN är inställd måste den anges i Anslutning & säkerhet.';
+}
+}
+
+async function placeOrder(side){
+const amount=Number($('amount').value),symbol=$('symbol').value;
+if(!Number.isFinite(amount)||amount<1||amount>100){
+$('orderStatus').textContent='Ange belopp mellan 1 och 100 kr.';
+return;
+}
+try{
+const d=await api('/api/paper/order',{
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({symbol,side,amount_sek:amount})
+});
+$('orderStatus').textContent='Simulerad '+side+'-order registrerad för '+symbol+'.';
+await refreshAll();
+}catch(e){
+$('orderStatus').textContent='Order misslyckades: '+e.message;
+}
+}
+
+async function exportCsv(){
+try{
+const headers={};
+const token=adminToken();
+if(token)headers['X-Paper-Admin-Token']=token;
+const response=await fetch(apiBase()+'/api/tax.csv',{headers});
+if(!response.ok){
+let msg='HTTP '+response.status;
+try{const err=await response.json();msg=err.detail||msg}catch(_){}
+throw Error(msg);
+}
+const blob=await response.blob();
+const a=document.createElement('a');
+const url=URL.createObjectURL(blob);
+a.href=url;
+a.download='paper-trading.csv';
+a.click();
+setTimeout(()=>URL.revokeObjectURL(url),1000);
+}catch(e){
+$('globalStatus').textContent='CSV-export misslyckades: '+e.message+' (kräver admin-token om sådan är inställd).';
+}
+}
+
+async function refreshAll(){
+await Promise.allSettled([refreshPortfolio(),refreshHistory(),refreshAuto()]);
+await testConnection().catch(()=>{});
+}
+
+(function init(){
+const base=storedApiBase();
+$('apiBase').value=base||((location.protocol==='file:')?DEFAULT_API:location.origin);
+refreshAll();
+loadScan();
+setInterval(()=>{refreshPortfolio().catch(()=>{});refreshHistory().catch(()=>{});refreshAuto().catch(()=>{})},60000);
+setInterval(()=>loadScan(),300000);
+})();
 </script>
 </body>
 </html>
