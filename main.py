@@ -1,6 +1,8 @@
-"""AI Crypto Trader v28 — PAPER ONLY. Simulated spot trading only. This app never submits real exchange orders. """
+"""AI Crypto Trader v29 — PAPER ONLY. Simulated spot trading only. Never submits real exchange orders. """
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import math
@@ -15,21 +17,24 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 
-APP_VERSION = "28.0.0-paper-control-fix"
+APP_VERSION = "29.0.0-adaptive-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
 START_BALANCE_SEK = float(os.getenv("START_BALANCE_SEK", "1000"))
 MAX_TRADE_SEK = float(os.getenv("MAX_TRADE_SEK", "100"))
-MAX_POSITION_SEK = float(os.getenv("MAX_POSITION_SEK", "100"))
+MAX_POSITION_SEK = float(os.getenv("MAX_POSITION_SEK", "150"))
 MAX_TOTAL_LOSS_SEK = float(os.getenv("MAX_TOTAL_LOSS_SEK", "250"))
-MAX_DAILY_LOSS_SEK = float(os.getenv("MAX_DAILY_LOSS_SEK", "100"))
+MAX_DAILY_LOSS_SEK = float(os.getenv("MAX_DAILY_LOSS_SEK", "75"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.005"))
 ESTIMATED_SPREAD_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SPREAD_SLIPPAGE_PCT", "0.20"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "62"))
-INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.5"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "4.5"))
+INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3.0"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "7.0"))
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "2.0"))
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "900"))
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/ai_trader_paper_state.json")
 PRODUCT_SUFFIX = "-USD"
 CANDLE_SECONDS = 300
@@ -37,7 +42,7 @@ CANDLE_LIMIT = 120
 SYMBOLS = [
     "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LINK", "AVAX", "DOT",
     "LTC", "BCH", "ATOM", "UNI", "AAVE", "XLM", "ETC", "FIL", "HBAR",
-    "NEAR", "QNT", "INJ", "EOS", "JUP", "MKR", "TRX", "SHIB", "BNB",
+    "NEAR", "QNT", "INJ", "EOS", "JUP", "MKR", "TRX", "SHIB",
 ]
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -56,24 +61,14 @@ def utc_now() -> str:
 
 def default_state() -> dict[str, Any]:
     return {
-        "starting_balance_sek": START_BALANCE_SEK,
-        "cash_sek": START_BALANCE_SEK,
-        "realized_pnl_sek": 0.0,
-        "fees_paid_sek": 0.0,
-        "positions": {},
-        "trades": [],
-        "equity_history": [],
+        "starting_balance_sek": START_BALANCE_SEK, "cash_sek": START_BALANCE_SEK,
+        "realized_pnl_sek": 0.0, "fees_paid_sek": 0.0, "positions": {},
+        "trades": [], "equity_history": [], "last_trade_at": {},
         "day_key": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "day_start_equity_sek": START_BALANCE_SEK,
-        "auto_enabled": False,
-        "risk_halt": False,
-        "last_run": None,
-        "last_success": None,
-        "last_error": None,
-        "cycle_count": 0,
-        "last_signal_count": 0,
-        "last_buy_candidate_count": 0,
-        "unavailable_market_symbols": [],
+        "day_start_equity_sek": START_BALANCE_SEK, "auto_enabled": False,
+        "risk_halt": False, "last_run": None, "last_success": None,
+        "last_error": None, "cycle_count": 0, "last_signal_count": 0,
+        "last_buy_candidate_count": 0, "unavailable_market_symbols": [],
     }
 
 
@@ -88,9 +83,12 @@ def load_state() -> dict[str, Any]:
         pass
     except Exception as exc:
         log.warning("Could not load paper state: %s", exc)
-    for key, fallback in (("positions", {}), ("trades", []), ("equity_history", [])):
+    for key, fallback in (("positions", {}), ("trades", []), ("equity_history", []), ("last_trade_at", {})):
         if not isinstance(base.get(key), type(fallback)):
             base[key] = fallback
+    # Migrate old positions to include a high-water mark for trailing exits.
+    for pos in base["positions"].values():
+        pos.setdefault("high_water_price_sek", float(pos.get("entry_price_sek", 0)))
     return base
 
 
@@ -111,21 +109,16 @@ def save_state() -> None:
 
 
 def check_admin(request: Request) -> None:
-    """Protect manual simulated orders and other sensitive paper actions if configured."""
     expected = os.getenv("PAPER_API_TOKEN", "").strip()
     supplied = request.headers.get("X-Paper-Admin-Token", "").strip()
     if expected and supplied != expected:
-        raise HTTPException(
-            status_code=403,
-            detail="Admin-token saknas eller är fel. Kontrollera PAPER_API_TOKEN i Render.",
-        )
+        raise HTTPException(status_code=403, detail="Admin-token saknas eller är fel.")
 
 
 def public_get(url: str) -> Any:
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "AI-Crypto-Trader-Paper/28.0", "Accept": "application/json"},
-    )
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "AI-Crypto-Trader-Paper/29.0", "Accept": "application/json"
+    })
     with urllib.request.urlopen(req, timeout=8) as response:
         if response.status != 200:
             raise RuntimeError(f"HTTP {response.status}")
@@ -140,6 +133,7 @@ def get_fx_usd_sek() -> tuple[float, bool]:
             return rate, True
     except Exception as exc:
         log.warning("USD/SEK unavailable: %s", exc)
+    # Do not silently pretend fallback FX is live.
     return 10.0, False
 
 
@@ -149,7 +143,6 @@ def get_candles(symbol: str) -> list[list[float]]:
         f"https://api.exchange.coinbase.com/products/{product}/candles?granularity={CANDLE_SECONDS}"
     )
     rows = []
-    # Coinbase returns newest candle first; strategy expects oldest first.
     for row in reversed(raw if isinstance(raw, list) else []):
         if isinstance(row, list) and len(row) >= 6:
             try:
@@ -204,7 +197,7 @@ def analyze_market(symbol: str) -> dict[str, Any]:
     mom1h = pct_change(price, closes[-13])
     trend_up = e9[-1] > e21[-1] and price > e21[-1]
     trend_down = e9[-1] < e21[-1] and price < e21[-1]
-    trend_strong = e21[-1] > e50[-1]
+    medium_up = e21[-1] > e50[-1]
     true_ranges = [
         max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
         for i in range(1, len(candles))
@@ -217,59 +210,42 @@ def analyze_market(symbol: str) -> dict[str, Any]:
 
     score, reasons = 50, []
     if trend_up:
-        score += 18
-        reasons.append("kort trend upp")
+        score += 18; reasons.append("kort trend upp")
     elif trend_down:
-        score -= 18
-        reasons.append("kort trend ned")
-    if trend_strong:
-        score += 12
-        reasons.append("medellång trend upp")
+        score -= 18; reasons.append("kort trend ned")
+    if medium_up:
+        score += 12; reasons.append("medellång trend upp")
     else:
-        score -= 8
-        reasons.append("medellång trend svag")
+        score -= 8; reasons.append("medellång trend svag")
     if mom15 > 0.10:
-        score += 8
-        reasons.append("positivt momentum 15 min")
+        score += 8; reasons.append("positivt momentum 15 min")
     elif mom15 < -0.15:
-        score -= 8
-        reasons.append("negativt momentum 15 min")
+        score -= 8; reasons.append("negativt momentum 15 min")
     if mom1h > 0.20:
-        score += 10
-        reasons.append("positivt momentum 1 timme")
+        score += 10; reasons.append("positivt momentum 1 timme")
     elif mom1h < -0.30:
-        score -= 10
-        reasons.append("negativt momentum 1 timme")
+        score -= 10; reasons.append("negativt momentum 1 timme")
     if rv is not None:
         if 48 <= rv <= 67:
-            score += 8
-            reasons.append("RSI bekräftar momentum")
+            score += 8; reasons.append("RSI bekräftar momentum")
         elif rv >= 74:
-            score -= 12
-            reasons.append("RSI överköpt")
+            score -= 12; reasons.append("RSI överköpt")
         elif rv <= 30:
-            score -= 5
-            reasons.append("RSI översåld — invänta bekräftelse")
+            score -= 5; reasons.append("RSI översåld — invänta bekräftelse")
     if vol_ratio >= 1.15:
-        score += 6
-        reasons.append("volymen ökar")
+        score += 6; reasons.append("volymen ökar")
     elif vol_ratio < 0.35:
-        score -= 5
-        reasons.append("låg relativ volym")
+        score -= 5; reasons.append("låg relativ volym")
     if atr_pct > 3.5:
-        score -= 12
-        reasons.append("hög volatilitet — förhöjd risk")
+        score -= 12; reasons.append("hög volatilitet — förhöjd risk")
     score = max(0, min(100, int(score)))
 
     cost_hurdle = FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT
+    # A deliberately conservative rough movement estimate, not a prediction.
     estimated_move = max(0.0, abs(mom15) * 1.1 + atr_pct * 0.25)
     if estimated_move < cost_hurdle:
-        action = "AVVAKTA"
-        block = f"för liten uppskattad rörelse ({estimated_move:.2f}%) jämfört med kostnader ({cost_hurdle:.2f}%)"
-    elif (
-        score >= MIN_CONFIDENCE and trend_up and mom15 > 0.05 and mom1h > -0.30
-        and (rv if rv is not None else 50) < 72 and atr_pct <= 3.5
-    ):
+        action, block = "AVVAKTA", f"uppskattad rörelse {estimated_move:.2f}% täcker inte kostnadströskeln {cost_hurdle:.2f}%"
+    elif score >= MIN_CONFIDENCE and trend_up and mom15 > 0.05 and mom1h > -0.30 and (rv if rv is not None else 50) < 72 and atr_pct <= 3.5:
         action, block = "KÖP", None
     elif trend_down and score <= 35 and mom1h < 0:
         action, block = "SÄLJ", None
@@ -300,16 +276,17 @@ def equity_snapshot() -> dict[str, Any]:
             )
             value = float(pos.get("quantity", 0)) * float(ticker["price"]) * fx
             pos["last_value_sek"] = value
+            pos["last_price_sek"] = float(ticker["price"]) * fx
         except Exception:
             value = float(pos.get("last_value_sek", 0))
         values[symbol] = value
     cash = float(state.get("cash_sek", START_BALANCE_SEK))
     equity = cash + sum(values.values())
+    start = float(state.get("starting_balance_sek", START_BALANCE_SEK))
     return {
         "cash_sek": round(cash, 2), "positions_value_sek": round(sum(values.values()), 2),
         "equity_sek": round(equity, 2), "realized_pnl_sek": round(float(state.get("realized_pnl_sek", 0)), 2),
-        "total_pnl_sek": round(equity - float(state.get("starting_balance_sek", START_BALANCE_SEK)), 2),
-        "fees_paid_sek": round(float(state.get("fees_paid_sek", 0)), 2),
+        "total_pnl_sek": round(equity - start, 2), "fees_paid_sek": round(float(state.get("fees_paid_sek", 0)), 2),
         "position_values_sek": {k: round(v, 2) for k, v in values.items()},
         "fx_usd_sek": fx, "fx_live": fx_live,
     }
@@ -326,6 +303,8 @@ def check_day() -> None:
 def buy_paper(symbol: str, amount: float, price_usd: float, fx: float, reason: str) -> tuple[bool, str]:
     if symbol in state.get("positions", {}):
         return False, "position finns redan"
+    if len(state.get("positions", {})) >= MAX_OPEN_POSITIONS:
+        return False, "max antal öppna positioner uppnått"
     if amount > MAX_TRADE_SEK or amount > MAX_POSITION_SEK:
         return False, "beloppet överskrider maxgränsen"
     fee = amount * FEE_RATE
@@ -340,8 +319,9 @@ def buy_paper(symbol: str, amount: float, price_usd: float, fx: float, reason: s
     state["fees_paid_sek"] = float(state.get("fees_paid_sek", 0)) + fee
     state.setdefault("positions", {})[symbol] = {
         "quantity": qty, "cost_sek": amount + fee, "entry_price_sek": price_sek,
-        "last_value_sek": amount, "opened_at": utc_now(),
+        "high_water_price_sek": price_sek, "last_value_sek": amount, "opened_at": utc_now(),
     }
+    state.setdefault("last_trade_at", {})[symbol] = time.time()
     state.setdefault("trades", []).append({
         "time": utc_now(), "symbol": symbol, "side": "BUY", "price_sek": round(price_sek, 6),
         "quantity": qty, "gross_sek": round(amount, 2), "fee_sek": round(fee, 2),
@@ -369,6 +349,7 @@ def sell_paper(symbol: str, price_usd: float, fx: float, reason: str) -> tuple[b
         "realized_pnl_sek": round(pnl, 2), "reason": reason,
         "automatic": reason.startswith("paper_auto"),
     })
+    state.setdefault("last_trade_at", {})[symbol] = time.time()
     del state["positions"][symbol]
     return True, f"simulerad försäljning registrerad; resultat {pnl:.2f} kr"
 
@@ -406,26 +387,61 @@ def run_cycle() -> dict[str, Any]:
         try:
             signals, errors = run_scan()
             fx, fx_live = get_fx_usd_sek()
+            snap_before = equity_snapshot()
+            total_loss = float(state.get("starting_balance_sek", START_BALANCE_SEK)) - snap_before["equity_sek"]
+            day_loss = float(state.get("day_start_equity_sek", START_BALANCE_SEK)) - snap_before["equity_sek"]
+            if total_loss >= MAX_TOTAL_LOSS_SEK or day_loss >= MAX_DAILY_LOSS_SEK:
+                state["risk_halt"] = True
+                state["auto_enabled"] = False
+                log.warning("Risk stop reached: total_loss=%.2f day_loss=%.2f", total_loss, day_loss)
+
+            # Manage open positions first. Trailing stop protects part of an unrealized gain.
             for s in signals:
                 symbol = s["symbol"]
-                if symbol in state.get("positions", {}):
-                    pos = state["positions"][symbol]
-                    current_sek = s["price_usd"] * fx
-                    entry = float(pos.get("entry_price_sek", current_sek))
-                    change = ((current_sek / entry) - 1) * 100 if entry else 0
-                    if change <= -STOP_LOSS_PCT or change >= TAKE_PROFIT_PCT or s["signal"] == "SÄLJ":
-                        sell_paper(symbol, s["price_usd"], fx, "paper_auto_exit")
-                elif s["signal"] == "KÖP" and state.get("auto_enabled") and not state.get("risk_halt"):
-                    equity = equity_snapshot()["equity_sek"]
-                    total_loss = float(state.get("starting_balance_sek", START_BALANCE_SEK)) - equity
-                    day_loss = float(state.get("day_start_equity_sek", START_BALANCE_SEK)) - equity
+                if symbol not in state.get("positions", {}):
+                    continue
+                pos = state["positions"][symbol]
+                current_sek = s["price_usd"] * fx
+                entry = float(pos.get("entry_price_sek", current_sek))
+                high = max(float(pos.get("high_water_price_sek", entry)), current_sek)
+                pos["high_water_price_sek"] = high
+                change = ((current_sek / entry) - 1) * 100 if entry else 0
+                drawdown_from_high = ((current_sek / high) - 1) * 100 if high else 0
+                if (change <= -STOP_LOSS_PCT or change >= TAKE_PROFIT_PCT
+                    or drawdown_from_high <= -TRAILING_STOP_PCT or s["signal"] == "SÄLJ"):
+                    reason = "paper_auto_stop_loss" if change <= -STOP_LOSS_PCT else (
+                        "paper_auto_take_profit" if change >= TAKE_PROFIT_PCT else (
+                            "paper_auto_trailing_stop" if drawdown_from_high <= -TRAILING_STOP_PCT else "paper_auto_trend_exit"
+                        )
+                    )
+                    sell_paper(symbol, s["price_usd"], fx, reason)
+
+            # Enter only when the bot is enabled and risk limits have not halted trading.
+            if state.get("auto_enabled") and not state.get("risk_halt"):
+                open_positions = set(state.get("positions", {}))
+                candidates = [s for s in signals if s["signal"] == "KÖP" and s["symbol"] not in open_positions]
+                candidates.sort(key=lambda s: (s["confidence"], s["momentum_1h_pct"], s["volume_ratio"]), reverse=True)
+                for s in candidates:
+                    if len(state.get("positions", {})) >= MAX_OPEN_POSITIONS:
+                        break
+                    if state.get("risk_halt"):
+                        break
+                    symbol = s["symbol"]
+                    last = float(state.get("last_trade_at", {}).get(symbol, 0))
+                    if time.time() - last < COOLDOWN_SECONDS:
+                        continue
+                    # Re-check equity/loss limits before every entry.
+                    snap = equity_snapshot()
+                    total_loss = float(state.get("starting_balance_sek", START_BALANCE_SEK)) - snap["equity_sek"]
+                    day_loss = float(state.get("day_start_equity_sek", START_BALANCE_SEK)) - snap["equity_sek"]
                     if total_loss >= MAX_TOTAL_LOSS_SEK or day_loss >= MAX_DAILY_LOSS_SEK:
                         state["risk_halt"] = True
                         state["auto_enabled"] = False
                         break
                     amount = min(MAX_TRADE_SEK, MAX_POSITION_SEK, float(state.get("cash_sek", 0)) / (1 + FEE_RATE))
-                    if amount >= 1:
+                    if amount >= 10:
                         buy_paper(symbol, amount, s["price_usd"], fx, "paper_auto_entry")
+
             state["last_success"] = utc_now()
             state["last_error"] = None
             state["cycle_count"] = int(state.get("cycle_count", 0)) + 1
@@ -493,7 +509,6 @@ def portfolio_payload() -> dict[str, Any]:
 
 @app.on_event("startup")
 def startup() -> None:
-    # Do not automatically begin trading after a fresh deploy. User can press Start.
     if state.get("auto_enabled"):
         ensure_worker()
 
@@ -522,7 +537,7 @@ def api_status():
     with lock:
         snap = equity_snapshot()
         return {
-            "status": "online", "version": APP_VERSION, "strategy_model": "balanced_entry_cost_aware_paper",
+            "status": "online", "version": APP_VERSION, "strategy_model": "adaptive_momentum_cost_aware_paper",
             "mode": MODE, "real_orders_enabled": False, "auto_enabled": bool(state.get("auto_enabled")),
             "worker_alive": bool(worker_thread and worker_thread.is_alive()), "state_file": STATE_FILE,
             "last_run": state.get("last_run"), "last_success": state.get("last_success"),
@@ -535,7 +550,9 @@ def api_status():
                 "max_position_sek": MAX_POSITION_SEK, "max_daily_loss_sek": MAX_DAILY_LOSS_SEK,
                 "max_total_loss_sek": MAX_TOTAL_LOSS_SEK, "fee_rate_each_side": FEE_RATE,
                 "stop_loss_pct": STOP_LOSS_PCT, "take_profit_pct": TAKE_PROFIT_PCT,
-                "min_confidence": MIN_CONFIDENCE, "estimated_spread_slippage_pct": ESTIMATED_SPREAD_SLIPPAGE_PCT,
+                "trailing_stop_pct": TRAILING_STOP_PCT, "max_open_positions": MAX_OPEN_POSITIONS,
+                "cooldown_seconds": COOLDOWN_SECONDS, "min_confidence": MIN_CONFIDENCE,
+                "estimated_spread_slippage_pct": ESTIMATED_SPREAD_SLIPPAGE_PCT,
             }, **snap,
         }
 
@@ -546,8 +563,9 @@ def auto_status():
     result.update({
         "enabled": bool(state.get("auto_enabled")), "interval_seconds": INTERVAL_SECONDS,
         "daily_trade_limit": "risk-limited", "max_daily_trades": None, "purchase_amount_cap": True,
-        "risk_halt": bool(state.get("risk_halt")), "stop_loss_pct": STOP_LOSS_PCT,
-        "take_profit_pct": TAKE_PROFIT_PCT, "min_confidence": MIN_CONFIDENCE,
+        "risk_halt": bool(state.get("risk_halt")),
+        "stop_loss_pct": STOP_LOSS_PCT, "take_profit_pct": TAKE_PROFIT_PCT,
+        "trailing_stop_pct": TRAILING_STOP_PCT, "min_confidence": MIN_CONFIDENCE,
         "worker": {
             "last_attempt": state.get("last_run"), "last_success": state.get("last_success"),
             "worker_alive": bool(worker_thread and worker_thread.is_alive()),
@@ -603,8 +621,8 @@ def api_history(limit: int = 500):
 def intelligence_status():
     return {
         "enabled": True, "available": True,
-        "message": "Inbyggd regelbaserad multi-factor analys; inte en externt tränad AI-modell.",
-        "model": "balanced_entry_cost_aware_paper", "mode": MODE,
+        "message": "Regelbaserad multi-factor analys; ingen externt tränad AI-modell.",
+        "model": "adaptive_momentum_cost_aware_paper", "mode": MODE,
     }
 
 
@@ -616,8 +634,6 @@ def news_status():
 @app.post("/api/paper/start")
 @app.post("/api/auto/start")
 def paper_start():
-    # Start/stop controls are intentionally token-free because this service is PAPER ONLY.
-    # No real-order endpoints exist in this application.
     with lock:
         state["auto_enabled"] = True
         state["risk_halt"] = False
@@ -628,7 +644,6 @@ def paper_start():
 
 @app.post("/api/auto/stop")
 def auto_stop():
-    # Stop is also token-free so the user can always stop simulated trading from the dashboard.
     with lock:
         state["auto_enabled"] = False
         save_state()
@@ -689,8 +704,6 @@ async def paper_order(request: Request):
 @app.get("/api/export.csv")
 def export_csv(request: Request):
     check_admin(request)
-    import csv
-    import io
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["time", "symbol", "side", "price_sek", "quantity", "gross_sek", "fee_sek", "realized_pnl_sek", "reason"])
@@ -700,7 +713,5 @@ def export_csv(request: Request):
             trade.get("quantity"), trade.get("gross_sek"), trade.get("fee_sek"),
             trade.get("realized_pnl_sek"), trade.get("reason"),
         ])
-    return Response(
-        content=buf.getvalue(), media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="ai-trader-trades.csv"'},
-    )
+    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="ai-trader-trades.csv"'})
