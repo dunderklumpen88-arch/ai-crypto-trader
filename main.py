@@ -350,7 +350,7 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None) ->
         "block_reason": block, "data_source": "Coinbase public candles + technical ensemble",
         "timeframe": "5 min candles; momentum 15 min / 1 timme; BTC/ETH regime filter", "updated_at": utc_now(),
     }
-    def equity_snapshot() -> dict[str, Any]:
+def equity_snapshot() -> dict[str, Any]:
     fx, fx_live = get_fx_usd_sek()
     values = {}
     for symbol, pos in list(state.get("positions", {}).items()):
@@ -547,7 +547,7 @@ def run_cycle() -> dict[str, Any]:
             state["last_error"] = last_error
             save_state()
             raise
-            def worker_loop() -> None:
+def worker_loop() -> None:
     while not stop_event.is_set():
         if state.get("auto_enabled"):
             try:
