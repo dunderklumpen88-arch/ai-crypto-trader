@@ -1,4 +1,4 @@
-"""AI Crypto Trader v30 — PAPER ONLY. Simulated trading only; no real exchange orders."""
+"""AI Crypto Trader v31 — PAPER ONLY. Simulated trading only; no real exchange orders."""
 from __future__ import annotations
 
 import csv
@@ -32,7 +32,7 @@ except Exception as exc:
     collect_provider_status = None
     logging.getLogger("ai-trader").warning("Trader Intelligence unavailable: %s", exc)
 
-APP_VERSION = "30.0.0-ensemble-paper"
+APP_VERSION = "31.0.0-active-ensemble-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -44,11 +44,11 @@ MAX_DAILY_LOSS_SEK = float(os.getenv("MAX_DAILY_LOSS_SEK", "75"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.005"))
 ESTIMATED_SPREAD_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SPREAD_SLIPPAGE_PCT", "0.20"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "60"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "56"))
 INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3.0"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "2.0"))
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "300"))
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "240"))
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/ai_trader_paper_state.json")
 PRODUCT_SUFFIX = "-USD"
 CANDLE_SECONDS = 300
@@ -131,7 +131,7 @@ def check_admin(request: Request) -> None:
 
 def public_get(url: str) -> Any:
     req = urllib.request.Request(url, headers={
-        "User-Agent": "AI-Crypto-Trader-Paper/30.0", "Accept": "application/json"
+        "User-Agent": "AI-Crypto-Trader-Paper/31.0", "Accept": "application/json"
     })
     with urllib.request.urlopen(req, timeout=8) as response:
         if response.status != 200:
@@ -282,20 +282,59 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None) ->
         except Exception as exc:
             market_filter = {"status": "error", "veto_buy": False, "reason": str(exc)[:120]}
 
+    # Active ensemble: use the actual indicator names returned by worker.py.
+    indicators = advanced.get("indicators", {}) or {}
+    macd_positive = (
+        indicators.get("macd_histogram_rising") is True
+        and float(indicators.get("macd_histogram", 0) or 0) > 0
+    )
+    aligned_up = indicators.get("multi_timeframe_aligned_up") is True
+    if macd_positive:
+        score += 4
+        reasons.append("MACD bekräftar förbättrat momentum")
+    if aligned_up:
+        score += 4
+        reasons.append("15m och 1h bekräftar upptrend")
+
     score = max(0, min(100, int(score)))
     cost_hurdle = FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT
-    # Only positive momentum counts toward the rough expected-move hurdle.
+    # Expected move is a rough filter, not a prediction or profit guarantee.
     estimated_move = max(0.0, mom15 * 1.1 + atr_pct * 0.25)
-    if estimated_move < cost_hurdle:
-        action, block = "AVVAKTA", f"uppskattad rörelse {estimated_move:.2f}% täcker inte kostnadströskeln {cost_hurdle:.2f}%"
-    elif market_filter.get("veto_buy"):
-        action, block = "AVVAKTA", "BTC/ETH visar samstämmig nedtrend"
-    elif score >= MIN_CONFIDENCE and trend_up and mom15 > 0.05 and mom1h > -0.30 and (rv if rv is not None else 50) < 72 and atr_pct <= 3.5:
-        action, block = "KÖP", None
-    elif trend_down and score <= 35 and mom1h < 0:
+
+    # A held position can be sold on a genuine down signal even when a new
+    # entry would not clear the estimated transaction-cost hurdle.
+    sell_ready = (
+        trend_down
+        and mom1h < -0.10
+        and (score <= 43 or indicators.get("macd_cross_down") is True)
+    )
+    trend_confirmed = trend_up or (medium_up and macd_positive)
+    momentum_confirmed = mom15 > 0.025 and mom1h > -0.35
+    rsi_ok = (rv if rv is not None else 50) < 74
+    volatility_ok = atr_pct <= 3.5
+    buy_ready = (
+        score >= MIN_CONFIDENCE
+        and trend_confirmed
+        and momentum_confirmed
+        and rsi_ok
+        and volatility_ok
+    )
+    if market_filter.get("veto_buy"):
+        buy_ready = False
+
+    if sell_ready:
         action, block = "SÄLJ", None
+    elif estimated_move < cost_hurdle:
+        action, block = "AVVAKTA", (
+            f"uppskattad rörelse {estimated_move:.2f}% täcker inte "
+            f"kostnadströskeln {cost_hurdle:.2f}%"
+        )
+    elif market_filter.get("veto_buy") and buy_ready is False:
+        action, block = "AVVAKTA", "BTC/ETH visar samstämmig nedtrend"
+    elif buy_ready:
+        action, block = "KÖP", None
     else:
-        action, block = "AVVAKTA", "trend och momentum bekräftar inte köp samtidigt"
+        action, block = "AVVAKTA", "invaktar trend-, momentum- och kostnadsbekräftelse"
 
     return {
         "symbol": symbol, "product_id": symbol + PRODUCT_SUFFIX, "price_usd": round(price, 10),
@@ -311,9 +350,7 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None) ->
         "block_reason": block, "data_source": "Coinbase public candles + technical ensemble",
         "timeframe": "5 min candles; momentum 15 min / 1 timme; BTC/ETH regime filter", "updated_at": utc_now(),
     }
-
-
-def equity_snapshot() -> dict[str, Any]:
+    def equity_snapshot() -> dict[str, Any]:
     fx, fx_live = get_fx_usd_sek()
     values = {}
     for symbol, pos in list(state.get("positions", {}).items()):
@@ -463,7 +500,7 @@ def run_cycle() -> dict[str, Any]:
                 atr = float(s.get("atr_pct", 0) or 0)
                 trail_pct = max(1.2, min(3.0, atr * 1.25 if atr > 0 else TRAILING_STOP_PCT))
                 stop_hit = change <= -STOP_LOSS_PCT
-                trail_hit = peak_gain >= 2.5 and drawdown <= -trail_pct
+                trail_hit = peak_gain >= 2.0 and drawdown <= -trail_pct
                 trend_exit = s["signal"] == "SÄLJ" and change > -STOP_LOSS_PCT
                 if stop_hit or trail_hit or trend_exit:
                     reason = "paper_auto_stop_loss" if stop_hit else ("paper_auto_trailing_stop" if trail_hit else "paper_auto_trend_exit")
@@ -510,9 +547,7 @@ def run_cycle() -> dict[str, Any]:
             state["last_error"] = last_error
             save_state()
             raise
-
-
-def worker_loop() -> None:
+            def worker_loop() -> None:
     while not stop_event.is_set():
         if state.get("auto_enabled"):
             try:
