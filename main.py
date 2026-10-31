@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import math
@@ -32,7 +33,7 @@ except Exception as exc:
     collect_provider_status = None
     logging.getLogger("ai-trader").warning("Trader Intelligence unavailable: %s", exc)
 
-APP_VERSION = "31.0.0-active-ensemble-paper"
+APP_VERSION = "32.0.0-dynamic-markets-hold-confirm-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -49,15 +50,27 @@ INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3.0"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "2.0"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "240"))
+MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "900"))
+TREND_EXIT_CONFIRMATIONS = max(1, int(os.getenv("TREND_EXIT_CONFIRMATIONS", "3")))
+TRAIL_ACTIVATION_PCT = float(os.getenv("TRAIL_ACTIVATION_PCT", "3.0"))
+MAX_SCAN_MARKETS = max(10, min(100, int(os.getenv("MAX_SCAN_MARKETS", "50"))))
+MARKET_DISCOVERY_CACHE_SECONDS = max(300, int(os.getenv("MARKET_DISCOVERY_CACHE_SECONDS", "1800")))
+MIN_24H_QUOTE_VOLUME_USD = max(0.0, float(os.getenv("MIN_24H_QUOTE_VOLUME_USD", "100000")))
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/ai_trader_paper_state.json")
 PRODUCT_SUFFIX = "-USD"
 CANDLE_SECONDS = 300
 CANDLE_LIMIT = 120
-SYMBOLS = [
+BASE_SYMBOLS = [
     "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LINK", "AVAX", "DOT",
     "LTC", "BCH", "ATOM", "UNI", "AAVE", "XLM", "ETC", "FIL", "HBAR",
     "NEAR", "QNT", "INJ", "EOS", "JUP", "MKR", "TRX", "SHIB",
 ]
+STABLE_OR_FIAT_SYMBOLS = {
+    "USDC", "USDT", "DAI", "USDP", "GUSD", "PAX", "PYUSD", "EURC",
+    "EUR", "GBP", "CAD", "AUD", "SGD", "USD", "RLUSD", "USD1",
+}
+SYMBOLS = list(BASE_SYMBOLS)
+_market_cache: dict[str, Any] = {"symbols": [], "details": [], "at": 0.0}
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ai-trader")
@@ -156,6 +169,96 @@ def get_fx_usd_sek() -> tuple[float, bool]:
     if cached and age < 86400:
         return float(cached), False
     return 10.0, False
+
+
+def _market_stats(product_id: str) -> tuple[str, float]:
+    """Approximate 24h quote volume in USD for a Coinbase product."""
+    try:
+        stats = public_get(
+            f"https://api.exchange.coinbase.com/products/{urllib.parse.quote(product_id, safe='-')}/stats"
+        )
+        volume = float(stats.get("volume", 0) or 0)
+        last = float(stats.get("last", 0) or 0)
+        quote_volume = volume * last
+        if not math.isfinite(quote_volume) or quote_volume < 0:
+            quote_volume = 0.0
+        return product_id, quote_volume
+    except Exception as exc:
+        log.debug("Market stats unavailable for %s: %s", product_id, exc)
+        return product_id, 0.0
+
+
+def get_available_symbols(force: bool = False) -> list[str]:
+    """Discover active Coinbase USD spot markets, rank by 24h quote volume, cache."""
+    global SYMBOLS
+    now = time.time()
+    cached_symbols = _market_cache.get("symbols") or []
+    if not force and cached_symbols and now - float(_market_cache.get("at", 0)) < MARKET_DISCOVERY_CACHE_SECONDS:
+        held = list(state.get("positions", {}).keys()) if "state" in globals() else []
+        SYMBOLS = list(dict.fromkeys(cached_symbols + held))
+        return SYMBOLS
+
+    try:
+        products = public_get("https://api.exchange.coinbase.com/products")
+        eligible = []
+        for product in products if isinstance(products, list) else []:
+            if not isinstance(product, dict):
+                continue
+            base = str(product.get("base_currency", "")).upper()
+            quote = str(product.get("quote_currency", "")).upper()
+            product_id = str(product.get("id", ""))
+            status = str(product.get("status", "")).lower()
+            if (
+                not base or quote != "USD" or not product_id.endswith("-USD")
+                or status not in ("online", "")
+                or product.get("trading_disabled") is True
+                or product.get("cancel_only") is True
+                or product.get("post_only") is True
+                or base in STABLE_OR_FIAT_SYMBOLS
+            ):
+                continue
+            eligible.append((base, product_id))
+
+        by_symbol = {base: pid for base, pid in eligible}
+        ordered = [(base, by_symbol.pop(base)) for base in BASE_SYMBOLS if base in by_symbol]
+        ordered.extend((base, pid) for base, pid in by_symbol.items())
+        ordered = ordered[:180]
+
+        ranked = []
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {pool.submit(_market_stats, pid): (base, pid) for base, pid in ordered}
+            for future in as_completed(futures):
+                base, pid = futures[future]
+                try:
+                    _, quote_volume = future.result()
+                except Exception:
+                    quote_volume = 0.0
+                if quote_volume >= MIN_24H_QUOTE_VOLUME_USD:
+                    ranked.append((base, quote_volume))
+
+        ranked.sort(key=lambda item: item[1], reverse=True)
+        discovered = [symbol for symbol, _ in ranked[:MAX_SCAN_MARKETS]]
+        held = list(state.get("positions", {}).keys()) if "state" in globals() else []
+        result = list(dict.fromkeys(discovered + held))
+        if not result:
+            result = list(BASE_SYMBOLS)
+
+        _market_cache.update({
+            "symbols": discovered or list(BASE_SYMBOLS),
+            "details": [
+                {"symbol": symbol, "quote_volume_24h_usd": round(volume, 2)}
+                for symbol, volume in ranked[:MAX_SCAN_MARKETS]
+            ],
+            "at": now,
+        })
+        SYMBOLS = result
+        log.info("Coinbase discovery selected %s markets (cap=%s)", len(SYMBOLS), MAX_SCAN_MARKETS)
+        return SYMBOLS
+    except Exception as exc:
+        log.warning("Coinbase market discovery failed; using fallback list: %s", exc)
+        held = list(state.get("positions", {}).keys()) if "state" in globals() else []
+        SYMBOLS = list(dict.fromkeys(BASE_SYMBOLS + held))
+        return SYMBOLS
 
 
 def get_candles(symbol: str) -> list[list[float]]:
@@ -454,16 +557,27 @@ def dashboard_signals(signals: list[dict[str, Any]], errors: list[dict[str, str]
 def run_scan() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     signals, errors = [], []
     market_context = None
+    symbols = get_available_symbols()
     if collect_market_signals is not None:
         try:
             market_context = collect_market_signals()
         except Exception as exc:
             errors.append({"symbol": "BTC/ETH_INTEL", "error": str(exc)[:180]})
-    for symbol in SYMBOLS:
-        try:
-            signals.append(analyze_market(symbol, market_context))
-        except Exception as exc:
-            errors.append({"symbol": symbol, "error": str(exc)[:180]})
+
+    # Bounded concurrency keeps a larger market universe practical.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(analyze_market, symbol, market_context): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                signals.append(future.result())
+            except Exception as exc:
+                errors.append({"symbol": symbol, "error": str(exc)[:180]})
+
+    signals.sort(
+        key=lambda item: (item.get("confidence", 0), item.get("momentum_1h_pct", 0), item.get("volume_ratio", 0)),
+        reverse=True,
+    )
     if not signals:
         raise RuntimeError("Ingen marknadsdata tillgänglig: " + "; ".join(e["symbol"] + ": " + e["error"] for e in errors[:5]))
     return signals, errors
@@ -500,10 +614,30 @@ def run_cycle() -> dict[str, Any]:
                 atr = float(s.get("atr_pct", 0) or 0)
                 trail_pct = max(1.2, min(3.0, atr * 1.25 if atr > 0 else TRAILING_STOP_PCT))
                 stop_hit = change <= -STOP_LOSS_PCT
-                trail_hit = peak_gain >= 2.0 and drawdown <= -trail_pct
-                trend_exit = s["signal"] == "SÄLJ" and change > -STOP_LOSS_PCT
+                trail_hit = peak_gain >= TRAIL_ACTIVATION_PCT and drawdown <= -trail_pct
+
+                # One noisy sell signal no longer closes a position immediately.
+                if s["signal"] == "SÄLJ":
+                    pos["sell_signal_count"] = int(pos.get("sell_signal_count", 0)) + 1
+                else:
+                    pos["sell_signal_count"] = 0
+                try:
+                    opened_ts = datetime.fromisoformat(
+                        str(pos.get("opened_at", "")).replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    opened_ts = time.time()
+                held_seconds = max(0.0, time.time() - opened_ts)
+                trend_exit = (
+                    held_seconds >= MIN_HOLD_SECONDS
+                    and int(pos.get("sell_signal_count", 0)) >= TREND_EXIT_CONFIRMATIONS
+                    and change > -STOP_LOSS_PCT
+                )
                 if stop_hit or trail_hit or trend_exit:
-                    reason = "paper_auto_stop_loss" if stop_hit else ("paper_auto_trailing_stop" if trail_hit else "paper_auto_trend_exit")
+                    reason = (
+                        "paper_auto_stop_loss" if stop_hit
+                        else ("paper_auto_trailing_stop" if trail_hit else "paper_auto_confirmed_trend_exit")
+                    )
                     sell_paper(symbol, s["price_usd"], fx, reason)
 
             if state.get("auto_enabled") and not state.get("risk_halt"):
@@ -587,6 +721,10 @@ def portfolio_payload() -> dict[str, Any]:
 
 @app.on_event("startup")
 def startup() -> None:
+    try:
+        get_available_symbols(force=True)
+    except Exception as exc:
+        log.warning("Initial market discovery skipped: %s", exc)
     if state.get("auto_enabled"):
         ensure_worker()
 
@@ -631,6 +769,12 @@ def api_status():
                 "stop_loss_pct": STOP_LOSS_PCT, "trailing_stop_pct": TRAILING_STOP_PCT,
                 "max_open_positions": MAX_OPEN_POSITIONS, "cooldown_seconds": COOLDOWN_SECONDS,
                 "min_confidence": MIN_CONFIDENCE, "estimated_spread_slippage_pct": ESTIMATED_SPREAD_SLIPPAGE_PCT,
+                "max_scan_markets": MAX_SCAN_MARKETS,
+                "min_24h_quote_volume_usd": MIN_24H_QUOTE_VOLUME_USD,
+                "market_discovery_cache_seconds": MARKET_DISCOVERY_CACHE_SECONDS,
+                "min_hold_seconds": MIN_HOLD_SECONDS,
+                "trend_exit_confirmations": TREND_EXIT_CONFIRMATIONS,
+                "trailing_activation_pct": TRAIL_ACTIVATION_PCT,
             }, **snap,
         }
 
@@ -655,6 +799,23 @@ def auto_status():
 def paper_status():
     with lock:
         return portfolio_payload()
+
+
+@app.get("/api/markets")
+def api_markets(refresh: bool = False):
+    symbols = get_available_symbols(force=refresh)
+    return {
+        "mode": MODE,
+        "real_orders_enabled": False,
+        "count": len(symbols),
+        "max_scan_markets": MAX_SCAN_MARKETS,
+        "min_24h_quote_volume_usd": MIN_24H_QUOTE_VOLUME_USD,
+        "discovery_cache_seconds": MARKET_DISCOVERY_CACHE_SECONDS,
+        "symbols": symbols,
+        "ranked_markets": _market_cache.get("details", []),
+        "updated_at": datetime.fromtimestamp(float(_market_cache.get("at", 0)), timezone.utc).isoformat()
+            if _market_cache.get("at") else None,
+    }
 
 
 @app.get("/api/market")
@@ -761,8 +922,10 @@ async def paper_order(request: Request):
         amount = float(body.get("amount_sek", 0))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Beloppet måste vara ett tal.")
-    if symbol not in SYMBOLS:
-        raise HTTPException(status_code=400, detail="Valutan stöds inte.")
+    allowed_symbols = set(get_available_symbols())
+    allowed_symbols.update(state.get("positions", {}).keys())
+    if symbol not in allowed_symbols:
+        raise HTTPException(status_code=400, detail="Valutan stöds inte eller är inte en aktiv Coinbase USD-marknad.")
     if side not in ("buy", "sell"):
         raise HTTPException(status_code=400, detail="Sidan måste vara buy eller sell.")
     if not math.isfinite(amount) or amount < 1 or amount > MAX_TRADE_SEK:
