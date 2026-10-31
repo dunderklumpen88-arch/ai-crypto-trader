@@ -33,7 +33,7 @@ except Exception as exc:
     collect_provider_status = None
     logging.getLogger("ai-trader").warning("Trader Intelligence unavailable: %s", exc)
 
-APP_VERSION = "32.0.0-dynamic-markets-hold-confirm-paper"
+APP_VERSION = "33.0.0-adaptive-multitimeframe-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -45,7 +45,7 @@ MAX_DAILY_LOSS_SEK = float(os.getenv("MAX_DAILY_LOSS_SEK", "75"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.005"))
 ESTIMATED_SPREAD_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SPREAD_SLIPPAGE_PCT", "0.20"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "56"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "52"))
 INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3.0"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "2.0"))
@@ -402,7 +402,7 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None) ->
     score = max(0, min(100, int(score)))
     cost_hurdle = FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT
     # Expected move is a rough filter, not a prediction or profit guarantee.
-    estimated_move = max(0.0, mom15 * 1.1 + atr_pct * 0.25)
+    estimated_move = max(0.0, mom15 * 1.1 + mom1h * 0.15 + atr_pct * 0.25)
 
     # A held position can be sold on a genuine down signal even when a new
     # entry would not clear the estimated transaction-cost hurdle.
@@ -412,9 +412,9 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None) ->
         and (score <= 43 or indicators.get("macd_cross_down") is True)
     )
     trend_confirmed = trend_up or (medium_up and macd_positive)
-    momentum_confirmed = mom15 > 0.025 and mom1h > -0.35
-    rsi_ok = (rv if rv is not None else 50) < 74
-    volatility_ok = atr_pct <= 3.5
+    momentum_confirmed = mom15 > -0.05 and mom1h > -0.45
+    rsi_ok = (rv if rv is not None else 50) < 78
+    volatility_ok = atr_pct <= 4.0
     buy_ready = (
         score >= MIN_CONFIDENCE
         and trend_confirmed
@@ -754,7 +754,7 @@ def api_status():
         snap = equity_snapshot()
         return {
             "status": "online", "version": APP_VERSION,
-            "strategy_model": "ensemble_momentum_cost_aware_regime_paper",
+            "strategy_model": "adaptive_multitimeframe_cost_aware_paper",
             "mode": MODE, "real_orders_enabled": False, "auto_enabled": bool(state.get("auto_enabled")),
             "worker_alive": bool(worker_thread and worker_thread.is_alive()), "state_file": STATE_FILE,
             "last_run": state.get("last_run"), "last_success": state.get("last_success"),
@@ -857,7 +857,7 @@ def intelligence_status():
         "enabled": analyze_advanced is not None,
         "available": analyze_advanced is not None,
         "message": "Teknisk indikator-ensemble och BTC/ETH-filter; ingen tränad AI-modell påstås.",
-        "model": "ensemble_momentum_cost_aware_regime_paper",
+        "model": "adaptive_multitimeframe_cost_aware_paper",
         "advanced_engine_available": analyze_advanced is not None,
         "market_context_available": collect_market_signals is not None,
         "mode": MODE, "real_orders_enabled": False,
