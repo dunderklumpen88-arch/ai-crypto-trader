@@ -33,7 +33,7 @@ except Exception as exc:
     collect_provider_status = None
     logging.getLogger("ai-trader").warning("Trader Intelligence unavailable: %s", exc)
 
-APP_VERSION = "33.0.0-adaptive-multitimeframe-paper"
+APP_VERSION = "34.0.0-adaptive-entry-autostart-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -45,7 +45,7 @@ MAX_DAILY_LOSS_SEK = float(os.getenv("MAX_DAILY_LOSS_SEK", "75"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.005"))
 ESTIMATED_SPREAD_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SPREAD_SLIPPAGE_PCT", "0.20"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "52"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "48"))
 INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3.0"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "2.0"))
@@ -402,19 +402,21 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None) ->
     score = max(0, min(100, int(score)))
     cost_hurdle = FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT
     # Expected move is a rough filter, not a prediction or profit guarantee.
-    estimated_move = max(0.0, mom15 * 1.1 + mom1h * 0.15 + atr_pct * 0.25)
+    estimated_move = max(0.0, mom15 * 1.35 + mom1h * 0.20 + atr_pct * 0.30)
 
     # A held position can be sold on a genuine down signal even when a new
     # entry would not clear the estimated transaction-cost hurdle.
     sell_ready = (
         trend_down
-        and mom1h < -0.10
-        and (score <= 43 or indicators.get("macd_cross_down") is True)
+        and mom1h < -0.05
+        and (score <= 48 or indicators.get("macd_cross_down") is True)
     )
-    trend_confirmed = trend_up or (medium_up and macd_positive)
-    momentum_confirmed = mom15 > -0.05 and mom1h > -0.45
-    rsi_ok = (rv if rv is not None else 50) < 78
-    volatility_ok = atr_pct <= 4.0
+    # More permissive entry ensemble: accept a medium trend or a MACD-confirmed
+    # recovery, while still requiring the market-wide BTC/ETH veto to pass.
+    trend_confirmed = trend_up or medium_up or (macd_positive and mom1h > 0)
+    momentum_confirmed = mom15 > -0.15 and mom1h > -0.60
+    rsi_ok = (rv if rv is not None else 50) < 80
+    volatility_ok = atr_pct <= 5.0
     buy_ready = (
         score >= MIN_CONFIDENCE
         and trend_confirmed
@@ -725,7 +727,11 @@ def startup() -> None:
         get_available_symbols(force=True)
     except Exception as exc:
         log.warning("Initial market discovery skipped: %s", exc)
-    if state.get("auto_enabled"):
+    # Start simulated trading automatically after deployment. The hard guard
+    # ensures this application can never submit real exchange orders.
+    if not REAL_ORDERS_ENABLED and MODE == "PAPER ONLY" and not state.get("risk_halt"):
+        state["auto_enabled"] = True
+        save_state()
         ensure_worker()
 
 
