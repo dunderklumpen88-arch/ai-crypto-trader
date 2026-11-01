@@ -33,7 +33,7 @@ except Exception as exc:
     collect_provider_status = None
     logging.getLogger("ai-trader").warning("Trader Intelligence unavailable: %s", exc)
 
-APP_VERSION = "35.0.0-cost-aware-profit-exit-paper"
+APP_VERSION = "36.0.0-cryptoquant-market-intelligence-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -83,6 +83,119 @@ stop_event = threading.Event()
 last_scan: dict[str, Any] = {"signals": [], "updated_at": None, "errors": []}
 last_error: str | None = None
 _fx_cache: dict[str, Any] = {"rate": None, "at": 0.0}
+
+# CryptoQuant market intelligence (read-only). Cached for one hour to keep
+# API credit usage modest. Missing/invalid keys never stop the trading bot.
+CRYPTOQUANT_API_KEY = os.getenv("CRYPTOQUANT_API_KEY", "").strip()
+CRYPTOQUANT_CACHE_SECONDS = max(900, int(os.getenv("CRYPTOQUANT_CACHE_SECONDS", "3600")))
+_cryptoquant_cache: dict[str, Any] = {"at": 0.0, "data": None}
+_cryptoquant_lock = threading.Lock()
+
+def _cq_get_metric(metric: str) -> dict[str, Any]:
+    if not CRYPTOQUANT_API_KEY:
+        raise RuntimeError("CRYPTOQUANT_API_KEY saknas")
+    query = urllib.parse.urlencode({"exchange": "all_exchange", "window": "day", "limit": 2})
+    url = f"https://api.cryptoquant.com/v1/btc/market-data/{metric}?{query}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {CRYPTOQUANT_API_KEY}",
+        "User-Agent": "AI-Crypto-Trader-Paper/36.0",
+        "Accept": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    status = payload.get("status", {}) if isinstance(payload, dict) else {}
+    if status and int(status.get("code", 200)) != 200:
+        raise RuntimeError(str(status.get("message", "CryptoQuant API-fel"))[:160])
+    rows = payload.get("result", {}).get("data", []) if isinstance(payload, dict) else []
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"CryptoQuant saknar data för {metric}")
+    return {"latest": rows[0], "previous": rows[1] if len(rows) > 1 else None}
+
+def _cq_number(row: Any, keys: tuple[str, ...]) -> float | None:
+    if not isinstance(row, dict):
+        return None
+    for key in keys:
+        value = row.get(key)
+        try:
+            number = float(value)
+            if math.isfinite(number):
+                return number
+        except (TypeError, ValueError):
+            continue
+    return None
+
+def collect_cryptoquant_context(force: bool = False) -> dict[str, Any]:
+    """Fetch BTC derivatives metrics once per cache window; never places orders."""
+    now = time.time()
+    cached = _cryptoquant_cache.get("data")
+    if not force and cached is not None and now - float(_cryptoquant_cache.get("at", 0)) < CRYPTOQUANT_CACHE_SECONDS:
+        return cached
+    if not CRYPTOQUANT_API_KEY:
+        return {"enabled": False, "available": False, "status": "not_configured",
+                "message": "Lägg till CRYPTOQUANT_API_KEY som Render Secret för att aktivera CryptoQuant.",
+                "score_adjustment": 0, "metrics": {}}
+
+    with _cryptoquant_lock:
+        # Re-check after acquiring lock; concurrent scans should share one fetch.
+        cached = _cryptoquant_cache.get("data")
+        if not force and cached is not None and time.time() - float(_cryptoquant_cache.get("at", 0)) < CRYPTOQUANT_CACHE_SECONDS:
+            return cached
+        metrics: dict[str, Any] = {}
+        errors: list[str] = []
+        for metric in ("open-interest", "funding-rates", "taker-buy-sell-stats", "liquidations"):
+            try:
+                metrics[metric] = _cq_get_metric(metric)
+            except Exception as exc:
+                errors.append(f"{metric}: {str(exc)[:120]}")
+        if not metrics:
+            result = {"enabled": True, "available": False, "status": "error",
+                      "message": "; ".join(errors)[:300] or "Ingen CryptoQuant-data",
+                      "score_adjustment": 0, "metrics": {}}
+        else:
+            oi = metrics.get("open-interest", {})
+            oi_now = _cq_number(oi.get("latest"), ("open_interest",))
+            oi_prev = _cq_number(oi.get("previous"), ("open_interest",))
+            oi_change = ((oi_now / oi_prev) - 1.0) * 100.0 if oi_now is not None and oi_prev not in (None, 0) else None
+            funding = metrics.get("funding-rates", {})
+            funding_now = _cq_number(funding.get("latest"), ("funding_rates",))
+            taker = metrics.get("taker-buy-sell-stats", {})
+            taker_ratio = _cq_number(taker.get("latest"), ("taker_buy_sell_ratio",))
+            if taker_ratio is None:
+                buy_ratio = _cq_number(taker.get("latest"), ("taker_buy_ratio",))
+                taker_ratio = (buy_ratio / (1.0 - buy_ratio)) if buy_ratio is not None and 0 < buy_ratio < 1 else None
+
+            adjustment = 0
+            reasons: list[str] = []
+            # Extreme positive funding can indicate crowded longs; negative funding
+            # is only a small contrarian tailwind, never a standalone buy signal.
+            if funding_now is not None and funding_now >= 0.05:
+                adjustment -= 2; reasons.append("CryptoQuant: hög positiv funding – trång long-positionering")
+            elif funding_now is not None and funding_now <= -0.05:
+                adjustment += 1; reasons.append("CryptoQuant: negativ funding – möjlig short-tyngd")
+            if taker_ratio is not None and taker_ratio >= 1.05:
+                adjustment += 2; reasons.append("CryptoQuant: taker-köpare dominerar")
+            elif taker_ratio is not None and taker_ratio <= 0.95:
+                adjustment -= 2; reasons.append("CryptoQuant: taker-säljare dominerar")
+            if oi_change is not None and oi_change >= 3.0 and taker_ratio is not None:
+                if taker_ratio >= 1.05:
+                    adjustment += 1; reasons.append("CryptoQuant: stigande open interest med köptryck")
+                elif taker_ratio <= 0.95:
+                    adjustment -= 1; reasons.append("CryptoQuant: stigande open interest med säljtryck")
+            adjustment = max(-3, min(3, adjustment))
+            result = {
+                "enabled": True, "available": True, "status": "partial" if errors else "ok",
+                "message": "BTC-derivatdata från CryptoQuant" if not errors else "Vissa CryptoQuant-mått kunde inte hämtas: " + "; ".join(errors)[:220],
+                "updated_at": utc_now(), "score_adjustment": adjustment, "reasons": reasons,
+                "metrics": {
+                    "btc_open_interest": oi_now, "btc_open_interest_change_pct": round(oi_change, 3) if oi_change is not None else None,
+                    "btc_funding_rate": funding_now, "btc_taker_buy_sell_ratio": taker_ratio,
+                    "liquidations_latest": metrics.get("liquidations", {}).get("latest"),
+                },
+                "data_points": {name: value.get("latest", {}) for name, value in metrics.items()},
+                "errors": errors,
+            }
+        _cryptoquant_cache.update({"at": time.time(), "data": result})
+        return result
 
 
 def utc_now() -> str:
@@ -308,7 +421,7 @@ def pct_change(new: float, old: float) -> float:
     return (new / old - 1.0) * 100.0 if old else 0.0
 
 
-def analyze_market(symbol: str, market_context: dict[str, Any] | None = None) -> dict[str, Any]:
+def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cryptoquant_context: dict[str, Any] | None = None) -> dict[str, Any]:
     candles = get_candles(symbol)
     if len(candles) < 55:
         raise RuntimeError(f"not_enough_candles:{len(candles)}")
@@ -401,6 +514,15 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None) ->
         score += 4
         reasons.append("15m och 1h bekräftar upptrend")
 
+    # CryptoQuant is a small BTC derivatives overlay for the whole market.
+    # It cannot bypass the existing technical, cost or BTC/ETH entry filters.
+    cq_adjustment = 0
+    if cryptoquant_context and cryptoquant_context.get("available"):
+        cq_adjustment = int(max(-3, min(3, cryptoquant_context.get("score_adjustment", 0) or 0)))
+        score += cq_adjustment * 2
+        if cq_adjustment:
+            reasons.extend(cryptoquant_context.get("reasons", [])[:3])
+
     score = max(0, min(100, int(score)))
     cost_hurdle = MIN_NET_EXIT_PCT
     # Expected move is a rough filter, not a prediction or profit guarantee.
@@ -453,6 +575,8 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None) ->
         "estimated_move_pct": round(estimated_move, 3), "cost_hurdle_pct": round(cost_hurdle, 3),
         "advanced_score_adjustment": advanced.get("score_adjustment", 0),
         "advanced_indicators": advanced.get("indicators", {}), "market_filter": market_filter,
+        "cryptoquant_score_adjustment": cq_adjustment,
+        "cryptoquant_status": (cryptoquant_context or {}).get("status", "not_available"),
         "reasons": reasons, "reason": "; ".join(reasons) if reasons else "ingen tydlig signal",
         "block_reason": block, "data_source": "Coinbase public candles + technical ensemble",
         "timeframe": "5 min candles; momentum 15 min / 1 timme; BTC/ETH regime filter", "updated_at": utc_now(),
@@ -552,7 +676,8 @@ def dashboard_signals(signals: list[dict[str, Any]], errors: list[dict[str, str]
         "status": "ok", "version": APP_VERSION, "mode": MODE, "real_orders_enabled": False,
         "updated_at": utc_now(), "count": len(signals), "signals": signals, "errors": errors,
         "prices_sek": {s["symbol"]: round(s["price_usd"] * fx, 6) for s in signals},
-        "market_source": "Coinbase public candles", "fx_usd_sek": fx, "fx_live": fx_live,
+        "market_source": "Coinbase public candles + CryptoQuant BTC derivatives (when configured)",
+        "cryptoquant": collect_cryptoquant_context(), "fx_usd_sek": fx, "fx_live": fx_live,
     }
     last_scan = result
     return result
@@ -561,6 +686,7 @@ def dashboard_signals(signals: list[dict[str, Any]], errors: list[dict[str, str]
 def run_scan() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     signals, errors = [], []
     market_context = None
+    cryptoquant_context = collect_cryptoquant_context()
     symbols = get_available_symbols()
     if collect_market_signals is not None:
         try:
@@ -570,7 +696,7 @@ def run_scan() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
 
     # Bounded concurrency keeps a larger market universe practical.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(analyze_market, symbol, market_context): symbol for symbol in symbols}
+        futures = {pool.submit(analyze_market, symbol, market_context, cryptoquant_context): symbol for symbol in symbols}
         for future in as_completed(futures):
             symbol = futures[future]
             try:
@@ -870,6 +996,8 @@ def intelligence_status():
         "model": "adaptive_multitimeframe_cost_aware_paper",
         "advanced_engine_available": analyze_advanced is not None,
         "market_context_available": collect_market_signals is not None,
+        "cryptoquant_available": bool(CRYPTOQUANT_API_KEY),
+        "cryptoquant_status_endpoint": "/api/cryptoquant/status",
         "mode": MODE, "real_orders_enabled": False,
     }
 
@@ -885,6 +1013,14 @@ def intelligence_providers():
     result["mode"] = MODE
     result["real_orders_enabled"] = False
     return result
+
+
+@app.get("/api/cryptoquant/status")
+def cryptoquant_status(refresh: bool = False):
+    result = collect_cryptoquant_context(force=refresh)
+    return {**result, "mode": MODE, "real_orders_enabled": False,
+            "cache_seconds": CRYPTOQUANT_CACHE_SECONDS,
+            "api_key_configured": bool(CRYPTOQUANT_API_KEY)}
 
 
 @app.get("/api/news/status")
