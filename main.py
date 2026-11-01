@@ -33,7 +33,7 @@ except Exception as exc:
     collect_provider_status = None
     logging.getLogger("ai-trader").warning("Trader Intelligence unavailable: %s", exc)
 
-APP_VERSION = "34.0.0-adaptive-entry-autostart-paper"
+APP_VERSION = "35.0.0-cost-aware-profit-exit-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -49,9 +49,11 @@ MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "48"))
 INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3.0"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "2.0"))
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "240"))
+COOLDOWN_SECONDS = max(1800, int(os.getenv("COOLDOWN_SECONDS", "1800")))
 MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "900"))
 TREND_EXIT_CONFIRMATIONS = max(1, int(os.getenv("TREND_EXIT_CONFIRMATIONS", "3")))
+# Round-trip fees + estimated spread/slippage + a small net-profit buffer.
+MIN_NET_EXIT_PCT = FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT + 0.25
 TRAIL_ACTIVATION_PCT = float(os.getenv("TRAIL_ACTIVATION_PCT", "3.0"))
 MAX_SCAN_MARKETS = max(10, min(100, int(os.getenv("MAX_SCAN_MARKETS", "50"))))
 MARKET_DISCOVERY_CACHE_SECONDS = max(300, int(os.getenv("MARKET_DISCOVERY_CACHE_SECONDS", "1800")))
@@ -400,7 +402,7 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None) ->
         reasons.append("15m och 1h bekräftar upptrend")
 
     score = max(0, min(100, int(score)))
-    cost_hurdle = FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT
+    cost_hurdle = MIN_NET_EXIT_PCT
     # Expected move is a rough filter, not a prediction or profit guarantee.
     estimated_move = max(0.0, mom15 * 1.35 + mom1h * 0.20 + atr_pct * 0.30)
 
@@ -616,7 +618,8 @@ def run_cycle() -> dict[str, Any]:
                 atr = float(s.get("atr_pct", 0) or 0)
                 trail_pct = max(1.2, min(3.0, atr * 1.25 if atr > 0 else TRAILING_STOP_PCT))
                 stop_hit = change <= -STOP_LOSS_PCT
-                trail_hit = peak_gain >= TRAIL_ACTIVATION_PCT and drawdown <= -trail_pct
+                trail_floor_pct = max(MIN_NET_EXIT_PCT, peak_gain - trail_pct)
+                trail_hit = peak_gain >= TRAIL_ACTIVATION_PCT and change <= trail_floor_pct
 
                 # One noisy sell signal no longer closes a position immediately.
                 if s["signal"] == "SÄLJ":
@@ -633,7 +636,7 @@ def run_cycle() -> dict[str, Any]:
                 trend_exit = (
                     held_seconds >= MIN_HOLD_SECONDS
                     and int(pos.get("sell_signal_count", 0)) >= TREND_EXIT_CONFIRMATIONS
-                    and change > -STOP_LOSS_PCT
+                    and change >= MIN_NET_EXIT_PCT
                 )
                 if stop_hit or trail_hit or trend_exit:
                     reason = (
@@ -780,6 +783,7 @@ def api_status():
                 "market_discovery_cache_seconds": MARKET_DISCOVERY_CACHE_SECONDS,
                 "min_hold_seconds": MIN_HOLD_SECONDS,
                 "trend_exit_confirmations": TREND_EXIT_CONFIRMATIONS,
+                "min_net_exit_pct": round(MIN_NET_EXIT_PCT, 3),
                 "trailing_activation_pct": TRAIL_ACTIVATION_PCT,
             }, **snap,
         }
