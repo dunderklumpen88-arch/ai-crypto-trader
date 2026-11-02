@@ -1,4 +1,4 @@
-"""AI Crypto Trader v37 — PAPER ONLY. Simulated trading only; no real exchange orders."""
+"""AI Crypto Trader v38 — PAPER ONLY. Simulated trading only; no real exchange orders."""
 from __future__ import annotations
 
 import csv
@@ -10,6 +10,7 @@ import math
 import os
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -33,194 +34,9 @@ except Exception as exc:
     collect_provider_status = None
     logging.getLogger("ai-trader").warning("Trader Intelligence unavailable: %s", exc)
 
-# Claude reviewer is embedded below; no second Python file is required.
+# Claude is intentionally not part of the trading decision path.
 
-
-# ---------------- Claude AI market reviewer (embedded, read-only) ----------------
-# Optional second opinion. It cannot place orders or override risk limits.
-CLAUDE_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5").strip()
-CLAUDE_CACHE_SECONDS = max(60, int(os.getenv("CLAUDE_CACHE_SECONDS", "300")))
-CLAUDE_MAX_SYMBOLS = max(5, min(25, int(os.getenv("CLAUDE_MAX_SYMBOLS", "20"))))
-CLAUDE_TIMEOUT_SECONDS = max(8, min(45, int(os.getenv("CLAUDE_TIMEOUT_SECONDS", "25"))))
-CLAUDE_MAX_TOKENS = max(500, min(2500, int(os.getenv("CLAUDE_MAX_TOKENS", "1400"))))
-_claude_lock = threading.Lock()
-_claude_cache: dict[str, Any] = {"at": 0.0, "result": None}
-_claude_last_error: str | None = None
-last_claude_review: dict[str, Any] = {
-    "enabled": False, "available": False, "status": "not_configured"
-}
-
-
-def claude_status() -> dict[str, Any]:
-    cached = _claude_cache.get("result") or {}
-    enabled = bool(CLAUDE_API_KEY)
-    return {
-        "enabled": enabled,
-        "available": bool(enabled and cached.get("available")),
-        "status": cached.get("status", "ready" if enabled else "not_configured"),
-        "message": cached.get("message") or (
-            "Claude API-nyckel är konfigurerad." if enabled
-            else "Lägg till ANTHROPIC_API_KEY i Render Environment för att aktivera Claude."
-        ),
-        "model": CLAUDE_MODEL if enabled else None,
-        "cache_seconds": CLAUDE_CACHE_SECONDS,
-        "last_error": _claude_last_error,
-        "updated_at": cached.get("updated_at"),
-        "read_only": True, "places_orders": False,
-    }
-
-
-def _claude_extract_json(text: str) -> dict[str, Any]:
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\\n", 1)[-1].rsplit("```", 1)[0].strip()
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("Claude-svaret innehöll ingen JSON")
-    result = json.loads(text[start:end + 1])
-    if not isinstance(result, dict):
-        raise ValueError("Claude-svaret hade fel format")
-    return result
-
-
-def _claude_request(payload: dict[str, Any]) -> dict[str, Any]:
-    if not CLAUDE_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY saknas")
-    body = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": CLAUDE_MAX_TOKENS,
-        "temperature": 0.1,
-        "system": (
-            "Du är en försiktig kryptoanalytiker som gör en andra bedömning. "
-            "Använd ENDAST skickad data. Hitta inte på nyheter eller fakta och lova "
-            "inte vinst. Returnera ENDAST JSON: "
-            '{"market_regime":"bullish|bearish|sideways|uncertain",'
-            '"summary":"kort svensk sammanfattning",'
-            '"decisions":[{"symbol":"BTC","action":"BUY|SELL|HOLD",'
-            '"confidence":0,"reason":"kort svensk motivering"}]}. '
-            "HOLD är standard vid osäkerhet. Confidence är heltal 0-100."
-        ),
-        "messages": [{
-            "role": "user",
-            "content": "Granska marknadssignalerna:\\n"
-                + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-        }],
-    }
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "x-api-key": CLAUDE_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-            "accept": "application/json",
-            "user-agent": "AI-Crypto-Trader-Paper/1.0",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=CLAUDE_TIMEOUT_SECONDS) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:400]
-        raise RuntimeError(f"Anthropic HTTP {exc.code}: {detail}") from exc
-    text = "\\n".join(
-        block.get("text", "") for block in data.get("content", [])
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
-    return _claude_extract_json(text)
-
-
-def review_market_signals( signals: list[dict[str, Any]], held_symbols: list[str] | None = None ) -> dict[str, Any]:
-    global _claude_last_error
-    if not CLAUDE_API_KEY:
-        return {
-            "enabled": False, "available": False, "status": "not_configured",
-            "message": "ANTHROPIC_API_KEY saknas; teknisk analys används som vanligt.",
-            "decisions": [], "updated_at": None,
-        }
-
-    held = sorted(set(str(x).upper() for x in (held_symbols or [])))
-    selected = list(signals[:CLAUDE_MAX_SYMBOLS])
-    chosen = {str(x.get("symbol", "")).upper() for x in selected}
-    for item in signals:
-        sym = str(item.get("symbol", "")).upper()
-        if sym in held and sym not in chosen:
-            selected.append(item)
-            chosen.add(sym)
-
-    fields = (
-        "symbol", "signal", "confidence", "rsi_14", "momentum_15m_pct",
-        "momentum_1h_pct", "atr_pct", "volume_ratio", "estimated_move_pct",
-        "cost_hurdle_pct", "advanced_score_adjustment",
-        "cryptoquant_score_adjustment", "reasons", "block_reason",
-    )
-    compact = []
-    for item in selected[:CLAUDE_MAX_SYMBOLS + len(held)]:
-        compact.append({k: item.get(k) for k in fields if k in item})
-    payload = {
-        "as_of_utc": utc_now(), "held_symbols": held,
-        "market_signals": compact,
-        "instructions": "Ge en andra bedömning. Utför inga order.",
-    }
-
-    now = time.time()
-    cached = _claude_cache.get("result")
-    if cached is not None and now - float(_claude_cache.get("at", 0)) < CLAUDE_CACHE_SECONDS:
-        return cached
-
-    with _claude_lock:
-        cached = _claude_cache.get("result")
-        if cached is not None and time.time() - float(_claude_cache.get("at", 0)) < CLAUDE_CACHE_SECONDS:
-            return cached
-        try:
-            response = _claude_request(payload)
-            allowed = {str(x.get("symbol", "")).upper() for x in compact}
-            seen, decisions = set(), []
-            for raw in response.get("decisions", []):
-                if not isinstance(raw, dict):
-                    continue
-                symbol = str(raw.get("symbol", "")).upper().strip()
-                action = str(raw.get("action", "HOLD")).upper().strip()
-                if symbol not in allowed or symbol in seen:
-                    continue
-                if action not in {"BUY", "SELL", "HOLD"}:
-                    action = "HOLD"
-                try:
-                    confidence = max(0, min(100, int(raw.get("confidence", 0))))
-                except (TypeError, ValueError):
-                    confidence = 0
-                decisions.append({
-                    "symbol": symbol, "action": action, "confidence": confidence,
-                    "reason": str(raw.get("reason", ""))[:240],
-                })
-                seen.add(symbol)
-            result = {
-                "enabled": True, "available": True, "status": "ok",
-                "message": "Claude har granskat signalerna som en andra bedömning.",
-                "model": CLAUDE_MODEL,
-                "market_regime": str(response.get("market_regime", "uncertain"))[:30],
-                "summary": str(response.get("summary", ""))[:500],
-                "decisions": decisions, "updated_at": utc_now(),
-                "read_only": True, "places_orders": False,
-            }
-            _claude_last_error = None
-        except Exception as exc:
-            _claude_last_error = str(exc)[:300]
-            log.warning("Claude review failed; technical strategy continues: %s", _claude_last_error)
-            result = {
-                "enabled": True, "available": False, "status": "error",
-                "message": "Claude kunde inte svara; teknisk strategi fortsätter.",
-                "decisions": [], "updated_at": utc_now(),
-                "read_only": True, "places_orders": False,
-            }
-        _claude_cache.update({"at": time.time(), "result": result})
-        return result
-
-# -------------------------------------------------------------------------------
-
-APP_VERSION = "37.0.0-claude-market-review-paper"
+APP_VERSION = "38.0.0-adaptive-cryptoquant-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -277,7 +93,6 @@ CRYPTOQUANT_API_KEY = os.getenv("CRYPTOQUANT_API_KEY", "").strip()
 CRYPTOQUANT_CACHE_SECONDS = max(900, int(os.getenv("CRYPTOQUANT_CACHE_SECONDS", "3600")))
 _cryptoquant_cache: dict[str, Any] = {"at": 0.0, "data": None}
 _cryptoquant_lock = threading.Lock()
-last_claude_review: dict[str, Any] = {"enabled": False, "available": False, "status": "not_configured"}
 
 def _cq_get_metric(metric: str) -> dict[str, Any]:
     if not CRYPTOQUANT_API_KEY:
@@ -286,7 +101,7 @@ def _cq_get_metric(metric: str) -> dict[str, Any]:
     url = f"https://api.cryptoquant.com/v1/btc/market-data/{metric}?{query}"
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {CRYPTOQUANT_API_KEY}",
-        "User-Agent": "AI-Crypto-Trader-Paper/36.0",
+        "User-Agent": "AI-Crypto-Trader-Paper/38.0",
         "Accept": "application/json",
     })
     with urllib.request.urlopen(req, timeout=10) as response:
@@ -766,7 +581,7 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
         "cryptoquant_score_adjustment": cq_adjustment,
         "cryptoquant_status": (cryptoquant_context or {}).get("status", "not_available"),
         "reasons": reasons, "reason": "; ".join(reasons) if reasons else "ingen tydlig signal",
-        "block_reason": block, "data_source": "Coinbase public candles + technical ensemble",
+        "block_reason": block, "data_source": "Coinbase public candles + technical ensemble + CryptoQuant overlay",
         "timeframe": "5 min candles; momentum 15 min / 1 timme; BTC/ETH regime filter", "updated_at": utc_now(),
     }
 def equity_snapshot() -> dict[str, Any]:
@@ -864,8 +679,8 @@ def dashboard_signals(signals: list[dict[str, Any]], errors: list[dict[str, str]
         "status": "ok", "version": APP_VERSION, "mode": MODE, "real_orders_enabled": False,
         "updated_at": utc_now(), "count": len(signals), "signals": signals, "errors": errors,
         "prices_sek": {s["symbol"]: round(s["price_usd"] * fx, 6) for s in signals},
-        "market_source": "Coinbase public candles + CryptoQuant BTC derivatives + Claude review (when configured)",
-        "cryptoquant": collect_cryptoquant_context(), "claude": last_claude_review,
+        "market_source": "Coinbase public candles + technical ensemble + CryptoQuant BTC derivatives (when configured)",
+        "cryptoquant": collect_cryptoquant_context(),
         "fx_usd_sek": fx, "fx_live": fx_live,
     }
     last_scan = result
@@ -897,47 +712,6 @@ def run_scan() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         key=lambda item: (item.get("confidence", 0), item.get("momentum_1h_pct", 0), item.get("volume_ratio", 0)),
         reverse=True,
     )
-
-    # Claude reviews the strongest candidates and current holdings as a second
-    # opinion. It may veto a technical BUY, or reinforce a SELL for an existing
-    # holding; it can never create a BUY or bypass the normal exit/risk rules.
-    global last_claude_review
-    if review_market_signals is not None:
-        try:
-            held_symbols = list(state.get("positions", {}).keys())
-            last_claude_review = review_market_signals(
-                signals[:25], held_symbols=held_symbols
-            )
-            decisions = {
-                str(item.get("symbol", "")).upper(): item
-                for item in last_claude_review.get("decisions", [])
-                if isinstance(item, dict)
-            }
-            for item in signals:
-                symbol = item.get("symbol", "")
-                decision = decisions.get(symbol, {})
-                action = str(decision.get("action", "HOLD")).upper()
-                try:
-                    claude_confidence = max(0, min(100, int(decision.get("confidence", 0))))
-                except (TypeError, ValueError):
-                    claude_confidence = 0
-                item["technical_signal"] = item.get("signal", "AVVAKTA")
-                item["claude_signal"] = action
-                item["claude_confidence"] = claude_confidence
-                item["claude_reason"] = str(decision.get("reason", ""))[:240]
-                if item["signal"] == "KÖP" and action == "SELL" and claude_confidence >= 75:
-                    item["signal"] = "AVVAKTA"
-                    item["block_reason"] = "Claude avråder från köp (andra bedömning)"
-                elif symbol in held_symbols and action == "SELL" and claude_confidence >= 80:
-                    item["signal"] = "SÄLJ"
-                    item["reason"] = (str(item.get("reason", "")) + "; Claude bekräftar säljsignal").strip("; ")
-        except Exception as exc:
-            last_claude_review = {
-                "enabled": True, "available": False, "status": "error",
-                "message": f"Claude-analys misslyckades: {str(exc)[:180]}",
-                "decisions": [], "updated_at": utc_now(),
-            }
-            log.warning("Claude review unavailable; technical strategy unchanged: %s", exc)
 
     if not signals:
         raise RuntimeError("Ingen marknadsdata tillgänglig: " + "; ".join(e["symbol"] + ": " + e["error"] for e in errors[:5]))
@@ -1081,6 +855,65 @@ def portfolio_payload() -> dict[str, Any]:
     }
 
 
+def performance_payload() -> dict[str, Any]:
+    """Summarize completed PAPER trades and equity history; no strategy side effects."""
+    trades = list(state.get("trades", []))
+    sells = [t for t in trades if str(t.get("side", "")).upper() == "SELL"]
+    pnls = []
+    for trade in sells:
+        try:
+            value = float(trade.get("realized_pnl_sek", 0) or 0)
+            if math.isfinite(value):
+                pnls.append(value)
+        except (TypeError, ValueError):
+            continue
+    wins = [x for x in pnls if x > 0]
+    losses = [x for x in pnls if x < 0]
+    gross_wins = sum(wins)
+    gross_losses = abs(sum(losses))
+    history = state.get("equity_history", [])
+    peak = None
+    max_drawdown_pct = 0.0
+    for point in history:
+        try:
+            equity = float(point.get("equity_sek", 0))
+            if not math.isfinite(equity):
+                continue
+            peak = equity if peak is None else max(peak, equity)
+            if peak and peak > 0:
+                max_drawdown_pct = max(max_drawdown_pct, (peak - equity) / peak * 100.0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    snap = equity_snapshot()
+    return {
+        "mode": MODE,
+        "real_orders_enabled": False,
+        "closed_trades": len(pnls),
+        "winning_trades": len(wins),
+        "losing_trades": len(losses),
+        "win_rate_pct": round(len(wins) / len(pnls) * 100.0, 2) if pnls else None,
+        "realized_pnl_sek": round(sum(pnls), 2),
+        "average_closed_trade_pnl_sek": round(sum(pnls) / len(pnls), 2) if pnls else None,
+        "gross_profit_sek": round(gross_wins, 2),
+        "gross_loss_sek": round(gross_losses, 2),
+        "profit_factor": round(gross_wins / gross_losses, 3) if gross_losses else (None if not gross_wins else "infinite"),
+        "max_observed_drawdown_pct": round(max_drawdown_pct, 2),
+        "fees_paid_sek": snap["fees_paid_sek"],
+        "total_pnl_sek": snap["total_pnl_sek"],
+        "equity_sek": snap["equity_sek"],
+        "trade_count": len(trades),
+        "history_points": len(history),
+        "updated_at": utc_now(),
+    }
+
+
+@app.get("/api/performance")
+def api_performance():
+    with lock:
+        return performance_payload()
+
+
+
 @app.on_event("startup")
 def startup() -> None:
     try:
@@ -1121,6 +954,8 @@ def api_status():
         return {
             "status": "online", "version": APP_VERSION,
             "strategy_model": "adaptive_multitimeframe_cost_aware_paper",
+            "decision_engine": "technical_ensemble_plus_cryptoquant_overlay",
+            "claude_enabled": False,
             "mode": MODE, "real_orders_enabled": False, "auto_enabled": bool(state.get("auto_enabled")),
             "worker_alive": bool(worker_thread and worker_thread.is_alive()), "state_file": STATE_FILE,
             "last_run": state.get("last_run"), "last_success": state.get("last_success"),
@@ -1229,23 +1064,8 @@ def intelligence_status():
         "market_context_available": collect_market_signals is not None,
         "cryptoquant_available": bool(CRYPTOQUANT_API_KEY),
         "cryptoquant_status_endpoint": "/api/cryptoquant/status",
-        "claude_available": bool(claude_status and claude_status().get("available")),
-        "claude_status_endpoint": "/api/claude/status",
-        "mode": MODE, "real_orders_enabled": False,
-    }
-
-
-@app.get("/api/claude/status")
-def claude_review_status():
-    if claude_status is None:
-        return {
-            "enabled": False, "available": False, "status": "module_unavailable",
-            "message": "Claude-modulen kunde inte laddas; befintlig strategi fortsätter.",
-            "mode": MODE, "real_orders_enabled": False,
-        }
-    return {
-        **claude_status(),
-        "last_review": last_claude_review,
+        "claude_enabled": False,
+        "decision_engine": "technical_ensemble_plus_cryptoquant_overlay",
         "mode": MODE, "real_orders_enabled": False,
     }
 
