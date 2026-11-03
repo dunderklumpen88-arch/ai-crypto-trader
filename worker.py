@@ -1,4 +1,4 @@
-"""Advanced, dependency-free market-analysis engine for AI Crypto Trader PAPER. Drop-in replacement for worker.py. Keeps the existing analyze_advanced(candles, fx, current_price_sek) interface and never places orders. Candles must be oldest-to-newest Coinbase OHLCV records. Scores are heuristics, not probabilities or guarantees. """
+"""Advanced v39 dependency-free ensemble market-analysis engine for AI Crypto Trader PAPER. Drop-in replacement for worker.py. Keeps the existing analyze_advanced(candles, fx, current_price_sek) interface and never places orders. Candles must be oldest-to-newest Coinbase OHLCV records. Scores are heuristics, not probabilities or guarantees. """
 from __future__ import annotations
 
 from math import isfinite, sqrt
