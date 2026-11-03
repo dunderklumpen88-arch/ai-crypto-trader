@@ -34,9 +34,15 @@ except Exception as exc:
     collect_provider_status = None
     logging.getLogger("ai-trader").warning("Trader Intelligence unavailable: %s", exc)
 
+try:
+    from market_agents import collect_sentiment, macro_status, quantitative_signal, sentiment_adjustment, walk_forward_diagnostics
+except Exception as exc:
+    collect_sentiment = macro_status = quantitative_signal = sentiment_adjustment = walk_forward_diagnostics = None
+    logging.getLogger("ai-trader").warning("Market agents unavailable: %s", exc)
+
 # Claude is intentionally not part of the trading decision path.
 
-APP_VERSION = "39.0.0-learning-ensemble-paper"
+APP_VERSION = "40.0.0-multi-agent-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -424,7 +430,7 @@ def pct_change(new: float, old: float) -> float:
     return (new / old - 1.0) * 100.0 if old else 0.0
 
 
-def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cryptoquant_context: dict[str, Any] | None = None) -> dict[str, Any]:
+def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cryptoquant_context: dict[str, Any] | None = None, sentiment_context: dict[str, Any] | None = None, macro_context: dict[str, Any] | None = None) -> dict[str, Any]:
     candles = get_candles(symbol)
     if len(candles) < 55:
         raise RuntimeError(f"not_enough_candles:{len(candles)}")
@@ -526,6 +532,20 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
         if cq_adjustment:
             reasons.extend(cryptoquant_context.get("reasons", [])[:3])
 
+    # Independent quant/statistics agent: bounded overlay, never a standalone trigger.
+    quant = quantitative_signal(closes, volumes) if quantitative_signal else {"status": "unavailable", "score_adjustment": 0}
+    backtest = walk_forward_diagnostics(closes, fee_pct=FEE_RATE * 100, slippage_pct=ESTIMATED_SPREAD_SLIPPAGE_PCT / 2) if walk_forward_diagnostics else {"status": "unavailable"}
+    quant_adjustment = int(max(-3, min(2, quant.get("score_adjustment", 0) or 0)))
+    score += quant_adjustment * 2
+    if quant_adjustment:
+        reasons.append("Kvantagent: statistisk avvik/volym bekräftar eller varnar")
+
+    # Headline sentiment is cached and weakly weighted; no headline can create a buy alone.
+    sentiment_adj = sentiment_adjustment(sentiment_context) if sentiment_adjustment else 0
+    score += sentiment_adj * 2
+    if sentiment_adj:
+        reasons.append("Sentimentagent: nyhetsrubriker ger " + ("positiv" if sentiment_adj > 0 else "negativ") + " ton")
+
     # Closed-trade feedback: small, sample-gated adjustment per coin.
     # It learns only from completed PAPER sells and is deliberately capped.
     learning = state.setdefault("symbol_learning", {}).get(symbol, {})
@@ -570,6 +590,9 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
     )
     if market_filter.get("veto_buy"):
         buy_ready = False
+    macro_block = bool((macro_context or {}).get("blackout"))
+    if macro_block:
+        buy_ready = False
 
     if sell_ready:
         action, block = "SÄLJ", None
@@ -578,6 +601,8 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
             f"uppskattad rörelse {estimated_move:.2f}% täcker inte "
             f"kostnadströskeln {cost_hurdle:.2f}%"
         )
+    elif macro_block:
+        action, block = "AVVAKTA", "makroekonomiskt blackout-fönster aktivt"
     elif market_filter.get("veto_buy") and buy_ready is False:
         action, block = "AVVAKTA", "BTC/ETH visar samstämmig nedtrend"
     elif buy_ready:
@@ -596,6 +621,10 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
         "advanced_score_adjustment": advanced.get("score_adjustment", 0),
         "advanced_indicators": advanced.get("indicators", {}), "market_filter": market_filter,
         "cryptoquant_score_adjustment": cq_adjustment,
+        "quant_score_adjustment": quant_adjustment, "quant_diagnostics": quant,
+        "backtest_diagnostics": backtest,
+        "sentiment_score": (sentiment_context or {}).get("score"), "sentiment_adjustment": sentiment_adj,
+        "macro_blackout": macro_block,
         "learning_score_adjustment": learning_adjustment,
         "learning_closed_trades": len(outcomes),
         "cryptoquant_status": (cryptoquant_context or {}).get("status", "not_available"),
@@ -647,9 +676,10 @@ def buy_paper(symbol: str, amount: float, price_usd: float, fx: float, reason: s
     total = amount + fee
     if total > float(state.get("cash_sek", 0)):
         return False, "otillräckligt saldo inklusive avgift"
-    price_sek = price_usd * fx
-    if price_sek <= 0:
+    market_price_sek = price_usd * fx
+    if market_price_sek <= 0:
         return False, "ogiltigt pris"
+    price_sek = market_price_sek * (1 + (ESTIMATED_SPREAD_SLIPPAGE_PCT / 2) / 100.0)
     qty = amount / price_sek
     state["cash_sek"] = float(state.get("cash_sek", 0)) - total
     state["fees_paid_sek"] = float(state.get("fees_paid_sek", 0)) + fee
@@ -672,7 +702,8 @@ def sell_paper(symbol: str, price_usd: float, fx: float, reason: str) -> tuple[b
     pos = state.get("positions", {}).get(symbol)
     if not pos:
         return False, "ingen position"
-    price_sek = price_usd * fx
+    market_price_sek = price_usd * fx
+    price_sek = market_price_sek * (1 - (ESTIMATED_SPREAD_SLIPPAGE_PCT / 2) / 100.0)
     qty = float(pos.get("quantity", 0))
     gross = qty * price_sek
     fee = gross * FEE_RATE
@@ -703,6 +734,9 @@ def dashboard_signals(signals: list[dict[str, Any]], errors: list[dict[str, str]
         "prices_sek": {s["symbol"]: round(s["price_usd"] * fx, 6) for s in signals},
         "market_source": "Coinbase public candles + technical ensemble + CryptoQuant BTC derivatives (when configured)",
         "cryptoquant": collect_cryptoquant_context(),
+        "sentiment_agent": collect_sentiment() if collect_sentiment else {"status": "unavailable"},
+        "macro_agent": macro_status() if macro_status else {"status": "unavailable"},
+        "agent_stack": ["technical_ensemble", "quant_statistics", "headline_sentiment", "macro_blackout", "cryptoquant", "paper_trade_learning", "hard_risk_guard"],
         "fx_usd_sek": fx, "fx_live": fx_live,
     }
     last_scan = result
@@ -713,6 +747,8 @@ def run_scan() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     signals, errors = [], []
     market_context = None
     cryptoquant_context = collect_cryptoquant_context()
+    sentiment_context = collect_sentiment() if collect_sentiment else {"status": "unavailable", "score": 0}
+    macro_context = macro_status() if macro_status else {"blackout": False, "status": "unavailable"}
     symbols = get_available_symbols()
     if collect_market_signals is not None:
         try:
@@ -722,7 +758,7 @@ def run_scan() -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
 
     # Bounded concurrency keeps a larger market universe practical.
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(analyze_market, symbol, market_context, cryptoquant_context): symbol for symbol in symbols}
+        futures = {pool.submit(analyze_market, symbol, market_context, cryptoquant_context, sentiment_context, macro_context): symbol for symbol in symbols}
         for future in as_completed(futures):
             symbol = futures[future]
             try:
@@ -814,7 +850,14 @@ def run_cycle() -> dict[str, Any]:
                         state["risk_halt"] = True
                         state["auto_enabled"] = False
                         break
-                    amount = min(MAX_TRADE_SEK, MAX_POSITION_SEK, float(state.get("cash_sek", 0)) / (1 + FEE_RATE))
+                    # Risk budget: at most 1% of equity lost at the configured stop distance.
+                    # Existing SEK caps remain stricter where applicable.
+                    risk_equity = max(0.0, float(snap.get("equity_sek", START_BALANCE_SEK)))
+                    stop_fraction = max(0.005, STOP_LOSS_PCT / 100.0)
+                    risk_budget = risk_equity * 0.01
+                    risk_sized_amount = risk_budget / stop_fraction
+                    amount = min(MAX_TRADE_SEK, MAX_POSITION_SEK, risk_sized_amount,
+                                 float(state.get("cash_sek", 0)) / (1 + FEE_RATE))
                     if amount >= 10:
                         buy_paper(s["symbol"], amount, s["price_usd"], fx, "paper_auto_entry")
 
