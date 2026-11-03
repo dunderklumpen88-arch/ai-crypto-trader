@@ -1,17 +1,21 @@
-"""External market context for AI Crypto Trader. Read-only PAPER integration."""
+"""Trader Intelligence status and safe signal weighting for paper trading. External sources are informational only until a documented, provider-specific adapter validates their schema, timestamp, provenance and track record. This module never places orders. """
 from __future__ import annotations
 
 import json
 import os
 import time
-import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
-TIMEOUT = min(8.0, max(1.0, float(os.getenv("TRADER_INTEL_TIMEOUT", "4"))))
-CACHE_SECONDS = max(60, int(os.getenv("TRADER_INTEL_CACHE_SECONDS", "300")))
-_cache: dict[str, Any] = {"at": 0.0, "result": None}
+TRADER_INTEL_ENABLED = os.getenv("TRADER_INTEL_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+TRADER_INTEL_SOURCES = [item.strip() for item in os.getenv("TRADER_INTEL_SOURCES", "").split(",") if item.strip()]
+TRADER_INTEL_TIMEOUT = min(10.0, max(1.0, float(os.getenv("TRADER_INTEL_TIMEOUT", "5"))))
+TRADER_INTEL_CACHE_SECONDS = max(30, int(os.getenv("TRADER_INTEL_CACHE_SECONDS", "300")))
+TRADER_INTEL_WEIGHT = min(0.5, max(0.0, float(os.getenv("TRADER_INTEL_WEIGHT", "0.20"))))
+TRADER_INTEL_MIN_SAMPLES = max(20, int(os.getenv("TRADER_INTEL_MIN_SAMPLES", "30")))
+
+_cache: dict[str, Any] = {"at": 0.0, "signals": [], "source_status": [], "updated_at": None}
 
 
 def utc_now() -> str:
@@ -19,331 +23,200 @@ def utc_now() -> str:
 
 
 def _fetch_json(url: str) -> Any:
-    if not url.startswith("https://api.coinbase.com/"):
-        raise ValueError("Only Coinbase public HTTPS market data is allowed.")
-    req = urllib.request.Request(
+    if not url.startswith("https://"):
+        raise ValueError("Trader Intelligence kräver HTTPS-källor.")
+    request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": "AI-Crypto-Trader-PAPER/33.0"},
+        headers={"Accept": "application/json", "User-Agent": "AI-Crypto-Trader-PAPER/2.0"},
+        method="GET",
     )
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+    with urllib.request.urlopen(request, timeout=TRADER_INTEL_TIMEOUT) as response:
         if response.status != 200:
-            raise RuntimeError(f"Coinbase HTTP {response.status}")
+            raise RuntimeError(f"Källan svarade HTTP {response.status}")
         raw = response.read(1_000_001)
     if len(raw) > 1_000_000:
-        raise ValueError("Market response was too large.")
+        raise ValueError("Källsvaret är för stort (max 1 MB).")
     return json.loads(raw.decode("utf-8"))
 
 
-def _ema(values: list[float], period: int) -> float:
-    if not values or period < 1:
-        raise ValueError("EMA requires values and a positive period.")
-    alpha = 2.0 / (period + 1.0)
-    value = float(values[0])
-    for item in values[1:]:
-        value = alpha * float(item) + (1.0 - alpha) * value
-    return value
-
-
-def _one_product(product: str) -> dict[str, Any]:
-    now = int(time.time())
-    start = now - 100 * 5 * 60
-    url = (
-        "https://api.coinbase.com/api/v3/brokerage/market/products/"
-        + urllib.parse.quote(product, safe="-")
-        + f"/candles?start={start}&end={now}&granularity=FIVE_MINUTE&limit=100"
-    )
-    payload = _fetch_json(url)
-    raw = payload.get("candles", []) if isinstance(payload, dict) else []
-    candles: list[tuple[int, float]] = []
-    for candle in raw if isinstance(raw, list) else []:
-        try:
-            ts = int(candle.get("start", 0))
-            close = float(candle.get("close", 0))
-            if close > 0 and ts + 300 <= now:
-                candles.append((ts, close))
-        except (TypeError, ValueError, AttributeError):
-            continue
-
-    candles = sorted(set(candles))
-    closes = [close for _, close in candles]
-    if len(closes) < 55:
-        return {"product": product, "status": "insufficient_data", "samples": len(closes)}
-
-    ema9 = _ema(closes[-50:], 9)
-    ema21 = _ema(closes[-50:], 21)
-    ema50 = _ema(closes[-55:], 50)
-
-    # Build 15-minute candles only from three complete, consecutive 5-minute bars.
-    buckets: dict[int, list[tuple[int, float]]] = {}
-    for ts, close in candles:
-        buckets.setdefault(ts // 900, []).append((ts, close))
-
-    closes_15m: list[float] = []
-    for bucket in sorted(buckets):
-        group = sorted(buckets[bucket])
-        if (
-            len(group) == 3
-            and group[1][0] - group[0][0] == 300
-            and group[2][0] - group[1][0] == 300
-        ):
-            closes_15m.append(group[-1][1])
-
-    if len(closes_15m) >= 25:
-        # _ema returns a scalar float. Do not index it as though it were a list.
-        ema9_15m = _ema(closes_15m[-50:], 9)
-        ema21_15m = _ema(closes_15m[-50:], 21)
-        if ema9_15m > ema21_15m:
-            direction_15m = "UP"
-        elif ema9_15m < ema21_15m:
-            direction_15m = "DOWN"
-        else:
-            direction_15m = "NEUTRAL"
-    else:
-        direction_15m = "NEUTRAL"
-
-    # Require aligned 5m structure, price confirmation and 15m direction.
-    if ema9 > ema21 > ema50 and closes[-1] > ema21 and direction_15m == "UP":
-        direction = "UP"
-    elif ema9 < ema21 < ema50 and closes[-1] < ema21 and direction_15m == "DOWN":
-        direction = "DOWN"
-    else:
-        direction = "NEUTRAL"
-
-    return {
-        "product": product,
-        "status": "ok",
-        "direction": direction,
-        "direction_15m": direction_15m,
-        "price": closes[-1],
-        "ema9": round(ema9, 8),
-        "ema21": round(ema21, 8),
-        "ema50": round(ema50, 8),
-        "samples": len(closes),
-        "samples_15m": len(closes_15m),
-        "source": "Coinbase public closed 5-minute candles with 15-minute confirmation",
-    }
-
-
-def collect_market_signals(force: bool = False) -> dict[str, Any]:
-    now = time.time()
-    if (
-        not force
-        and _cache.get("result") is not None
-        and now - float(_cache.get("at", 0)) < CACHE_SECONDS
-    ):
-        return {**_cache["result"], "cached": True}
-
-    signals = []
-    for product in ("BTC-EUR", "ETH-EUR"):
-        try:
-            signals.append(_one_product(product))
-        except Exception as exc:
-            signals.append({"product": product, "status": "error", "error": str(exc)[:180]})
-
-    valid = [item for item in signals if item.get("status") == "ok"]
-    directions = [item.get("direction") for item in valid]
-    bearish = len(directions) == 2 and all(direction == "DOWN" for direction in directions)
-    bullish = len(directions) == 2 and all(direction == "UP" for direction in directions)
-    regime = "BEARISH" if bearish else "BULLISH" if bullish else "MIXED_OR_UNKNOWN"
-
-    result = {
-        "ok": bool(valid),
-        "signals": signals,
-        "market_regime": regime,
-        "veto_new_buys": bearish,
-        "source": "Coinbase public market data",
-        "updated_at": utc_now(),
-        "cache_seconds": CACHE_SECONDS,
-        "influences_trades": True,
-        "note": "Only a confirmed BTC+ETH bearish regime blocks new entries. No external data places orders.",
-    }
-    _cache.update({"at": now, "result": result})
-    return {**result, "cached": False}
-
-
-def market_filter_for_symbol(symbol: str, context: dict[str, Any] | None) -> dict[str, Any]:
-    context = context or {}
-    signals = context.get("signals", [])
-    valid = [
-        item for item in signals
-        if isinstance(item, dict) and item.get("status") == "ok"
-    ]
-    bearish = len(valid) >= 2 and all(
-        str(item.get("direction", "")).upper() == "DOWN" for item in valid[:2]
-    )
-    return {
-        "source": "Coinbase BTC/ETH benchmark",
-        "market_regime": context.get("market_regime", "MIXED_OR_UNKNOWN"),
-        "veto_buy": bool(bearish),
-        "status": "ok" if valid else "unavailable",
-        "reason": (
-            "BTC and ETH both confirm a bearish trend; new entries are blocked."
-            if bearish else
-            "No confirmed BTC+ETH bearish regime; local asset analysis applies."
-            if valid else
-            "Benchmark data unavailable; local asset analysis applies."
-        ),
-        "benchmarks": [
-            {
-                "product": item.get("product"),
-                "direction": item.get("direction"),
-                "status": item.get("status"),
-            }
-            for item in signals
-        ],
-    }
-
-
 def collect_public_signals() -> dict[str, Any]:
-    """Unverified public trader accounts are deliberately not trade inputs."""
+    """Report reachability honestly; no unparsed provider payload influences trading."""
+    now = time.time()
+    if now - _cache["at"] < TRADER_INTEL_CACHE_SECONDS and _cache["updated_at"]:
+        return {
+            "enabled": TRADER_INTEL_ENABLED, "signals": _cache["signals"],
+            "sources": _cache["source_status"], "cached": True,
+            "updated_at": _cache["updated_at"], "influences_trades": False,
+        }
+
+    statuses: list[dict[str, Any]] = []
+    signals: list[dict[str, Any]] = []
+    if not TRADER_INTEL_ENABLED:
+        statuses.append({"source": None, "status": "disabled", "note": "Avstängt som säkert standardläge."})
+    elif not TRADER_INTEL_SOURCES:
+        statuses.append({"source": None, "status": "not_configured", "note": "Ingen dokumenterad offentlig HTTPS-källa konfigurerad."})
+    else:
+        for url in TRADER_INTEL_SOURCES[:5]:
+            item: dict[str, Any] = {"source": url, "status": "unavailable"}
+            try:
+                payload = _fetch_json(url)
+                item.update({
+                    "status": "reachable_unparsed",
+                    "note": "JSON nåddes, men verifierad leverantörsspecifik adapter saknas; payload påverkar inte handeln.",
+                    "payload_type": type(payload).__name__,
+                })
+            except Exception as exc:
+                item["error"] = str(exc)[:250]
+            statuses.append(item)
+
+    _cache.update({"at": now, "signals": signals, "source_status": statuses, "updated_at": utc_now()})
     return {
-        "enabled": False,
-        "signals": [],
-        "sources": [],
-        "cached": False,
-        "updated_at": utc_now(),
-        "influences_trades": False,
-        "note": "Unverified trader accounts are not used as BUY/SELL sources.",
+        "enabled": TRADER_INTEL_ENABLED, "signals": signals, "sources": statuses,
+        "cached": False, "updated_at": _cache["updated_at"], "influences_trades": False,
     }
 
 
 def trader_intelligence_adjustment( base_score: float, signal: dict[str, Any], trader_signals: list[dict[str, Any]] | None = None, ) -> dict[str, Any]:
-    """Compatibility function: unverified external trader signals never alter scores."""
+    """Bounded adjustment for normalized, independently verified signals only."""
+    now = time.time()
+    product = signal.get("product")
+    eligible: list[dict[str, Any]] = []
+    for item in trader_signals or []:
+        if not isinstance(item, dict) or item.get("product") != product:
+            continue
+        if item.get("verified_track_record") is not True or not item.get("observed_at"):
+            continue
+        try:
+            samples = int(item.get("sample_count", 0))
+            quality = float(item.get("quality", 0))
+            drawdown = float(item.get("max_drawdown_pct", 100))
+            observed = datetime.fromisoformat(str(item["observed_at"]).replace("Z", "+00:00"))
+            age = now - observed.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            continue
+        direction = str(item.get("direction", "NEUTRAL")).upper()
+        if (
+            samples < TRADER_INTEL_MIN_SAMPLES
+            or age < -60 or age > 3600
+            or direction not in ("LONG", "SHORT", "NEUTRAL")
+            or not 0 <= quality <= 1 or drawdown > 25 or quality < 0.55
+        ):
+            continue
+        eligible.append({**item, "quality": quality, "direction": direction})
+
+    adjustment = 0.0
+    source_state = "none"
+    if eligible:
+        votes = sum(
+            (1 if item["direction"] == "LONG" else -1 if item["direction"] == "SHORT" else 0)
+            * item["quality"] for item in eligible
+        ) / len(eligible)
+        adjustment = max(-1.0, min(1.0, votes)) * TRADER_INTEL_WEIGHT
+        source_state = "verified_public_signals"
+
     base = float(base_score)
     return {
         "base_score": base,
-        "adjustment": 0.0,
-        "final_score": base,
-        "sources_used": 0,
-        "source_state": "disabled_unverified",
-        "decision_note": "Unverified trader signals do not affect trading decisions.",
+        "adjustment": round(adjustment, 3),
+        "final_score": round(max(-4.0, min(4.0, base + adjustment)), 3),
+        "sources_used": len(eligible),
+        "source_state": source_state,
+        "decision_note": (
+            "Verifierade och färska tradersignaler vägs in med begränsad vikt."
+            if eligible else "Ingen verifierad tradersignal; beslut ska baseras på marknadsdata."
+        ),
     }
 
 
 def reset_signal_cache() -> None:
-    _cache.update({"at": 0.0, "result": None})
+    _cache.update({"at": 0.0, "signals": [], "source_status": [], "updated_at": None})
 
 
-# Optional provider diagnostics: read-only and never allowed to influence trades.
-PROVIDER_TIMEOUT = min(8.0, max(1.0, float(os.getenv("EXTERNAL_PROVIDER_TIMEOUT", "4"))))
-PROVIDER_CACHE_SECONDS = max(30, int(os.getenv("EXTERNAL_PROVIDER_CACHE_SECONDS", "180")))
-_provider_cache: dict[str, Any] = {"at": 0.0, "result": None}
-
-
-def _provider_config() -> list[dict[str, str]]:
-    return [
-        {
-            "name": "Bitsgap",
-            "url": os.getenv("BITSGAP_SIGNAL_URL", "").strip(),
-            "credential": os.getenv("BITSGAP_API_KEY", "").strip(),
-            "note": "Configure only with the provider's official HTTPS API details.",
-        },
-        {
-            "name": "Cryptohopper",
-            "url": os.getenv("CRYPTOHOPPER_SIGNAL_URL", "").strip(),
-            "credential": os.getenv("CRYPTOHOPPER_ACCESS_TOKEN", "").strip(),
-            "note": "Requires valid API/OAuth access and a documented signal endpoint.",
-        },
-        {
-            "name": "HelaSyn",
-            "url": os.getenv("HELASYN_SIGNAL_URL", "").strip(),
-            "credential": os.getenv("HELASYN_API_KEY", "").strip(),
-            "note": "Configure only if the provider supplies a documented official HTTPS API.",
-        },
-    ]
-
-
-def _safe_provider_probe(item: dict[str, str]) -> dict[str, Any]:
-    name, url, credential = item["name"], item["url"], item["credential"]
-    base = {
-        "provider": name,
-        "configured": bool(url),
-        "status": "not_configured",
-        "signals": [],
-        "influences_trades": False,
-        "note": item["note"],
-    }
-    if not url:
-        return base
-
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != "https" or not parsed.hostname:
-        return {**base, "status": "invalid_url", "note": "Endpoint must be a valid HTTPS URL."}
-
-    allowed_host = os.getenv(name.upper().replace(" ", "") + "_API_HOST", "").strip().lower()
-    if credential and (not allowed_host or parsed.hostname.lower() != allowed_host):
-        return {
-            **base,
-            "status": "credential_host_not_allowlisted",
-            "note": "Credential not sent: explicitly allowlist the exact trusted API host.",
-        }
-
-    try:
-        headers = {"Accept": "application/json", "User-Agent": "AI-Crypto-Trader-PAPER/33.0"}
-        if credential:
-            if name == "Cryptohopper":
-                headers["access-token"] = credential
-            else:
-                headers["Authorization"] = "Bearer " + credential
-        request = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(request, timeout=PROVIDER_TIMEOUT) as response:
-            if response.status != 200:
-                raise RuntimeError(f"HTTP {response.status}")
-            raw = response.read(500_001)
-        if len(raw) > 500_000:
-            raise ValueError("Response larger than 500 KB")
-        payload = json.loads(raw.decode("utf-8"))
-        raw_signals = payload.get("signals", []) if isinstance(payload, dict) else []
-        clean = []
-        if isinstance(raw_signals, list):
-            for row in raw_signals[:100]:
-                if not isinstance(row, dict):
+def collect_market_signals() -> dict[str, Any]:
+    """Independent BTC/ETH public market diagnostic; does not influence orders."""
+    results: list[dict[str, Any]] = []
+    for product in ("BTC-EUR", "ETH-EUR"):
+        try:
+            end = int(time.time())
+            start = end - (80 * 5 * 60)
+            url = (
+                "https://api.coinbase.com/api/v3/brokerage/market/"
+                f"products/{product}/candles?start={start}&end={end}"
+                "&granularity=FIVE_MINUTE&limit=80"
+            )
+            payload = _fetch_json(url)
+            candles = payload.get("candles", []) if isinstance(payload, dict) else []
+            candles = sorted(candles, key=lambda item: int(item.get("start", 0)))
+            closes = []
+            for candle in candles:
+                try:
+                    close = float(candle.get("close", 0))
+                    start_ts = int(candle.get("start", 0))
+                    if close > 0 and start_ts + 300 <= int(time.time()):
+                        closes.append(close)
+                except (TypeError, ValueError):
                     continue
-                symbol = str(row.get("symbol", "")).upper().strip()
-                direction = str(row.get("signal", row.get("direction", ""))).upper().strip()
-                if (
-                    symbol and len(symbol) <= 24
-                    and direction in {"BUY", "SELL", "HOLD", "KÖP", "SÄLJ", "AVVAKTA", "NEUTRAL"}
-                ):
-                    clean.append({
-                        "symbol": symbol,
-                        "direction": direction,
-                        "timestamp": str(row.get("timestamp", ""))[:80],
-                        "source": name,
-                    })
-        return {
-            **base,
-            "status": "ok",
-            "signals": clean,
-            "payload_signal_count": len(raw_signals) if isinstance(raw_signals, list) else 0,
-            "accepted_signal_count": len(clean),
-            "checked_at": utc_now(),
-            "note": "Signals are diagnostic only and never control trades.",
-        }
-    except Exception as exc:
-        return {**base, "status": "error", "error": str(exc)[:180], "checked_at": utc_now()}
+            if len(closes) < 55:
+                results.append({"product": product, "status": "insufficient_data", "samples": len(closes)})
+                continue
+
+            def ema_last(values: list[float], period: int) -> float:
+                alpha = 2 / (period + 1)
+                value = values[0]
+                for price in values[1:]:
+                    value = alpha * price + (1 - alpha) * value
+                return value
+
+            ema9 = ema_last(closes[-50:], 9)
+            ema21 = ema_last(closes[-50:], 21)
+            ema50 = ema_last(closes[-60:], 50)
+            direction = "LONG" if ema9 > ema21 and ema21 > ema50 else (
+                "SHORT" if ema9 < ema21 and ema21 < ema50 else "NEUTRAL"
+            )
+            results.append({
+                "product": product, "status": "ok", "direction": direction,
+                "price": closes[-1], "ema9": round(ema9, 4),
+                "ema21": round(ema21, 4), "ema50": round(ema50, 4),
+                "source": "Coinbase public market data",
+                "verified_trader_signal": False,
+                "note": "Oberoende marknadsdiagnos; påverkar inte orderbeslut.",
+            })
+        except Exception as exc:
+            results.append({"product": product, "status": "error", "error": str(exc)[:200]})
+    return {"ok": any(item.get("status") == "ok" for item in results), "signals": results, "influences_trades": False}
 
 
-def collect_provider_status(force: bool = False) -> dict[str, Any]:
-    now = time.time()
-    if (
-        not force
-        and _provider_cache.get("result") is not None
-        and now - float(_provider_cache.get("at", 0)) < PROVIDER_CACHE_SECONDS
-    ):
-        return {**_provider_cache["result"], "cached": True}
 
-    providers = [_safe_provider_probe(item) for item in _provider_config()]
-    result = {
-        "mode": "PAPER ONLY",
-        "real_orders_enabled": False,
-        "influences_trades": False,
-        "providers": providers,
-        "configured_count": sum(1 for provider in providers if provider["configured"]),
-        "ready_count": sum(1 for provider in providers if provider["status"] == "ok"),
-        "updated_at": utc_now(),
-        "cached": False,
-        "note": "External provider signals are diagnostic only; none can place orders or change balances.",
-    }
-    _provider_cache.update({"at": now, "result": result})
-    return result
+def market_filter_for_symbol(symbol: str, market_context: dict[str, Any] | None) -> dict[str, Any]:
+    """Use independently calculated BTC/ETH regime as a conservative market-wide veto."""
+    if not isinstance(market_context, dict):
+        return {"status": "unavailable", "veto_buy": False, "reason": "BTC/ETH-kontext saknas"}
+    rows = market_context.get("signals", [])
+    by_base = {}
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, dict) and row.get("status") == "ok":
+            base = str(row.get("product", "")).split("-")[0].upper()
+            by_base[base] = str(row.get("direction", "NEUTRAL")).upper()
+    btc, eth = by_base.get("BTC"), by_base.get("ETH")
+    if btc == "SHORT" and eth == "SHORT":
+        return {"status": "risk_off", "veto_buy": True,
+                "reason": "BTC och ETH visar samstämmig nedtrend", "btc": btc, "eth": eth}
+    if btc == "LONG" and eth == "LONG":
+        return {"status": "risk_on", "veto_buy": False,
+                "reason": "BTC och ETH visar samstämmig upptrend", "btc": btc, "eth": eth}
+    return {"status": "mixed", "veto_buy": False,
+            "reason": "BTC/ETH ger blandad eller neutral marknadsbild", "btc": btc, "eth": eth}
+
+
+def collect_provider_status() -> dict[str, Any]:
+    """Report configured external feeds honestly; no unknown payload can trade."""
+    configured = list(TRADER_INTEL_SOURCES[:5])
+    statuses = []
+    for source in configured:
+        statuses.append({"source": source, "status": "configured_unverified",
+                         "influences_trades": False,
+                         "note": "Källan är konfigurerad men saknar verifierad adapter för orderbeslut."})
+    return {"enabled": TRADER_INTEL_ENABLED, "configured_count": len(configured),
+            "ready_count": 0, "providers": statuses,
+            "influences_trades": False,
+            "note": "Externa källor måste ha dokumenterad adapter, färskhet och verifierad historik innan de får påverka signaler."}
