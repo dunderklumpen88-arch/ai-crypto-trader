@@ -36,7 +36,7 @@ except Exception as exc:
 
 # Claude is intentionally not part of the trading decision path.
 
-APP_VERSION = "38.0.0-adaptive-cryptoquant-paper"
+APP_VERSION = "39.0.0-learning-ensemble-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -526,6 +526,23 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
         if cq_adjustment:
             reasons.extend(cryptoquant_context.get("reasons", [])[:3])
 
+    # Closed-trade feedback: small, sample-gated adjustment per coin.
+    # It learns only from completed PAPER sells and is deliberately capped.
+    learning = state.setdefault("symbol_learning", {}).get(symbol, {})
+    outcomes = learning.get("outcomes", []) if isinstance(learning, dict) else []
+    learning_adjustment = 0
+    if len(outcomes) >= 8:
+        recent = outcomes[-30:]
+        win_rate = sum(1 for x in recent if float(x.get("pnl_sek", 0)) > 0) / len(recent)
+        avg_pnl = sum(float(x.get("pnl_sek", 0)) for x in recent) / len(recent)
+        if win_rate >= 0.65 and avg_pnl > 0:
+            learning_adjustment = 2
+            reasons.append(f"Lärande: {symbol} har positiv historisk PAPER-statistik")
+        elif win_rate <= 0.35 and avg_pnl < 0:
+            learning_adjustment = -4
+            reasons.append(f"Lärande: {symbol} har svag historisk PAPER-statistik")
+        score += learning_adjustment
+
     score = max(0, min(100, int(score)))
     cost_hurdle = MIN_NET_EXIT_PCT
     # Expected move is a rough filter, not a prediction or profit guarantee.
@@ -579,6 +596,8 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
         "advanced_score_adjustment": advanced.get("score_adjustment", 0),
         "advanced_indicators": advanced.get("indicators", {}), "market_filter": market_filter,
         "cryptoquant_score_adjustment": cq_adjustment,
+        "learning_score_adjustment": learning_adjustment,
+        "learning_closed_trades": len(outcomes),
         "cryptoquant_status": (cryptoquant_context or {}).get("status", "not_available"),
         "reasons": reasons, "reason": "; ".join(reasons) if reasons else "ingen tydlig signal",
         "block_reason": block, "data_source": "Coinbase public candles + technical ensemble + CryptoQuant overlay",
@@ -668,6 +687,9 @@ def sell_paper(symbol: str, price_usd: float, fx: float, reason: str) -> tuple[b
         "realized_pnl_sek": round(pnl, 2), "reason": reason, "automatic": reason.startswith("paper_auto"),
     })
     state.setdefault("last_trade_at", {})[symbol] = time.time()
+    learning = state.setdefault("symbol_learning", {}).setdefault(symbol, {"outcomes": []})
+    learning.setdefault("outcomes", []).append({"time": utc_now(), "pnl_sek": round(pnl, 4), "return_pct": round((pnl / max(1e-9, float(pos.get("cost_sek", 0)))) * 100, 4)})
+    learning["outcomes"] = learning["outcomes"][-60:]
     del state["positions"][symbol]
     return True, f"simulerad försäljning registrerad; resultat {pnl:.2f} kr"
 
@@ -953,9 +975,11 @@ def api_status():
         snap = equity_snapshot()
         return {
             "status": "online", "version": APP_VERSION,
-            "strategy_model": "adaptive_multitimeframe_cost_aware_paper",
-            "decision_engine": "technical_ensemble_plus_cryptoquant_overlay",
+            "strategy_model": "learning_ensemble_multitimeframe_cryptoquant_paper",
+            "decision_engine": "technical_ensemble_plus_btc_eth_regime_plus_cryptoquant_plus_closed_trade_learning",
             "claude_enabled": False,
+            "learning_symbols": len(state.get("symbol_learning", {})),
+            "learning_closed_trades": sum(len(v.get("outcomes", [])) for v in state.get("symbol_learning", {}).values()),
             "mode": MODE, "real_orders_enabled": False, "auto_enabled": bool(state.get("auto_enabled")),
             "worker_alive": bool(worker_thread and worker_thread.is_alive()), "state_file": STATE_FILE,
             "last_run": state.get("last_run"), "last_success": state.get("last_success"),
@@ -1065,7 +1089,7 @@ def intelligence_status():
         "cryptoquant_available": bool(CRYPTOQUANT_API_KEY),
         "cryptoquant_status_endpoint": "/api/cryptoquant/status",
         "claude_enabled": False,
-        "decision_engine": "technical_ensemble_plus_cryptoquant_overlay",
+        "decision_engine": "technical_ensemble_plus_btc_eth_regime_plus_cryptoquant_plus_closed_trade_learning",
         "mode": MODE, "real_orders_enabled": False,
     }
 
