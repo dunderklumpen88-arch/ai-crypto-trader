@@ -1,4 +1,4 @@
-"""AI Crypto Trader v38 — PAPER ONLY. Simulated trading only; no real exchange orders."""
+"""AI Crypto Trader v41 — PAPER ONLY. Simulated trading only; no real exchange orders."""
 from __future__ import annotations
 
 import csv
@@ -42,7 +42,7 @@ except Exception as exc:
 
 # Claude is intentionally not part of the trading decision path.
 
-APP_VERSION = "40.0.0-multi-agent-paper"
+APP_VERSION = "41.0.0-expanded-market-universe-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -64,7 +64,7 @@ TREND_EXIT_CONFIRMATIONS = max(1, int(os.getenv("TREND_EXIT_CONFIRMATIONS", "3")
 # Round-trip fees + estimated spread/slippage + a small net-profit buffer.
 MIN_NET_EXIT_PCT = FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT + 0.25
 TRAIL_ACTIVATION_PCT = float(os.getenv("TRAIL_ACTIVATION_PCT", "3.0"))
-MAX_SCAN_MARKETS = max(10, min(100, int(os.getenv("MAX_SCAN_MARKETS", "50"))))
+MAX_SCAN_MARKETS = max(10, min(100, int(os.getenv("MAX_SCAN_MARKETS", "75"))))
 MARKET_DISCOVERY_CACHE_SECONDS = max(300, int(os.getenv("MARKET_DISCOVERY_CACHE_SECONDS", "1800")))
 MIN_24H_QUOTE_VOLUME_USD = max(0.0, float(os.getenv("MIN_24H_QUOTE_VOLUME_USD", "100000")))
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/ai_trader_paper_state.json")
@@ -72,9 +72,26 @@ PRODUCT_SUFFIX = "-USD"
 CANDLE_SECONDS = 300
 CANDLE_LIMIT = 120
 BASE_SYMBOLS = [
+    # Stora och etablerade marknader
     "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LINK", "AVAX", "DOT",
     "LTC", "BCH", "ATOM", "UNI", "AAVE", "XLM", "ETC", "FIL", "HBAR",
     "NEAR", "QNT", "INJ", "EOS", "JUP", "MKR", "TRX", "SHIB",
+    # L1/L2 och skalning
+    "SUI", "APT", "ARB", "OP", "SEI", "TIA", "ICP", "MATIC", "POL",
+    "EGLD", "FLOW", "MINA", "KAVA", "ROSE", "XTZ", "ALGO", "VET",
+    "IOTA", "ZK", "STRK", "ZRO",
+    # AI, data och infrastruktur
+    "RENDER", "FET", "GRT", "TAO", "AKT", "HNT", "PYTH", "WLD",
+    "JASMY", "KAS",
+    # DeFi och finansiell infrastruktur
+    "CRV", "COMP", "SNX", "LDO", "ENS", "ONDO", "PENDLE", "YFI",
+    "1INCH", "ZRX", "MASK", "RUNE",
+    # Gaming, socialt och konsument
+    "SAND", "MANA", "IMX", "GALA", "AXS", "CHZ", "BAT",
+    # Meme och högvolatila tillgångar
+    "ENA", "WIF", "BONK", "PEPE", "FLOKI",
+    # Övriga etablerade alternativ
+    "ZEC", "DASH",
 ]
 STABLE_OR_FIAT_SYMBOLS = {
     "USDC", "USDT", "DAI", "USDP", "GUSD", "PAX", "PYUSD", "EURC",
