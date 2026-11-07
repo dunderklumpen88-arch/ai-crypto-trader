@@ -1,4 +1,4 @@
-"""Trader Intelligence status and safe signal weighting for paper trading. External sources are informational only until a documented, provider-specific adapter validates their schema, timestamp, provenance and track record. This module never places orders. """
+"""Trader Intelligence v42 status and safe signal weighting for PAPER trading. External sources are informational only until a documented, provider-specific adapter validates their schema, timestamp, provenance and track record. This module never places orders. """
 from __future__ import annotations
 
 import json
