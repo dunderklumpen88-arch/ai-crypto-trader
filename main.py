@@ -1,4 +1,4 @@
-"""AI Crypto Trader v42 — PAPER ONLY. Simulated trading only; no real exchange orders."""
+"""AI Crypto Trader v41 — PAPER ONLY. Simulated trading only; no real exchange orders."""
 from __future__ import annotations
 
 import csv
@@ -42,35 +42,35 @@ except Exception as exc:
 
 # Claude is intentionally not part of the trading decision path.
 
-APP_VERSION = "42.0.0-cost-aware-confirmed-entries-paper"
+APP_VERSION = "43.0.0-quality-first-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
 START_BALANCE_SEK = float(os.getenv("START_BALANCE_SEK", "1000"))
-MAX_TRADE_SEK = min(75.0, max(25.0, float(os.getenv("MAX_TRADE_SEK", "75"))))
-MAX_POSITION_SEK = min(100.0, max(MAX_TRADE_SEK, float(os.getenv("MAX_POSITION_SEK", "100"))))
-MAX_TOTAL_LOSS_SEK = min(200.0, max(25.0, float(os.getenv("MAX_TOTAL_LOSS_SEK", "200"))))
-MAX_DAILY_LOSS_SEK = min(50.0, max(10.0, float(os.getenv("MAX_DAILY_LOSS_SEK", "50"))))
-MAX_OPEN_POSITIONS = max(1, min(3, int(os.getenv("MAX_OPEN_POSITIONS", "3"))))
+MAX_TRADE_SEK = float(os.getenv("MAX_TRADE_SEK", "100"))
+MAX_POSITION_SEK = float(os.getenv("MAX_POSITION_SEK", "150"))
+MAX_TOTAL_LOSS_SEK = float(os.getenv("MAX_TOTAL_LOSS_SEK", "250"))
+MAX_DAILY_LOSS_SEK = float(os.getenv("MAX_DAILY_LOSS_SEK", "75"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.005"))
-ESTIMATED_SPREAD_SLIPPAGE_PCT = max(0.25, float(os.getenv("ESTIMATED_SPREAD_SLIPPAGE_PCT", "0.25")))
-MIN_CONFIDENCE = max(68, min(90, int(os.getenv("MIN_CONFIDENCE", "68"))))
-INTERVAL_SECONDS = max(300, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
-STOP_LOSS_PCT = min(2.5, max(1.5, float(os.getenv("STOP_LOSS_PCT", "2.5"))))
+ESTIMATED_SPREAD_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SPREAD_SLIPPAGE_PCT", "0.20"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "48"))
+INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3.0"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "2.0"))
-COOLDOWN_SECONDS = max(3600, int(os.getenv("COOLDOWN_SECONDS", "3600")))
-MIN_HOLD_SECONDS = max(1800, int(os.getenv("MIN_HOLD_SECONDS", "1800")))
+COOLDOWN_SECONDS = max(1800, int(os.getenv("COOLDOWN_SECONDS", "1800")))
+MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "900"))
 TREND_EXIT_CONFIRMATIONS = max(1, int(os.getenv("TREND_EXIT_CONFIRMATIONS", "3")))
 # Round-trip fees + estimated spread/slippage + a small net-profit buffer.
-MIN_NET_EXIT_PCT = FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT + 0.35
-TRAIL_ACTIVATION_PCT = max(2.8, float(os.getenv("TRAIL_ACTIVATION_PCT", "2.8")))
-MAX_SCAN_MARKETS = max(10, min(50, int(os.getenv("MAX_SCAN_MARKETS", "40"))))
+MIN_NET_EXIT_PCT = FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT + 0.25
+TRAIL_ACTIVATION_PCT = float(os.getenv("TRAIL_ACTIVATION_PCT", "3.0"))
+MAX_SCAN_MARKETS = max(10, min(100, int(os.getenv("MAX_SCAN_MARKETS", "75"))))
 MARKET_DISCOVERY_CACHE_SECONDS = max(300, int(os.getenv("MARKET_DISCOVERY_CACHE_SECONDS", "1800")))
 MIN_24H_QUOTE_VOLUME_USD = max(0.0, float(os.getenv("MIN_24H_QUOTE_VOLUME_USD", "100000")))
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/ai_trader_paper_state.json")
 PRODUCT_SUFFIX = "-USD"
 CANDLE_SECONDS = 300
-CANDLE_LIMIT = 300
+CANDLE_LIMIT = 120
 BASE_SYMBOLS = [
     # Stora och etablerade marknader
     "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LINK", "AVAX", "DOT",
@@ -408,15 +408,11 @@ def get_candles(symbol: str) -> list[list[float]]:
         f"https://api.exchange.coinbase.com/products/{product}/candles?granularity={CANDLE_SECONDS}"
     )
     rows = []
-    now_ts = int(time.time())
     for row in reversed(raw if isinstance(raw, list) else []):
         if isinstance(row, list) and len(row) >= 6:
             try:
-                candle = [float(x) for x in row[:6]]
-                # Exclude the currently-forming candle to avoid intrabar signal flips.
-                if candle[0] + CANDLE_SECONDS <= now_ts:
-                    rows.append(candle)
-            except (TypeError, ValueError, OverflowError):
+                rows.append([float(x) for x in row[:6]])
+            except (TypeError, ValueError):
                 continue
     return rows[-CANDLE_LIMIT:]
 
@@ -586,40 +582,38 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
 
     score = max(0, min(100, int(score)))
     cost_hurdle = MIN_NET_EXIT_PCT
-    # ATR-derived movement is only a volatility screen, not a forecast.
-    # Require independent trend/momentum confirmation before considering entry.
-    estimated_move = max(0.0, mom15 * 1.15 + mom1h * 0.45 + atr_pct * math.sqrt(3.0) * 0.35)
+    # Expected move is a rough filter, not a prediction or profit guarantee.
+    estimated_move = max(0.0, mom15 * 1.35 + mom1h * 0.20 + atr_pct * 0.30)
 
+    # A held position can be sold on a genuine down signal even when a new
+    # entry would not clear the estimated transaction-cost hurdle.
     sell_ready = (
         trend_down
-        and mom1h < -0.10
+        and mom1h < -0.05
         and (score <= 48 or indicators.get("macd_cross_down") is True)
     )
-    advanced_ready = (
-        analyze_advanced is not None
-        and int(indicators.get("samples", 0) or 0) >= 240
-        and indicators.get("data_quality") in ("MEDIUM", "HIGH")
-        and indicators.get("trend_1h") in ("UP", "DOWN")
-    )
-    trend_confirmed = (
-        trend_up and medium_up and aligned_up
-        and indicators.get("multi_timeframe_aligned_down") is not True
-    )
-    momentum_confirmed = mom15 > 0.05 and mom1h > 0.15
-    rsi_ok = rv is not None and 50.0 <= rv <= 68.0
-    volume_ok = 0.80 <= vol_ratio <= 3.50
-    volatility_ok = 0.05 <= atr_pct <= 2.50
-    cost_ok = estimated_move >= cost_hurdle * 1.20
+    # Quality-first entry: descriptive confidence and the rough expected-move
+    # estimate are diagnostics, not hard gates. Require a coherent cluster of
+    # independent signals instead of one arbitrary score threshold.
+    indicators_down = indicators.get("multi_timeframe_aligned_down") is True
+    confirmations = {
+        "short_trend_up": bool(trend_up),
+        "medium_trend_up": bool(medium_up),
+        "macd_improving": bool(macd_positive),
+        "positive_momentum": bool(mom15 > 0 and mom1h > 0),
+    }
+    confirmation_count = sum(confirmations.values())
+    trend_confirmed = trend_up or medium_up or (macd_positive and mom1h > 0)
+    rsi_ok = (rv if rv is not None else 50) < 78
+    volatility_ok = atr_pct <= 5.0
+    liquidity_ok = vol_ratio >= 0.20
     buy_ready = (
-        advanced_ready
-        and score >= MIN_CONFIDENCE
+        confirmation_count >= 2
         and trend_confirmed
-        and momentum_confirmed
-        and macd_positive
+        and not indicators_down
         and rsi_ok
-        and volume_ok
         and volatility_ok
-        and cost_ok
+        and liquidity_ok
     )
     if market_filter.get("veto_buy"):
         buy_ready = False
@@ -629,24 +623,23 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
 
     if sell_ready:
         action, block = "SÄLJ", None
-    elif not advanced_ready:
-        action, block = "AVVAKTA", "avancerad analys saknas eller historiken räcker inte för 1h-bekräftelse"
-    elif not cost_ok:
-        action, block = "AVVAKTA", (
-            f"rörelse-/volatilitetsfilter {estimated_move:.2f}% når inte "
-            f"säkerhetsmarginalen {cost_hurdle * 1.20:.2f}% över handelskostnader"
-        )
     elif macro_block:
         action, block = "AVVAKTA", "makroekonomiskt blackout-fönster aktivt"
     elif market_filter.get("veto_buy"):
         action, block = "AVVAKTA", "BTC/ETH visar samstämmig nedtrend"
+    elif indicators_down:
+        action, block = "AVVAKTA", "15m- och 1h-trenden pekar båda nedåt"
+    elif not rsi_ok:
+        action, block = "AVVAKTA", "rörelsen är översträckt; inväntar bättre ingång"
+    elif not liquidity_ok:
+        action, block = "AVVAKTA", "för svag handelsaktivitet för en tillförlitlig ingång"
+    elif not volatility_ok:
+        action, block = "AVVAKTA", "volatiliteten är för hög just nu"
     elif buy_ready:
         action, block = "KÖP", None
     else:
-        action, block = "AVVAKTA", (
-            "kräver samstämmig 15m/1h-upptrend, positiv MACD, momentum, "
-            "RSI 50–68, normal volym och måttlig volatilitet"
-        )
+        missing = [name for name, ok in confirmations.items() if not ok]
+        action, block = "AVVAKTA", "för få samstämmiga köptecken: " + ", ".join(missing[:3])
 
     return {
         "symbol": symbol, "product_id": symbol + PRODUCT_SUFFIX, "price_usd": round(price, 10),
@@ -656,7 +649,8 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
         "momentum_15m_pct": round(mom15, 3), "momentum_1h_pct": round(mom1h, 3),
         "atr_pct": round(atr_pct, 3), "volume_ratio": round(vol_ratio, 2),
         "estimated_move_pct": round(estimated_move, 3), "cost_hurdle_pct": round(cost_hurdle, 3),
-        "entry_policy": "closed_candles + 15m/1h trend + positive MACD + net-cost hurdle",
+        "entry_quality": {"confirmations": confirmations, "confirmation_count": confirmation_count,
+                          "cost_estimate_is_diagnostic_only": True},
         "advanced_score_adjustment": advanced.get("score_adjustment", 0),
         "advanced_indicators": advanced.get("indicators", {}), "market_filter": market_filter,
         "cryptoquant_score_adjustment": cq_adjustment,
@@ -846,12 +840,8 @@ def run_cycle() -> dict[str, Any]:
                 atr = float(s.get("atr_pct", 0) or 0)
                 trail_pct = max(1.2, min(3.0, atr * 1.25 if atr > 0 else TRAILING_STOP_PCT))
                 stop_hit = change <= -STOP_LOSS_PCT
-                # Only activate profit-protection once estimated net costs are covered.
                 trail_floor_pct = max(MIN_NET_EXIT_PCT, peak_gain - trail_pct)
-                trail_hit = (
-                    peak_gain >= max(TRAIL_ACTIVATION_PCT, MIN_NET_EXIT_PCT + trail_pct)
-                    and change <= trail_floor_pct
-                )
+                trail_hit = peak_gain >= TRAIL_ACTIVATION_PCT and change <= trail_floor_pct
 
                 # One noisy sell signal no longer closes a position immediately.
                 if s["signal"] == "SÄLJ":
@@ -1080,7 +1070,6 @@ def api_status():
                 "stop_loss_pct": STOP_LOSS_PCT, "trailing_stop_pct": TRAILING_STOP_PCT,
                 "max_open_positions": MAX_OPEN_POSITIONS, "cooldown_seconds": COOLDOWN_SECONDS,
                 "min_confidence": MIN_CONFIDENCE, "estimated_spread_slippage_pct": ESTIMATED_SPREAD_SLIPPAGE_PCT,
-                "min_net_exit_pct": round(MIN_NET_EXIT_PCT, 3), "candle_limit": CANDLE_LIMIT,
                 "max_scan_markets": MAX_SCAN_MARKETS,
                 "min_24h_quote_volume_usd": MIN_24H_QUOTE_VOLUME_USD,
                 "market_discovery_cache_seconds": MARKET_DISCOVERY_CACHE_SECONDS,
