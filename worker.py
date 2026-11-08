@@ -1,4 +1,4 @@
-"""Advanced v42 dependency-free ensemble market-analysis engine for AI Crypto Trader PAPER. Drop-in replacement for worker.py. Keeps the existing analyze_advanced(candles, fx, current_price_sek) interface and never places orders. Candles must be oldest-to-newest Coinbase OHLCV records. Scores are heuristics, not probabilities or guarantees. """
+"""Advanced v39 dependency-free ensemble market-analysis engine for AI Crypto Trader PAPER. Drop-in replacement for worker.py. Keeps the existing analyze_advanced(candles, fx, current_price_sek) interface and never places orders. Candles must be oldest-to-newest Coinbase OHLCV records. Scores are heuristics, not probabilities or guarantees. """
 from __future__ import annotations
 
 from math import isfinite, sqrt
@@ -146,7 +146,7 @@ def _aggregate(rows: list[dict[str, float]], n: int) -> list[dict[str, float]]:
 
 
 def _trend(values: list[float]) -> str:
-    if len(values) < 21:
+    if len(values) < 25:
         return "NEUTRAL"
     fast, slow = _ema(values, 9)[-1], _ema(values, 21)[-1]
     if fast > slow:
