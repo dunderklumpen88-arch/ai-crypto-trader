@@ -1,4 +1,4 @@
-"""AI Crypto Trader v41 — PAPER ONLY. Simulated trading only; no real exchange orders."""
+"""AI Crypto Trader v44 — PAPER ONLY. Revised exit discipline; simulated trades only."""
 from __future__ import annotations
 
 import csv
@@ -42,7 +42,7 @@ except Exception as exc:
 
 # Claude is intentionally not part of the trading decision path.
 
-APP_VERSION = "43.0.0-quality-first-paper"
+APP_VERSION = "44.0.0-balanced-exit-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -56,14 +56,15 @@ FEE_RATE = float(os.getenv("FEE_RATE", "0.005"))
 ESTIMATED_SPREAD_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SPREAD_SLIPPAGE_PCT", "0.20"))
 MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "48"))
 INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "3.0"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.5"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "2.0"))
 COOLDOWN_SECONDS = max(1800, int(os.getenv("COOLDOWN_SECONDS", "1800")))
-MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "900"))
-TREND_EXIT_CONFIRMATIONS = max(1, int(os.getenv("TREND_EXIT_CONFIRMATIONS", "3")))
+MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "600"))
+TREND_EXIT_CONFIRMATIONS = max(1, int(os.getenv("TREND_EXIT_CONFIRMATIONS", "2")))
+MAX_WEAK_HOLD_SECONDS = max(1800, int(os.getenv("MAX_WEAK_HOLD_SECONDS", "14400")))
 # Round-trip fees + estimated spread/slippage + a small net-profit buffer.
 MIN_NET_EXIT_PCT = FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT + 0.25
-TRAIL_ACTIVATION_PCT = float(os.getenv("TRAIL_ACTIVATION_PCT", "3.0"))
+TRAIL_ACTIVATION_PCT = float(os.getenv("TRAIL_ACTIVATION_PCT", "2.0"))
 MAX_SCAN_MARKETS = max(10, min(100, int(os.getenv("MAX_SCAN_MARKETS", "75"))))
 MARKET_DISCOVERY_CACHE_SECONDS = max(300, int(os.getenv("MARKET_DISCOVERY_CACHE_SECONDS", "1800")))
 MIN_24H_QUOTE_VOLUME_USD = max(0.0, float(os.getenv("MIN_24H_QUOTE_VOLUME_USD", "100000")))
@@ -843,8 +844,11 @@ def run_cycle() -> dict[str, Any]:
                 trail_floor_pct = max(MIN_NET_EXIT_PCT, peak_gain - trail_pct)
                 trail_hit = peak_gain >= TRAIL_ACTIVATION_PCT and change <= trail_floor_pct
 
-                # One noisy sell signal no longer closes a position immediately.
-                if s["signal"] == "SÄLJ":
+                # Count consecutive bearish signals. Unlike the previous version,
+                # a confirmed trend break may close a losing trade; it is not forced
+                # to wait until the position is profitable.
+                bearish_now = s["signal"] == "SÄLJ"
+                if bearish_now:
                     pos["sell_signal_count"] = int(pos.get("sell_signal_count", 0)) + 1
                 else:
                     pos["sell_signal_count"] = 0
@@ -855,15 +859,23 @@ def run_cycle() -> dict[str, Any]:
                 except Exception:
                     opened_ts = time.time()
                 held_seconds = max(0.0, time.time() - opened_ts)
-                trend_exit = (
+                confirmed_trend_exit = (
                     held_seconds >= MIN_HOLD_SECONDS
                     and int(pos.get("sell_signal_count", 0)) >= TREND_EXIT_CONFIRMATIONS
-                    and change >= MIN_NET_EXIT_PCT
                 )
-                if stop_hit or trail_hit or trend_exit:
+                # Time-based damage control: if a position has been weak for hours
+                # and remains below entry, free the capital instead of holding forever.
+                weak_time_exit = (
+                    held_seconds >= MAX_WEAK_HOLD_SECONDS
+                    and change < MIN_NET_EXIT_PCT
+                    and (s.get("momentum_1h_pct", 0) < 0 or s.get("signal") == "SÄLJ")
+                )
+                if stop_hit or trail_hit or confirmed_trend_exit or weak_time_exit:
                     reason = (
                         "paper_auto_stop_loss" if stop_hit
-                        else ("paper_auto_trailing_stop" if trail_hit else "paper_auto_confirmed_trend_exit")
+                        else ("paper_auto_trailing_stop" if trail_hit
+                              else ("paper_auto_weak_time_exit" if weak_time_exit
+                                    else "paper_auto_confirmed_trend_exit"))
                     )
                     sell_paper(symbol, s["price_usd"], fx, reason)
 
@@ -1051,7 +1063,7 @@ def api_status():
         snap = equity_snapshot()
         return {
             "status": "online", "version": APP_VERSION,
-            "strategy_model": "learning_ensemble_multitimeframe_cryptoquant_paper",
+            "strategy_model": "learning_ensemble_multitimeframe_balanced_exit_paper",
             "decision_engine": "technical_ensemble_plus_btc_eth_regime_plus_cryptoquant_plus_closed_trade_learning",
             "claude_enabled": False,
             "learning_symbols": len(state.get("symbol_learning", {})),
@@ -1075,6 +1087,7 @@ def api_status():
                 "market_discovery_cache_seconds": MARKET_DISCOVERY_CACHE_SECONDS,
                 "min_hold_seconds": MIN_HOLD_SECONDS,
                 "trend_exit_confirmations": TREND_EXIT_CONFIRMATIONS,
+                "max_weak_hold_seconds": MAX_WEAK_HOLD_SECONDS,
                 "min_net_exit_pct": round(MIN_NET_EXIT_PCT, 3),
                 "trailing_activation_pct": TRAIL_ACTIVATION_PCT,
             }, **snap,
