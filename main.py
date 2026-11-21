@@ -42,7 +42,7 @@ except Exception as exc:
 
 # Claude is intentionally not part of the trading decision path.
 
-APP_VERSION = "44.0.0-balanced-exit-paper"
+APP_VERSION = "45.0.0-stricter-signals-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -54,10 +54,10 @@ MAX_DAILY_LOSS_SEK = float(os.getenv("MAX_DAILY_LOSS_SEK", "75"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.005"))
 ESTIMATED_SPREAD_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SPREAD_SLIPPAGE_PCT", "0.20"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "48"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "62"))
 INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "2.5"))
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "2.0"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "1.8"))
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "1.5"))
 COOLDOWN_SECONDS = max(1800, int(os.getenv("COOLDOWN_SECONDS", "1800")))
 MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "600"))
 TREND_EXIT_CONFIRMATIONS = max(1, int(os.getenv("TREND_EXIT_CONFIRMATIONS", "2")))
@@ -65,34 +65,17 @@ MAX_WEAK_HOLD_SECONDS = max(1800, int(os.getenv("MAX_WEAK_HOLD_SECONDS", "14400"
 # Round-trip fees + estimated spread/slippage + a small net-profit buffer.
 MIN_NET_EXIT_PCT = FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT + 0.25
 TRAIL_ACTIVATION_PCT = float(os.getenv("TRAIL_ACTIVATION_PCT", "2.0"))
-MAX_SCAN_MARKETS = max(10, min(100, int(os.getenv("MAX_SCAN_MARKETS", "75"))))
+MAX_SCAN_MARKETS = max(5, min(30, int(os.getenv("MAX_SCAN_MARKETS", "20"))))
 MARKET_DISCOVERY_CACHE_SECONDS = max(300, int(os.getenv("MARKET_DISCOVERY_CACHE_SECONDS", "1800")))
-MIN_24H_QUOTE_VOLUME_USD = max(0.0, float(os.getenv("MIN_24H_QUOTE_VOLUME_USD", "100000")))
+MIN_24H_QUOTE_VOLUME_USD = max(0.0, float(os.getenv("MIN_24H_QUOTE_VOLUME_USD", "500000")))
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/ai_trader_paper_state.json")
 PRODUCT_SUFFIX = "-USD"
 CANDLE_SECONDS = 300
 CANDLE_LIMIT = 120
 BASE_SYMBOLS = [
-    # Stora och etablerade marknader
+    # Endast etablerade högvolym-marknader för lägre noise
     "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LINK", "AVAX", "DOT",
-    "LTC", "BCH", "ATOM", "UNI", "AAVE", "XLM", "ETC", "FIL", "HBAR",
-    "NEAR", "QNT", "INJ", "EOS", "JUP", "MKR", "TRX", "SHIB",
-    # L1/L2 och skalning
-    "SUI", "APT", "ARB", "OP", "SEI", "TIA", "ICP", "MATIC", "POL",
-    "EGLD", "FLOW", "MINA", "KAVA", "ROSE", "XTZ", "ALGO", "VET",
-    "IOTA", "ZK", "STRK", "ZRO",
-    # AI, data och infrastruktur
-    "RENDER", "FET", "GRT", "TAO", "AKT", "HNT", "PYTH", "WLD",
-    "JASMY", "KAS",
-    # DeFi och finansiell infrastruktur
-    "CRV", "COMP", "SNX", "LDO", "ENS", "ONDO", "PENDLE", "YFI",
-    "1INCH", "ZRX", "MASK", "RUNE",
-    # Gaming, socialt och konsument
-    "SAND", "MANA", "IMX", "GALA", "AXS", "CHZ", "BAT",
-    # Meme och högvolatila tillgångar
-    "ENA", "WIF", "BONK", "PEPE", "FLOKI",
-    # Övriga etablerade alternativ
-    "ZEC", "DASH",
+    "LTC", "BCH", "ATOM", "UNI", "AAVE", "NEAR", "INJ", "TRX",
 ]
 STABLE_OR_FIAT_SYMBOLS = {
     "USDC", "USDT", "DAI", "USDP", "GUSD", "PAX", "PYUSD", "EURC",
@@ -494,7 +477,7 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
     if rv is not None:
         if 48 <= rv <= 67:
             score += 8; reasons.append("RSI bekräftar momentum")
-        elif rv >= 74:
+        elif rv >= 70:
             score -= 12; reasons.append("RSI överköpt")
         elif rv <= 30:
             score -= 5; reasons.append("RSI översåld")
@@ -605,16 +588,18 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
     }
     confirmation_count = sum(confirmations.values())
     trend_confirmed = trend_up or medium_up or (macd_positive and mom1h > 0)
-    rsi_ok = (rv if rv is not None else 50) < 78
+    rsi_ok = (rv if rv is not None else 50) < 72
     volatility_ok = atr_pct <= 5.0
     liquidity_ok = vol_ratio >= 0.20
     buy_ready = (
-        confirmation_count >= 2
+        confirmation_count >= 3
         and trend_confirmed
+        and medium_up
         and not indicators_down
         and rsi_ok
         and volatility_ok
         and liquidity_ok
+        and score >= MIN_CONFIDENCE
     )
     if market_filter.get("veto_buy"):
         buy_ready = False
