@@ -42,7 +42,7 @@ except Exception as exc:
 
 # Claude is intentionally not part of the trading decision path.
 
-APP_VERSION = "45.0.0-stricter-signals-paper"
+APP_VERSION = "46.0.0-quality-first-paper"
 MODE = "PAPER ONLY"
 REAL_ORDERS_ENABLED = False
 
@@ -50,15 +50,15 @@ START_BALANCE_SEK = float(os.getenv("START_BALANCE_SEK", "1000"))
 MAX_TRADE_SEK = float(os.getenv("MAX_TRADE_SEK", "100"))
 MAX_POSITION_SEK = float(os.getenv("MAX_POSITION_SEK", "150"))
 MAX_TOTAL_LOSS_SEK = float(os.getenv("MAX_TOTAL_LOSS_SEK", "250"))
-MAX_DAILY_LOSS_SEK = float(os.getenv("MAX_DAILY_LOSS_SEK", "75"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
+MAX_DAILY_LOSS_SEK = float(os.getenv("MAX_DAILY_LOSS_SEK", "50"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.005"))
 ESTIMATED_SPREAD_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SPREAD_SLIPPAGE_PCT", "0.20"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "62"))
-INTERVAL_SECONDS = max(60, int(os.getenv("AUTO_INTERVAL_SECONDS", "180")))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "68"))
+INTERVAL_SECONDS = max(300, int(os.getenv("AUTO_INTERVAL_SECONDS", "300")))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "1.8"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "1.5"))
-COOLDOWN_SECONDS = max(1800, int(os.getenv("COOLDOWN_SECONDS", "1800")))
+COOLDOWN_SECONDS = max(3600, int(os.getenv("COOLDOWN_SECONDS", "3600")))
 MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "600"))
 TREND_EXIT_CONFIRMATIONS = max(1, int(os.getenv("TREND_EXIT_CONFIRMATIONS", "2")))
 MAX_WEAK_HOLD_SECONDS = max(1800, int(os.getenv("MAX_WEAK_HOLD_SECONDS", "14400")))
@@ -73,9 +73,8 @@ PRODUCT_SUFFIX = "-USD"
 CANDLE_SECONDS = 300
 CANDLE_LIMIT = 120
 BASE_SYMBOLS = [
-    # Endast etablerade högvolym-marknader för lägre noise
-    "BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LINK", "AVAX", "DOT",
-    "LTC", "BCH", "ATOM", "UNI", "AAVE", "NEAR", "INJ", "TRX",
+    # Endast de mest likvida för hög kvalitet
+    "BTC", "ETH", "SOL", "XRP", "ADA", "LINK", "AVAX", "DOT",
 ]
 STABLE_OR_FIAT_SYMBOLS = {
     "USDC", "USDT", "DAI", "USDP", "GUSD", "PAX", "PYUSD", "EURC",
@@ -431,6 +430,38 @@ def pct_change(new: float, old: float) -> float:
     return (new / old - 1.0) * 100.0 if old else 0.0
 
 
+
+def approx_adx(highs, lows, closes, period=14):
+    """Simple directional movement approximation for trend strength."""
+    if len(closes) < period + 1:
+        return 20.0
+    plus_dm = []
+    minus_dm = []
+    trs = []
+    for i in range(1, len(closes)):
+        up = highs[i] - highs[i-1]
+        down = lows[i-1] - lows[i]
+        plus_dm.append(up if up > down and up > 0 else 0)
+        minus_dm.append(down if down > up and down > 0 else 0)
+        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        trs.append(tr)
+    def smooth(vals):
+        if not vals:
+            return 0
+        s = sum(vals[:period])
+        for v in vals[period:]:
+            s = (s * (period-1) + v) / period
+        return s
+    atr = smooth(trs)
+    plus = smooth(plus_dm)
+    minus = smooth(minus_dm)
+    if atr == 0:
+        return 20.0
+    pdi = 100 * plus / atr
+    mdi = 100 * minus / atr
+    dx = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) > 0 else 0
+    return min(50, max(10, dx))  # rough ADX-like
+
 def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cryptoquant_context: dict[str, Any] | None = None, sentiment_context: dict[str, Any] | None = None, macro_context: dict[str, Any] | None = None) -> dict[str, Any]:
     candles = get_candles(symbol)
     if len(candles) < 55:
@@ -453,6 +484,7 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
     ]
     recent = ranges[-14:]
     atr_pct = (sum(recent) / max(1, len(recent)) / price * 100) if price else 0.0
+    adx_val = approx_adx(highs, lows, closes)
     recent_vol = sum(volumes[-5:]) / 5
     prior_vol = sum(volumes[-20:-5]) / max(1, len(volumes[-20:-5]))
     vol_ratio = recent_vol / prior_vol if prior_vol > 0 else 1.0
@@ -487,6 +519,10 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
         score -= 5; reasons.append("låg relativ volym")
     if atr_pct > 3.5:
         score -= 12; reasons.append("hög volatilitet")
+    if adx_val < 22:
+        score -= 15; reasons.append("svag trend (låg ADX-liknande)")
+    elif adx_val > 30:
+        score += 8; reasons.append("stark trend (hög ADX-liknande)")
 
     advanced = {"score_adjustment": 0, "reasons": [], "indicators": {}}
     if analyze_advanced is not None:
@@ -591,6 +627,7 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
     rsi_ok = (rv if rv is not None else 50) < 72
     volatility_ok = atr_pct <= 5.0
     liquidity_ok = vol_ratio >= 0.20
+    expected_net = max(0.0, mom15 * 0.8 + mom1h * 0.4) - (FEE_RATE * 200 + ESTIMATED_SPREAD_SLIPPAGE_PCT + 0.3)
     buy_ready = (
         confirmation_count >= 3
         and trend_confirmed
@@ -600,6 +637,9 @@ def analyze_market(symbol: str, market_context: dict[str, Any] | None = None, cr
         and volatility_ok
         and liquidity_ok
         and score >= MIN_CONFIDENCE
+        and adx_val >= 22
+        and expected_net > 0.4
+        and vol_ratio >= 0.8
     )
     if market_filter.get("veto_buy"):
         buy_ready = False
@@ -825,7 +865,8 @@ def run_cycle() -> dict[str, Any]:
                 peak_gain = ((high / entry) - 1) * 100 if entry else 0
                 atr = float(s.get("atr_pct", 0) or 0)
                 trail_pct = max(1.2, min(3.0, atr * 1.25 if atr > 0 else TRAILING_STOP_PCT))
-                stop_hit = change <= -STOP_LOSS_PCT
+                dynamic_stop = max(1.2, min(2.8, atr * 1.4 if atr > 0 else STOP_LOSS_PCT))
+                stop_hit = change <= -dynamic_stop
                 trail_floor_pct = max(MIN_NET_EXIT_PCT, peak_gain - trail_pct)
                 trail_hit = peak_gain >= TRAIL_ACTIVATION_PCT and change <= trail_floor_pct
 
@@ -884,7 +925,7 @@ def run_cycle() -> dict[str, Any]:
                     # Existing SEK caps remain stricter where applicable.
                     risk_equity = max(0.0, float(snap.get("equity_sek", START_BALANCE_SEK)))
                     stop_fraction = max(0.005, STOP_LOSS_PCT / 100.0)
-                    risk_budget = risk_equity * 0.01
+                    risk_budget = risk_equity * 0.006
                     risk_sized_amount = risk_budget / stop_fraction
                     amount = min(MAX_TRADE_SEK, MAX_POSITION_SEK, risk_sized_amount,
                                  float(state.get("cash_sek", 0)) / (1 + FEE_RATE))
